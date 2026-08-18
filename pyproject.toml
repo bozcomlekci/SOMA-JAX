@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77.0"]   # PEP 639 SPDX `license` / `license-files`
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soma-jax"
+version = "0.1.0"
+description = "JAX implementation of SOMA-X: Skeleton-Oriented Mean Avatar universal body model pivot"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    # No "License ::" classifier: PEP 639 supersedes it with the SPDX
+    # expression above, and setuptools errors if both are present.
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "jax>=0.4.25",
+    "jaxlib>=0.4.25",
+    "equinox>=0.11.0",
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "optax>=0.1.7",
+]
+
+[project.optional-dependencies]
+# `tests/` is not distributed (see docs/DESCRIPTION.md#testing); this extra is
+# for running the suite from a local checkout.
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist",
+]
+vis = [
+    "trimesh>=4.0",
+    "pyrender",
+]
+usd = [
+    "usd-core",
+]
+# Upstream's Anny backend imports this package rather than vendoring it, so the
+# faithful path needs it installed. See soma_jax.body_models.anny_native.
+anny = [
+    "anny>=0.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["soma_jax*"]
+
+[tool.ruff]
+line-length = 100
+select = ["B", "E", "F", "I", "UP", "W"]
+
+[tool.ruff.isort]
+known-first-party = ["soma_jax"]

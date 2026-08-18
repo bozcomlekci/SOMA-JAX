@@ -1,0 +1,7 @@
+# Example clip list for render_bvh.sh.
+# One clip per line: "<label>  <bvh path relative to $BVH_ROOT>".
+# Lines starting with '#' and blank lines are skipped. Point BVH_ROOT at a
+# directory of SOMA-skeleton BVH files and list the ones you want to render.
+walk        walk/clip_001.bvh
+jump        jump/clip_001.bvh
+run         run/clip_001.bvh

@@ -1,0 +1,123 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+.hypothesis/
+.tox/
+.nox/
+
+# Type checkers
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.log
+logs/
+tmp/
+temp/
+*~
+
+# Model / data files (ignore by default to avoid accidental commits)
+*.npz
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# Generated meshes / animations / media (tools/vis, tools/pipeline renders).
+# Committed figures are .png/.pdf and are NOT ignored.
+*.obj
+*.ply
+*.stl
+*.glb
+*.gltf
+*.usd
+*.usda
+*.gif
+*.mp4
+*.webm
+
+# Project-specific directories (may be large or user-specific).
+# Root-anchored forms (/data, /datasets) also catch the symlinks that point
+# these at a sibling SMPL-JAX checkout; the trailing-slash forms only match
+# real directories, not symlinks.
+# Assets: `assets/` is tracked (it holds small, repo-owned files and the
+# derived-archive location), but third-party downloads under it are not.
+# Large binaries are additionally covered by the *.npz / *.pt / *.pkl rules
+# above, so a built SOMA_neutral_fixed.npz stays out of git regardless.
+assets/third_party/
+# generated symlink view assembled by soma_jax.assets.data_root()
+assets/data_root/
+demo_renders/
+keys/
+/data
+data/
+/datasets
+datasets/
+
+# Benchmark intermediates — run_runtime.sh writes one JSON per backend then
+# merges into results/runtime.json. Only the merged file (+ figures) is committed.
+benchmarks/results/_soma_x.json
+benchmarks/results/_soma_jax.json
+# Public media (teaser, README figures) — re-included despite *.gif etc. above.
+# Lives under assets/ but is repo-owned, unlike assets/third_party/.
+!assets/media/
+!assets/media/**
+
+# Local AI-assistant state and instruction files
+.claude
+.codex
+
+# graphify — local tooling only, never pushed. Regenerate the graph with:
+#   graphify extract . --code-only && graphify cluster-only . --no-label
+graphify-out/
+.graphifyignore
+CLAUDE.md
+
+test.ipynb
+
+# Tests are kept local — the published tree ships the library, not the suite.
+tests/
+
+# Local reference checkouts of the upstream MHR and Anny sources. Neither is a
+# submodule and neither is needed to run this repo: the MHR archives the code
+# loads (mhr_model_lod1.pt, mhr_model_lod6.pt) already ship inside the SOMA-X
+# submodule, and Anny is consumed as the `anny` pip package — which is what
+# upstream SOMA-X does too, so calling it is the faithful path, not a shortcut.
+# Vendoring them would add ~110 MB to every clone for nothing.
+third_party/MHR/
+third_party/anny/

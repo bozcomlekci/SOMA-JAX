@@ -1,0 +1,6 @@
+[submodule "third_party/SOMA-X"]
+	path = third_party/SOMA-X
+	url = https://github.com/NVlabs/SOMA-X
+[submodule "third_party/SMPL-JAX"]
+	path = third_party/SMPL-JAX
+	url = https://github.com/bozcomlekci/SMPL-JAX

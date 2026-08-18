@@ -1,0 +1,7 @@
+{
+  "method": "TF32 numerical-error emulation: the identity-blend GEMM 'mean + (coeffs*sqrt(eig)) @ shapedirs' (the largest matmul in the forward, which sets vertex positions) computed twice on CPU -- once in full float32, once with both operands rounded to a 10-bit mantissa (TF32, round-to-nearest-even) and accumulated in float32, exactly as an Ampere+ TF32 tensor-core GEMM does. B=256 random SOMA identities (seed 0).",
+  "vertex_error_mm": {"mean": 0.0150, "median": 0.0099, "p99": 0.0791, "max": 0.2134},
+  "relative_mean": 2.55e-05,
+  "body_radius_mm": 589.3,
+  "note": "SOMA-X runs full float32 and structurally cannot use TF32 (Warp scalar kernels + sparse RBF, none tensor-core-eligible), so this JAX-only TF32 precision cost is why TF32 throughput is never compared head-to-head with SOMA-X. The cost is sub-millimetre (mean ~0.015 mm, worst-case ~0.21 mm on a ~59 cm body radius)."
+}
