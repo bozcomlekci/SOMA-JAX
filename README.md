@@ -11,8 +11,7 @@ hardware-portable graph.
 
 ![SOMA-JAX vs SOMA-X](assets/media/soma_x_vs_soma_jax.gif)
 
-<sub>Identical rig and motion, equal wall-clock. The frame counters show what each
-pipeline gets through in that time.</sub>
+<sub>Identical rig and motion, equal wall-clock. The frame counters show what eachpipeline gets through in that time.</sub>
 
 ## Overview
 
@@ -93,10 +92,10 @@ layer = SOMALayer(soma_data, identity_model=model)                # anny, garmen
 Against SOMA-X (PyTorch + Warp) on an RTX 5080, full forward at batch 2048,
 matched float32:
 
-| Pipeline | vs SOMA-X | Needs |
-|---|---|---|
-| **Hybrid** (JAX + one Warp `svd3` kernel) | **1.68× faster** | optional `warp-lang`; approximates upstream's rotation solve |
-| **Pure JAX** (the faithful path) | 0.61× — 1.65× slower | nothing beyond JAX |
+| Pipeline                                          | vs SOMA-X               | Needs                                                         |
+| ------------------------------------------------- | ----------------------- | ------------------------------------------------------------- |
+| **Hybrid** (JAX + one Warp `svd3` kernel) | **1.68× faster** | optional`warp-lang`; approximates upstream's rotation solve |
+| **Pure JAX** (the faithful path)            | 0.61× — 1.65× slower | nothing beyond JAX                                            |
 
 The pure-JAX path wins below B≈256 and loses above it; the gap is
 `jnp.linalg.svd` over many tiny 3×3 matrices. On peak GPU memory SOMA-JAX grows
@@ -105,20 +104,19 @@ by B=8192.
 
 ![float32 → TF32](assets/media/soma_jax_tf32_teaser.gif)
 
-<sub>Switching the hybrid pipeline to TF32 mid-motion reaches ~2.8× — a JAX-only
-deployment mode at ~sub-mm error. float32 stays the like-for-like comparison.</sub>
+<sub>Switching the hybrid pipeline to TF32 mid-motion reaches ~2.8× — a JAX-onlydeployment mode at ~sub-mm error. float32 stays the like-for-like comparison.</sub>
 
 Method, fairness checks and the full precision discussion:
 [`benchmarks/README.md`](benchmarks/README.md).
 
 ## Documentation
 
-| | |
-|---|---|
-| [`docs/DESCRIPTION.md`](docs/DESCRIPTION.md) | what is implemented, the API surface, tooling and conversion scripts |
-| [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) | module-by-module parity audit against SOMA-X |
-| [`docs/INSTALL.md`](docs/INSTALL.md) | GPU setup, model assets, headless rendering |
-| [`benchmarks/README.md`](benchmarks/README.md) | runtime and memory study vs SOMA-X |
+|                                                 |                                                                      |
+| ----------------------------------------------- | -------------------------------------------------------------------- |
+| [`docs/DESCRIPTION.md`](docs/DESCRIPTION.md)   | what is implemented, the API surface, tooling and conversion scripts |
+| [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) | module-by-module parity audit against SOMA-X                         |
+| [`docs/INSTALL.md`](docs/INSTALL.md)           | GPU setup, model assets, headless rendering                          |
+| [`benchmarks/README.md`](benchmarks/README.md) | runtime and memory study vs SOMA-X                                   |
 
 ## License
 
@@ -132,7 +130,18 @@ research-only. See [`NOTICE`](NOTICE) for the list and links.
 
 ## Citation
 
-If you use SOMA-JAX, please cite the original SOMA-X paper:
+If you use SOMA-JAX in your research, please cite this repository:
+
+```bibtex
+@misc{somajax,
+  title  = {SOMA-JAX: A Differentiable JAX Port of NVIDIA SOMA-X},
+  author = {Batuhan Ozcomlekci},
+  year   = {2026},
+  howpublished = {\url{https://github.com/bozcomlekci/SOMA-JAX}},
+}
+```
+
+Please also cite the original SOMA-X paper:
 
 ```bibtex
 @article{soma2026,
