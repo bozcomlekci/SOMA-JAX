@@ -13,10 +13,20 @@ process actually demands**, plus the fixed CUDA-context overhead.
 
 Nothing here polls. Every byte is counted where it is allocated:
 
-* **XLA** — ``memory_stats()["bytes_in_use"]`` / ``["peak_bytes_in_use"]``,
-  counters the BFC allocator maintains on every alloc and free.
+* **XLA** — requested bytes: every resident buffer is a live ``jax.Array``
+  (``jax.live_arrays()``), the loaded executable holds its generated code with
+  the closed-over model constants XLA embeds in it, and one execution adds
+  exactly the temp and output buffers of XLA's static buffer assignment (all
+  three from ``Compiled.memory_analysis()``; the whole generated code is
+  charged, though SOMA-X's kernel code is not counted on its side).
+  XLA's allocator counter ``peak_bytes_in_use`` is recorded as well
+  (``xla_bytes_in_use_peak_mib``) but is not the metric: the BFC allocator
+  hands out a free chunk whole when splitting it would leave less than the
+  request (and under 128 MiB), so that counter includes allocator slack the
+  torch counter, whose split granularity is at most 1 MiB, never charges.
 * **PyTorch** — ``torch.cuda.memory_allocated()`` /
-  ``max_memory_allocated()``, likewise exact.
+  ``max_memory_allocated()``: requested bytes (512-byte rounding), reset and
+  read per iteration.
 * **NVIDIA Warp** — a counting allocator installed with
   ``wp.set_device_allocator`` that *wraps and delegates to* the allocator Warp
   was already using. It changes no allocation policy (same mempool setting,
@@ -182,6 +192,12 @@ def _pin_torch_float32() -> None:
     torch.backends.cudnn.allow_tf32 = False
 
 
+def _live_array_bytes() -> int:
+    """Requested bytes of every live ``jax.Array`` (all resident device data)."""
+    import jax
+    return sum(a.nbytes for a in jax.live_arrays())
+
+
 def _jax_mem(field: str) -> int:
     try:
         import jax
@@ -202,8 +218,18 @@ def _run_jax(method: str, B: int, hf: Path, soma_npz: Path,
 
     # Force backend/context creation, then size the fixed overhead.
     jax.device_put(0.0).block_until_ready()
-    framework_live = lambda: _jax_mem("bytes_in_use")          # noqa: E731
-    context_mib = _measure_context_mib(framework_live)
+    context_mib = _measure_context_mib(lambda: _jax_mem("bytes_in_use"))
+    # Demand, counted the way torch.cuda.memory_allocated counts it: requested
+    # bytes. XLA's own "bytes_in_use" is not that -- its BFC allocator hands
+    # out a free chunk WHOLE when splitting it would leave less than the
+    # request (and under 128 MiB), so a 66.7 MiB array can occupy a 128 MiB
+    # chunk. Six such RBF factors alone carry ~180 MiB of that slack, which
+    # torch's allocator (split granularity <= 1 MiB) never charges SOMA-X.
+    # Requested bytes are exact: every resident buffer is a jax.Array, and an
+    # execution adds exactly the temp + output buffers XLA's static buffer
+    # assignment reports. ``exec_bytes`` is filled in once compiled.
+    exec_bytes = 0
+    framework_live = lambda: _live_array_bytes() + exec_bytes  # noqa: E731
     tracker = _PeakTracker(framework_live)
 
     if method in ("fair", "hybrid"):
@@ -228,6 +254,19 @@ def _run_jax(method: str, B: int, hf: Path, soma_npz: Path,
         raise ValueError(method)
 
     args = _jax_inputs(B, J, K)
+    # Compile once and run that executable, so its memory analysis describes
+    # exactly what is measured below. ``jitted`` stays referenced: its closure
+    # owns the model's device arrays, as a user's layer object would.
+    jitted = fwd
+    fwd = jitted.lower(*args).compile()
+    analysis = fwd.memory_analysis()
+    # Per execution: the temp and output buffers. Resident: the loaded
+    # executable itself -- XLA embeds the closed-over model constants in it,
+    # where neither jax.live_arrays() nor the BFC counter sees them. Charging
+    # its whole generated code to SOMA-JAX is conservative (SOMA-X's kernel
+    # code is not counted on its side).
+    exec_bytes = (analysis.temp_size_in_bytes + analysis.output_size_in_bytes
+                  + analysis.generated_code_size_in_bytes)
     for _ in range(warmup):
         fwd(*args).block_until_ready()
 
@@ -238,15 +277,22 @@ def _run_jax(method: str, B: int, hf: Path, soma_npz: Path,
         tracker.sample()
         n += 1
 
-    xla_peak = _jax_mem("peak_bytes_in_use")
-    tracker.fold_framework_peak(xla_peak)
+    demand_peak = framework_live()
+    tracker.fold_framework_peak(demand_peak)
     warp_peak = tracker.warp.peak if tracker.warp is not None else 0
     return {
         "peak_mib": context_mib + tracker.peak_bytes / MIB,
-        "peak_upper_mib": context_mib + (xla_peak + warp_peak) / MIB,
+        "peak_upper_mib": context_mib + (demand_peak + warp_peak) / MIB,
         "context_mib": context_mib,
-        "framework_peak_mib": xla_peak / MIB,
+        "framework_peak_mib": demand_peak / MIB,
         "warp_peak_mib": warp_peak / MIB,
+        "resident_mib": (demand_peak - exec_bytes) / MIB,
+        "exec_temp_mib": analysis.temp_size_in_bytes / MIB,
+        "exec_output_mib": analysis.output_size_in_bytes / MIB,
+        "exec_code_mib": analysis.generated_code_size_in_bytes / MIB,
+        # XLA's allocator view of the same run (BFC chunk slack included,
+        # the executable's embedded constants not).
+        "xla_bytes_in_use_peak_mib": _jax_mem("peak_bytes_in_use") / MIB,
         "iters": n,
     }
 

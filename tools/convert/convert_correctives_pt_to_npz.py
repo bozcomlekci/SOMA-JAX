@@ -35,7 +35,6 @@ import argparse
 import sys
 from pathlib import Path
 import numpy as np
-import torch
 
 
 def main():
@@ -45,46 +44,17 @@ def main():
     p.add_argument("dst", type=Path, help="output .npz")
     args = p.parse_args()
 
-    # weights_only=False is required because SOMA-X stores a meta dict alongside
-    # the tensors (epoch, mask paths, etc.); torch 2.4+ blocks those by default.
-    ck = torch.load(args.src, map_location="cpu", weights_only=False)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from soma_jax.correctives_model import load_correctives_pt
 
-    def dense(t):
-        """Coerce a tensor (sparse or dense) into a float32 numpy array."""
-        if torch.is_tensor(t) and t.is_sparse:
-            t = t.to_dense()
-        return np.asarray(t, dtype=np.float32) if torch.is_tensor(t) else np.asarray(t)
-
-    # SOMA-X correctives ship in centimeters; convert to meters by scaling W2.
-    # See third_party/SOMA-X/soma/correctives_model.py: load_checkpoint multiplies
-    # W2 by `native_unit.meters_per_unit / output_unit.meters_per_unit`.
-    native_unit_name = str(ck.get("unit", "centimeters")).lower()
-    cm_to_m = {"centimeters": 0.01, "millimeters": 0.001, "meters": 1.0}
-    scale = cm_to_m.get(native_unit_name, 0.01)
-
-    W2_dense = dense(ck["W2"]) * scale
-    out = {
-        "C_max":    np.int32(int(ck["C_max"])),
-        "use_tanh": np.bool_(bool(ck["use_tanh"])),
-        "bindpose": dense(ck["bindpose"]),
-        "W1":       dense(ck["W1"]),
-        "W2":       W2_dense,
-    }
-    print(f"  applied native_unit={native_unit_name} -> W2 *= {scale}")
-    if "M1_mask" in ck:
-        out["M1_mask"] = dense(ck["M1_mask"])
-    if "M2_mask" in ck:
-        out["M2_mask"] = dense(ck["M2_mask"])
-    if "joint_indices" in ck:
-        out["joint_indices"] = np.asarray(ck["joint_indices"], dtype=np.int64)
-    if "source_num_joints" in ck:
-        out["source_num_joints"] = np.int32(int(ck["source_num_joints"]))
-
+    # W2 comes back in metres: SOMA-X correctives ship in centimetres and its
+    # load_checkpoint scales W2 by native/output units; see load_correctives_pt.
+    out = load_correctives_pt(args.src)
     args.dst.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.dst, **out)
     print(f"Wrote {args.dst}")
     for k, v in out.items():
-        if isinstance(v, np.ndarray):
+        if isinstance(v, np.ndarray) and v.ndim:
             print(f"  {k:20s} shape={v.shape} dtype={v.dtype}")
         else:
             print(f"  {k:20s} = {v}")

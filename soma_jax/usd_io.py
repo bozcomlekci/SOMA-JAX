@@ -19,7 +19,12 @@ Typical export::
                     bind_transforms_world=bind_transforms, rest_shape=rest_verts)
 
 Upstream: ``soma/io.py (USD half)``
-    Faithful port of that code. UsdSkel rig/animation read+write. The LOD-discovery chain used to BUILD assets is not ported.
+    Faithful port of that code: UsdSkel mesh/rig/animation read+write, the
+    LOD skin-mesh discovery chain and the template-rig readers
+    (``load_rig_from_usd``, ``load_lod_rig_from_usd``, ``load_lod_rigs_from_usd``,
+    same ``RigUSDData`` keys). :func:`load_template_rig` / :func:`load_lod_rig`
+    are SOMA-JAX's own lower-level readers (raw binding arrays), which
+    :mod:`soma_jax.rig_build` builds on.
 """
 from __future__ import annotations
 
@@ -33,7 +38,12 @@ from .units import Unit
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SKIN_MESH_NAME = "c_skin_mid"
+#: Upstream ``DEFAULT_SKIN_MESH_NAME``: the generic skinned-mesh prim name
+#: :func:`save_soma_usd` writes and :func:`load_rig_from_usd` looks for first.
+#: Layers that know their topology name it themselves (``c_skin_mid`` / ``_lo``
+#: / ``_xlo``, :attr:`SOMALayer.default_skin_mesh_name`), which
+#: :func:`export_soma_usd` forwards.
+DEFAULT_SKIN_MESH_NAME = "Mesh"
 _HIPS_IDX = 1
 
 _USD_IMPORT_ERROR = (
@@ -114,6 +124,32 @@ def _is_uv_primvar(pv) -> bool:
     return pv.GetInterpolation() in ("vertex", "varying", "faceVarying")
 
 
+def _read_uv_primvars(mesh) -> dict:
+    """UV primvars of ``mesh`` as ``{name: UVPrimvarEntry}`` (upstream ``_read_uv_primvars``)."""
+    _, _, _, UsdGeom, _, _ = _pxr()
+    uv_data: dict[str, UVPrimvarEntry] = {}
+    for pv in UsdGeom.PrimvarsAPI(mesh).GetPrimvars():
+        if not _is_uv_primvar(pv):
+            continue
+        coords = pv.GetAttr().Get()
+        if not coords or len(coords) == 0:
+            continue
+        uvs = np.array(coords, dtype=np.float32)
+        if uvs.ndim == 1:
+            if uvs.size % 2 != 0:
+                continue
+            uvs = uvs.reshape(-1, 2)
+        uv_indices = None
+        if pv.IsIndexed():
+            idx = pv.GetIndicesAttr().Get()
+            if idx:
+                uv_indices = np.array(idx, dtype=np.int32)
+        uv_data[pv.GetPrimvarName()] = UVPrimvarEntry(
+            coordinates=uvs, indices=uv_indices, interpolation=pv.GetInterpolation()
+        )
+    return uv_data
+
+
 def load_usd_mesh(usd_file_path, mesh_name: str):
     """Load a mesh from a USD file.
 
@@ -149,26 +185,7 @@ def load_usd_mesh(usd_file_path, mesh_name: str):
     if fvi_raw is None or fvc_raw is None:
         raise ValueError(f"Mesh '{mesh_name}' has no face topology")
 
-    uv_data: dict[str, UVPrimvarEntry] = {}
-    for pv in UsdGeom.PrimvarsAPI(mesh).GetPrimvars():
-        if not _is_uv_primvar(pv):
-            continue
-        coords = pv.GetAttr().Get()
-        if not coords or len(coords) == 0:
-            continue
-        uvs = np.array(coords, dtype=np.float32)
-        if uvs.ndim == 1:
-            if uvs.size % 2 != 0:
-                continue
-            uvs = uvs.reshape(-1, 2)
-        uv_indices = None
-        if pv.IsIndexed():
-            idx = pv.GetIndicesAttr().Get()
-            if idx:
-                uv_indices = np.array(idx, dtype=np.int32)
-        uv_data[pv.GetPrimvarName()] = UVPrimvarEntry(
-            coordinates=uvs, indices=uv_indices, interpolation=pv.GetInterpolation()
-        )
+    uv_data = _read_uv_primvars(mesh)
 
     return (
         vertices,
@@ -662,34 +679,59 @@ def export_soma_usd(
     bind_transforms_world,
     rest_shape,
     fps: float = 30.0,
-    unit: str = "meters",
+    unit: Optional[str] = None,
     root_joint_idx: Optional[int] = None,
-    skin_mesh_name: str = DEFAULT_SKIN_MESH_NAME,
+    skin_mesh_name: Optional[str] = None,
 ) -> None:
     """Export a skeletal animation to USD from a SOMA-JAX layer.
 
     Convenience wrapper around :func:`save_soma_usd` that pulls joint names,
-    parents, skinning weights and faces off the layer's public rig view.
+    parents, skinning weights and faces off the layer, as upstream's
+    ``export_soma_usd`` does for any layer with a fitted rig: a
+    :class:`~soma_jax.SOMALayer` (its public rig), a
+    :class:`~soma_jax.hand.SOMAHandLayer`, or a MANO / SMPL-family layer.
 
     Because SOMA-JAX layers are immutable and do not cache identity state, the
     fitted rig is passed explicitly — take both from
-    ``layer.prepare_identity(..., return_bind_transforms=True)``. (Upstream
-    reads them from the layer's ``_cached_*`` attributes instead.)
+    ``layer.prepare_identity(..., return_bind_transforms=True)`` (body) or the
+    identity :meth:`~soma_jax.hand.SOMAHandLayer.prepare_identity` returns
+    (``rest_shape``, ``bind_transforms_world``). Upstream reads them from the
+    layer's ``_cached_*`` attributes instead.
 
     Args:
         output_path: destination USD path.
-        soma_layer: a :class:`~soma_jax.SOMALayer`.
+        soma_layer: the layer that produced ``rotations``.
         rotations: (N, J, 3, 3) absolute local rotation matrices, e.g. from
-            :meth:`~soma_jax.SOMAPoseInversion.fit`.
+            :meth:`~soma_jax.SOMAPoseInversion.fit`; a procedural body layer
+            also takes its expanded (target) rig's rotations.
         root_translation: (N, 3) root translation.
         bind_transforms_world: (J, 4, 4) or (1, J, 4, 4) fitted bind transforms.
         rest_shape: (V, 3) or (1, V, 3) fitted rest mesh.
         fps: animation frame rate.
-        unit: unit string written to the USD metadata.
-        root_joint_idx: joint receiving ``root_translation`` (default 1).
-        skin_mesh_name: leaf name for the skinned mesh prim.
+        unit: unit string written to the USD metadata. ``None`` takes the
+            layer's ``output_unit`` (metres for the body layer); a value that
+            contradicts the layer's ``output_unit`` is rejected, as upstream.
+        root_joint_idx: joint receiving ``root_translation``; defaults to the
+            layer's ``root_joint_idx`` (1 = Hips for the body, 0 for hands).
+        skin_mesh_name: leaf name for the skinned mesh prim. ``None`` (the
+            default) takes ``soma_layer.default_skin_mesh_name`` when the layer
+            has one, else :data:`DEFAULT_SKIN_MESH_NAME` — as upstream.
     """
     from .geometry.rig_utils import joint_world_to_local
+
+    if skin_mesh_name is None:
+        skin_mesh_name = getattr(soma_layer, "default_skin_mesh_name", DEFAULT_SKIN_MESH_NAME)
+    if root_joint_idx is None:
+        root_joint_idx = getattr(soma_layer, "root_joint_idx", _HIPS_IDX)
+    layer_unit = getattr(soma_layer, "output_unit", None)
+    layer_unit_name = layer_unit.unit_name if layer_unit is not None else "meters"
+    if unit is None:
+        unit = layer_unit_name
+    elif layer_unit is not None and unit != layer_unit_name:
+        raise ValueError(
+            "export_soma_usd writes the layer's output_unit data. "
+            f"Got unit={unit!r}, but soma_layer.output_unit is {layer_unit_name!r}. "
+            "Construct the layer with the desired output_unit before exporting.")
 
     bw = _to_np(bind_transforms_world)
     if bw.ndim == 4 and bw.shape[0] == 1:
@@ -698,32 +740,38 @@ def export_soma_usd(
     if rs.ndim == 3 and rs.shape[0] == 1:
         rs = rs[0]
 
-    parents = np.asarray(soma_layer._parents_np)
+    if hasattr(soma_layer, "_parents_np"):            # SOMALayer: its public rig
+        parents = np.asarray(soma_layer._parents_np)
+        joint_names = [str(n) for n in soma_layer.joint_names]
+        weights = soma_layer.public_skinning_weights()
+        # Expanded-rig (target) rotations reduce to the public joints, as
+        # upstream exports a procedural layer through its public rig view.
+        rotations = soma_layer.to_public_rotations(rotations)
+    else:                                              # hand / MANO / SMPL family
+        parents = np.asarray(soma_layer.joint_parent_ids)
+        joint_names = [str(n) for n in soma_layer.rig_data["joint_names"]]
+        weights = soma_layer.skinning_weights
     bl = _to_np(joint_world_to_local(bw, parents))
 
     rots = _to_np(rotations)
-    expected = len(soma_layer.joint_names)
-    if rots.shape[-3] != expected:
+    if rots.shape[-3] != len(joint_names):
         raise ValueError(
-            f"Expected rotations for {expected} joints, got {rots.shape[-3]}."
-        )
+            f"Expected rotations for {len(joint_names)} joints, got {rots.shape[-3]}.")
 
     save_soma_usd(
         output_path,
         rots,
         _to_np(root_translation),
-        joint_names=[str(n) for n in soma_layer.joint_names],
+        joint_names=joint_names,
         joint_parent_ids=parents,
         bind_transforms_world=bw,
         bind_transforms_local=bl,
         rest_shape=rs,
         faces=_to_np(soma_layer.faces),
-        skinning_weights=_to_np(soma_layer.public_skinning_weights()),
+        skinning_weights=_to_np(weights),
         unit=unit,
         fps=fps,
-        root_joint_idx=(
-            root_joint_idx if root_joint_idx is not None else _HIPS_IDX
-        ),
+        root_joint_idx=root_joint_idx,
         skin_mesh_name=skin_mesh_name,
     )
 
@@ -732,8 +780,8 @@ def load_template_rig(usd_path=None, mesh_name: str = "c_skin_mid") -> dict:
     """Load the **expanded** template rig (skeleton + skinning) from the USD.
 
     The runtime archive this repo builds carries the 78-joint *public* rig. The
-    template USD additionally authors the full skeleton — 122 joints with bind
-    transforms — and binds the skin mesh to a subset of them. Upstream skins
+    template USD additionally authors the full skeleton — 110 joints with bind
+    transforms on the v0027 template (122 on v0026) — and binds the skin mesh to a subset of them. Upstream skins
     with that expanded rig by default (its procedural transforms expand the
     public pose to fill it); reading it is the prerequisite for doing the same
     here.
@@ -811,6 +859,16 @@ def load_template_rig(usd_path=None, mesh_name: str = "c_skin_mid") -> dict:
     name_to_skel = {n: i for i, n in enumerate(names)}
     bound_to_skeleton = np.asarray([name_to_skel.get(n, -1) for n in bound_names], np.int32)
 
+    # The skin mesh's points ARE the bind shape: upstream `io._load_rig_from_usd_stage`
+    # reads `bind_shape` from here. Since the v0.3 asset contract the npz no
+    # longer carries `bind_shape` at all, so the template is its only source.
+    geom = UsdGeom.Mesh(mesh)
+    points = geom.GetPointsAttr().Get()
+    if not points:
+        raise ValueError(f"Mesh {mesh_name!r} has no points")
+    fvi = geom.GetFaceVertexIndicesAttr().Get()
+    fvc = geom.GetFaceVertexCountsAttr().Get()
+
     return {
         "joint_names": names,
         "parents": parents,
@@ -820,6 +878,9 @@ def load_template_rig(usd_path=None, mesh_name: str = "c_skin_mid") -> dict:
         "joint_indices": joint_indices,
         "joint_weights": joint_weights,
         "bound_to_skeleton": bound_to_skeleton,
+        "points": np.asarray(points, dtype=np.float32),
+        "face_vert_indices": None if fvi is None else np.asarray(fvi, dtype=np.int32),
+        "face_vert_counts": None if fvc is None else np.asarray(fvc, dtype=np.int32),
     }
 
 
@@ -920,3 +981,211 @@ def load_lod_rig(usd_path=None, lod: str = "mid") -> dict:
     rig["lod"] = lod
     rig["mesh_name"] = name
     return rig
+
+
+# ---------------------------------------------------------------------------
+# Template-rig readers in upstream's `RigUSDData` layout (`soma/io.py`)
+# ---------------------------------------------------------------------------
+def _find_mesh_by_name(stage, name):
+    """The first ``UsdGeomMesh`` whose leaf name is ``name``, or None."""
+    _, _, _, UsdGeom, _, _ = _pxr()
+    for p in stage.Traverse():
+        if p.IsA(UsdGeom.Mesh) and p.GetPath().name == name:
+            return p
+    return None
+
+
+def _find_first_mesh_under_skel_root(stage):
+    """The first ``UsdGeomMesh`` below any ``UsdSkelRoot``, or None."""
+    _, _, Usd, UsdGeom, UsdSkel, _ = _pxr()
+    for root in stage.Traverse():
+        if not root.IsA(UsdSkel.Root):
+            continue
+        for p in Usd.PrimRange(root):
+            if p.IsA(UsdGeom.Mesh):
+                return p
+    return None
+
+
+def _open_usd_stage(usd_path):
+    """Upstream ``_open_usd_stage``: a missing file is a ``FileNotFoundError``."""
+    if not Path(str(usd_path)).exists():
+        raise FileNotFoundError(f"USD file not found: {usd_path}")
+    return _open_stage(usd_path)
+
+
+def _load_rig_from_usd_stage(stage, usd_path, *, skin_mesh_name: Optional[str] = None) -> dict:
+    """Upstream ``_load_rig_from_usd_stage``: rig keys the npz used to carry."""
+    _, _, _, UsdGeom, UsdSkel, _ = _pxr()
+    from scipy.sparse import csc_matrix
+    from .rig_build import _local_from_world, _world_from_local
+
+    usd_path_str = str(usd_path)
+    skel_prim = next((p for p in stage.Traverse() if p.IsA(UsdSkel.Skeleton)), None)
+    if skel_prim is None:
+        raise RuntimeError(f"No UsdSkelSkeleton prim found in '{usd_path_str}'")
+    skel = UsdSkel.Skeleton(skel_prim)
+
+    joint_paths_raw = skel.GetJointsAttr().Get()
+    if joint_paths_raw is None or len(joint_paths_raw) == 0:
+        raise RuntimeError(f"Skeleton '{skel_prim.GetPath()}' in '{usd_path_str}' has no joints")
+    joint_paths = [str(j) for j in joint_paths_raw]
+    J = len(joint_paths)
+
+    bind_xforms = skel.GetBindTransformsAttr().Get()
+    if bind_xforms is None:
+        raise RuntimeError(
+            f"No bindTransforms on skeleton '{skel_prim.GetPath()}' in '{usd_path_str}'")
+    if len(bind_xforms) != J:
+        raise RuntimeError(
+            f"Skeleton '{skel_prim.GetPath()}' has {J} joints but "
+            f"{len(bind_xforms)} bindTransforms in '{usd_path_str}'")
+    bind_usd = np.array(bind_xforms, dtype=np.float32).reshape(J, 4, 4)
+    rest_xforms = skel.GetRestTransformsAttr().Get()
+    if rest_xforms is not None and len(rest_xforms) != J:
+        raise RuntimeError(
+            f"Skeleton '{skel_prim.GetPath()}' has {J} joints but "
+            f"{len(rest_xforms)} restTransforms in '{usd_path_str}'")
+    rest_usd = (np.array(rest_xforms, dtype=np.float32).reshape(J, 4, 4)
+                if rest_xforms is not None else None)
+
+    path_to_idx = {j: i for i, j in enumerate(joint_paths)}
+    joint_parent_ids = np.array(
+        [path_to_idx.get(j.rsplit("/", 1)[0] if "/" in j else "", -1) for j in joint_paths],
+        dtype=np.int32)
+    # Root has no parent in USD (-1); SOMA convention: root points to itself (0).
+    joint_parent_ids[joint_parent_ids < 0] = 0
+    joint_names = np.array([j.split("/")[-1] for j in joint_paths])
+
+    # USD stores row-vector matrices; SOMA uses column vectors.
+    bind_pose_world = bind_usd.swapaxes(-2, -1)
+    t_pose_local = rest_usd.swapaxes(-2, -1) if rest_usd is not None else bind_pose_world.copy()
+    t_pose_world = _world_from_local(t_pose_local.astype(np.float64),
+                                     joint_parent_ids).astype(np.float32)
+    bind_pose_local = _local_from_world(bind_pose_world.astype(np.float64),
+                                        joint_parent_ids).astype(np.float32)
+
+    if skin_mesh_name is not None:
+        if not isinstance(skin_mesh_name, str) or not skin_mesh_name or "/" in skin_mesh_name:
+            raise ValueError(
+                f"skin_mesh_name must be a non-empty leaf name (no '/'), got {skin_mesh_name!r}")
+        skin_prim = _find_mesh_by_name(stage, skin_mesh_name)
+        missing_label = f"named '{skin_mesh_name}'"
+    else:
+        skin_prim = _find_mesh_by_name(stage, DEFAULT_SKIN_MESH_NAME)
+        if skin_prim is None:
+            skin_prim = _find_first_mesh_under_skel_root(stage)
+        missing_label = f"named '{DEFAULT_SKIN_MESH_NAME}' or any UsdGeomMesh under a UsdSkelRoot"
+    if skin_prim is None:
+        available = sorted({p.GetPath().name for p in stage.Traverse() if p.IsA(UsdGeom.Mesh)})
+        raise ValueError(
+            f"Body skin mesh {missing_label} not found in '{usd_path_str}'. "
+            f"Available UsdGeomMesh prims: {available}")
+
+    skin_mesh = UsdGeom.Mesh(skin_prim)
+    pts = skin_mesh.GetPointsAttr().Get()
+    if not pts:
+        raise ValueError(f"Body skin mesh '{skin_prim.GetPath()}' has no points in '{usd_path_str}'")
+    bind_shape = np.array(pts, dtype=np.float32)
+    fvi = skin_mesh.GetFaceVertexIndicesAttr().Get()
+    fvc = skin_mesh.GetFaceVertexCountsAttr().Get()
+
+    binding = UsdSkel.BindingAPI(skin_prim)
+    ji_pv = binding.GetJointIndicesPrimvar()
+    jw_pv = binding.GetJointWeightsPrimvar()
+    if not ji_pv or not jw_pv:
+        raise RuntimeError(
+            "No skinning primvars (skel:jointIndices / skel:jointWeights) "
+            f"found on '{skin_prim.GetPath()}' in '{usd_path_str}'")
+    V = len(bind_shape)
+    K = ji_pv.GetElementSize()
+    if K <= 0:
+        raise RuntimeError(f"Skinning primvar element size is {K} on '{skin_prim.GetPath()}'")
+    ji_raw = np.array(ji_pv.Get(), dtype=np.int32)
+    jw_raw = np.array(jw_pv.Get(), dtype=np.float32)
+    if ji_raw.size != V * K or jw_raw.size != V * K:
+        raise RuntimeError(
+            f"Skinning primvars on '{skin_prim.GetPath()}' have inconsistent shape: "
+            f"expected V*K = {V}*{K} = {V * K}, got jointIndices={ji_raw.size}, "
+            f"jointWeights={jw_raw.size}")
+
+    # The mesh binding may declare its own joint subset; map to skeleton indices.
+    skel_joint_to_idx = {name: i for i, name in enumerate(joint_paths)}
+    binding_joints = binding.GetJointsAttr().Get()
+    if binding_joints and len(binding_joints) > 0:
+        binding_to_skel = np.array(
+            [skel_joint_to_idx.get(str(j), -1) for j in binding_joints], dtype=np.int32)
+    else:
+        binding_to_skel = np.arange(J, dtype=np.int32)
+    v_idx = np.repeat(np.arange(V, dtype=np.int32), K)
+    j_idx = binding_to_skel[ji_raw]
+    valid = (jw_raw > 0) & (j_idx >= 0)
+    W = np.zeros((V, J), dtype=np.float32)
+    np.add.at(W, (v_idx[valid], j_idx[valid]), jw_raw[valid])
+    sw = csc_matrix(W)
+
+    out = {
+        "joint_names": joint_names,
+        "joint_parent_ids": joint_parent_ids,
+        "bind_pose_world": bind_pose_world,
+        "bind_pose_local": bind_pose_local,
+        "t_pose_world": t_pose_world,
+        "t_pose_local": t_pose_local,
+        "bind_shape": bind_shape,
+        "skinning_weights_data": sw.data.astype(np.float32),
+        "skinning_weights_indices": sw.indices.astype(np.int32),
+        "skinning_weights_indptr": sw.indptr.astype(np.int32),
+        "skinning_weights_shape": np.array(sw.shape, dtype=np.int32),
+    }
+    if fvi is not None and fvc is not None:
+        out["face_vert_indices"] = np.array(fvi, dtype=np.int32)
+        out["face_vert_counts"] = np.array(fvc, dtype=np.int32)
+        out["uv_data"] = _read_uv_primvars(skin_mesh)
+    from .io import RigUSDData
+    return RigUSDData(out)
+
+
+def load_rig_from_usd(usd_path, *, skin_mesh_name: Optional[str] = None) -> dict:
+    """Load SOMA template rig data from a UsdSkel USD file.
+
+    Port of upstream ``soma.io.load_rig_from_usd``: the joint hierarchy,
+    bind/T-pose transforms, bind shape and skinning weights — the rig keys that
+    used to be stored in ``SOMA_neutral.npz`` (:data:`soma_jax.io.SOMA_NEUTRAL_RIG_KEYS`),
+    with the root self-parented and the weights as CSC arrays. When the skin
+    mesh carries polygons, ``face_vert_indices``, ``face_vert_counts`` and
+    ``uv_data`` are included too.
+
+    Args:
+        usd_path: the ``.usda`` / ``.usdc`` / ``.usd`` template rig.
+        skin_mesh_name: leaf name of the body skin mesh. ``None`` looks for
+            :data:`DEFAULT_SKIN_MESH_NAME`, then the first mesh under a
+            ``UsdSkelRoot``.
+    """
+    return _load_rig_from_usd_stage(_open_usd_stage(usd_path), usd_path,
+                                    skin_mesh_name=skin_mesh_name)
+
+
+def load_lod_rig_from_usd(usd_path, lod: str, *, skin_mesh_name: Optional[str] = None) -> dict:
+    """Rig data for one body LOD (upstream ``load_lod_rig_from_usd``)."""
+    stage = _open_usd_stage(usd_path)
+    if skin_mesh_name is None:
+        skin_mesh_name = find_lod_skin_mesh_name(usd_path, lod)
+    return _load_rig_from_usd_stage(stage, usd_path, skin_mesh_name=skin_mesh_name)
+
+
+def load_lod_rigs_from_usd(usd_path, lods: Sequence[str], *,
+                           skin_mesh_names: Optional[Mapping[str, str]] = None) -> dict:
+    """Several LOD rigs from one USD file (upstream ``load_lod_rigs_from_usd``)."""
+    stage = _open_usd_stage(usd_path)
+    skin_mesh_names = skin_mesh_names or {}
+    rigs: dict = {}
+    for lod in lods:
+        lod_key = lod.lower()
+        if lod_key in rigs:
+            continue
+        name = skin_mesh_names.get(lod_key, skin_mesh_names.get(lod))
+        if name is None:
+            name = find_lod_skin_mesh_name(usd_path, lod_key)
+        rigs[lod_key] = _load_rig_from_usd_stage(stage, usd_path, skin_mesh_name=name)
+    return rigs
+

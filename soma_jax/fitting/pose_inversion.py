@@ -1,7 +1,7 @@
-"""Faithful JAX port of SOMA-X's :mod:`soma.pose_inversion`.
+"""Faithful JAX port of SOMA-X's :mod:`soma.fitting.pose_inversion`.
 
 Recovers SOMA skeleton rotations from posed mesh vertices using the same
-multi-stage solver as upstream ``soma.pose_inversion.PoseInversion``:
+multi-stage solver as upstream ``soma.fitting.pose_inversion.PoseInversion``:
 
 - **Analytical**: a :class:`~soma_jax.geometry.skeleton_transfer.SkeletonTransfer`
   warm start followed by top-down per-joint inverse-LBS Procrustes refits
@@ -18,23 +18,25 @@ multi-stage solver as upstream ``soma.pose_inversion.PoseInversion``:
 (absolute local rotation matrices), ``root_translation`` and
 ``per_vertex_error``, matching upstream.
 
-This module is the *faithful* inversion path.
-:class:`soma_jax.pose_inversion.PoseInversion` remains available as the
-lightweight SOMA-JAX alternative (single Kabsch init + one autograd refine).
+This module is the *faithful* inversion path, also importable from the
+pre-0.3 path ``soma_jax.pose_inversion`` as upstream's is from
+``soma.pose_inversion``. :class:`soma_jax.pose_inversion_lite.PoseInversion`
+(the top-level ``soma_jax.PoseInversion``) is the lightweight SOMA-JAX
+alternative (single Kabsch init + one autograd refine).
 
 Usage::
 
     from soma_jax import SOMALayer, SOMAPoseInversion
 
-    layer = SOMALayer.load("assets/SOMA_neutral_fixed.npz")
-    inv = SOMAPoseInversion(layer)
+    layer = SOMALayer.from_upstream_assets()
+    inv = SOMAPoseInversion(layer)       # refits on an internal low-LOD layer
     inv.prepare_identity(identity_coeffs)
 
     result = inv.fit(posed_vertices)             # analytical + Lie-GN
     result = inv.fit(posed_vertices, lie_iters=0)               # analytical only
     result = inv.fit(posed_vertices, autograd_iters=10)         # + autograd FK
 
-Upstream: ``soma/pose_inversion.py :: PoseInversion``
+Upstream: ``soma/fitting/pose_inversion.py :: PoseInversion``
     Faithful port of that code. All three stages: SkeletonTransfer warm start -> inverse-LBS Procrustes refit -> Lie-algebra Gauss-Newton -> optional autograd FK.
 """
 from __future__ import annotations
@@ -47,15 +49,20 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from .geometry.lbs import compute_skeleton_levels, fk_levelorder_transforms, lbs_sparse
-from .geometry.rig_utils import (
+from ..geometry.lbs import (
+    batch_rodrigues,
+    compute_skeleton_levels,
+    fk_levelorder_transforms,
+    lbs_sparse,
+)
+from ..geometry.rig_utils import (
     body_part_vertex_ids,
     get_joint_descendents,
     joint_world_to_local,
 )
-from .geometry.skeleton_transfer import SkeletonTransfer
-from .geometry.transforms import (
-    axis_angle_to_rotmat,
+from ..geometry.skeleton_transfer import SkeletonTransfer
+from ..geometry.transforms import (
+    align_vectors,
     compute_covariance,
     newton_schulz,
     regularize_covariance_with_reference,
@@ -152,6 +159,22 @@ def _to_sparse_weights(dense_weights: np.ndarray, K: int) -> tuple[np.ndarray, n
     return vals.astype(np.float32), idx.astype(np.int32)
 
 
+def _active_lie_joint_indices(descendant_weights, root_idx: int) -> np.ndarray:
+    """Joints with geometry influence, excluding the full-body virtual root.
+
+    Port of upstream ``pose_inversion._active_lie_joint_indices`` (SOMA-X
+    v0.2.4), part 2 of the fixed-root change: the virtual Root's descendant
+    weight row is nonzero — it is an ancestor of every bone — yet it must stay
+    at identity, so it is factored out with the zero-influence leaf joints.
+    With ``root_idx == 0`` (hand-only rigs) joint 0 is a real wrist and stays
+    active.
+    """
+    active = np.asarray(jnp.any(jnp.asarray(descendant_weights) > 0, axis=1)).copy()
+    if root_idx > 0:
+        active[0] = False
+    return np.where(active)[0]
+
+
 def _align_vectors_auto(
     target: jnp.ndarray,
     source: jnp.ndarray,
@@ -163,7 +186,9 @@ def _align_vectors_auto(
     Mirrors upstream ``_align_vectors_auto``: regularize the covariance toward
     the current world rotation so an under-constrained twist axis keeps its
     previous value instead of snapping to an arbitrary one, then fall back to
-    SVD Kabsch only where Newton-Schulz did not land in SO(3).
+    SVD Kabsch where Newton-Schulz did not land in SO(3) **or** the regularized
+    covariance is reflected (``det < 0``) — SOMA-X v0.2.2: a Newton-Schulz
+    result there is a valid rotation but not the nearest one.
     """
     covariance = compute_covariance(target, source, virtual_normal=True, eps=eps)
     regularized = regularize_covariance_with_reference(
@@ -174,8 +199,15 @@ def _align_vectors_auto(
     )
     R = newton_schulz(regularized)
     valid = rotation_matrices_are_valid(R, det_tol=1e-3, orthogonality_tol=1e-3)
-    fallback = rotation_from_covariance(regularized, method="kabsch")
-    return jnp.where(valid[..., None, None], R, fallback)
+    needs_kabsch = (~valid | (jnp.linalg.det(regularized) < 0))[..., None, None]
+    # Upstream runs Kabsch only where it is needed; `jnp.where` evaluates it
+    # everywhere, so the slots it does not serve get a placeholder with
+    # distinct singular values, keeping their discarded SVD gradient finite.
+    placeholder = jnp.broadcast_to(
+        jnp.diag(jnp.asarray([3.0, 2.0, 1.0], regularized.dtype)), regularized.shape)
+    fallback = rotation_from_covariance(
+        jnp.where(needs_kabsch, regularized, placeholder), method="kabsch")
+    return jnp.where(needs_kabsch, fallback, R)
 
 
 def _classify_joints(joint_names, parents: np.ndarray) -> tuple[set[int], set[int]]:
@@ -318,7 +350,7 @@ def _precompute_refit_cache(
     *non-subtree* part (does not), which is what makes the per-joint
     inverse-LBS Procrustes solve exact.
     """
-    from .geometry.batched_skinning import topk_skinning
+    from ..geometry.batched_skinning import topk_skinning
 
     parents = np.asarray(parents).astype(np.int64)
     J = len(parents)
@@ -488,8 +520,7 @@ def _refit_joint(
     if rotation_method == "auto":
         R_new = _align_vectors_auto(tgt, src, W[:, j_idx, :3, :3])
     else:
-        H = compute_covariance(tgt, src, virtual_normal=True)
-        R_new = rotation_from_covariance(H, method=rotation_method)
+        R_new = align_vectors(tgt, src, method=rotation_method)
 
     grandparent_idx = int(cache["parents"][j_idx])
     if grandparent_idx == j_idx or grandparent_idx < 0:
@@ -510,7 +541,6 @@ def _constrain_1dof_z(pose_local: jnp.ndarray, cache) -> jnp.ndarray:
     orient_j = cd["orient_j"]
     orient_p = cd["orient_p"]
 
-    B = pose_local.shape[0]
     R_abs = pose_local[:, indices, :3, :3]
 
     R_tpose = orient_p[None] @ R_abs @ jnp.swapaxes(orient_j, -2, -1)[None]
@@ -643,41 +673,142 @@ def _solve_lie_gn_normal_equations(JtJ: jnp.ndarray, rhs: jnp.ndarray) -> jnp.nd
 # ---------------------------------------------------------------------------
 
 
-class SOMAPoseInversion:
+class _LayerContractView:
+    """Upstream's ``PoseInversion`` layer contract, seen through SOMA-JAX layers.
+
+    Upstream's ``PoseInversion`` accepts any layer that exposes a fitted rig —
+    ``SOMALayer``, ``SOMAHandLayer``, ``MANOLayer`` and the SMPL family — and
+    reads its cached bind transforms and rest shape. SOMA-JAX layers are
+    immutable and their ``prepare_identity`` returns the identity instead, so
+    this view adapts a :class:`~soma_jax.hand.SOMAHandLayer` or an SMPL-family
+    / MANO layer (``prepare_identity`` -> ``(rest_shape, bind_transforms_world)``)
+    to the surface :class:`SOMAPoseInversion` reads from a :class:`SOMALayer`.
+    """
+
+    def __init__(self, layer) -> None:
+        self.layer = layer
+        self.v_template = jnp.asarray(layer.bind_shape)
+        self._lod_mid_to_low_np = None
+        self._lod_mid_num_verts = None
+        self.lod = getattr(layer, "lod", None)
+        self.identity_model_type = getattr(layer, "identity_model_type", None)
+        self.identity_model = getattr(layer, "identity_model", None)
+        parents = np.asarray(layer.joint_parent_ids, np.int64)
+        self._parents_np = parents
+        self.weights = jnp.asarray(layer.skinning_weights)
+        self.t_pose_world = layer.t_pose_world
+        self.joint_names = [str(n) for n in layer.rig_data["joint_names"]]
+        excluded = getattr(layer, "excluded_vert_ids", None)
+        self.excluded_vert_ids = (None if excluded is None or len(excluded) == 0
+                                  else np.asarray(excluded, np.int64))
+        self.skeleton_transfer = getattr(layer, "skeleton_transfer", None)
+        self.root_joint_idx = int(getattr(layer, "root_joint_idx", _HIPS_IDX))
+
+    def prepare_identity(self, identity_coeffs, scale_params=None, repose_to_bind_pose=True,
+                         skeleton_fit="auto", return_bind_transforms=True, kwargs=None):
+        extra = {} if kwargs is None else {"kwargs": kwargs}
+        identity = self.layer.prepare_identity(identity_coeffs, scale_params,
+                                               repose_to_bind_pose=repose_to_bind_pose, **extra)
+        bind = identity.bind_transforms_world
+        return identity.rest_shape, bind[..., :3, 3], bind
+
+
+def _is_soma_body_layer(layer) -> bool:
+    return hasattr(layer, "_parents_np") and hasattr(layer, "skeleton_levels")
+
+
+def _build_low_lod_refit_layer(layer):
+    """Upstream ``PoseInversion.__init__``'s internal ``SOMALayer(lod="low")``.
+
+    Upstream rebuilds the layer from its ``data_root`` with the same identity
+    backend, ``mode``, ``output_unit``, ``identity_model_kwargs``, template rig
+    and procedural flag. Everything else takes the constructor default, so a
+    procedural layer loads the default corrective checkpoint and no
+    constructor-default reference pose carries over.
+    """
+    if not _is_soma_body_layer(layer):
+        # Upstream would build a *body* SOMALayer from a hand / MANO / SMPL
+        # layer here; every upstream caller passes low_lod=False instead.
+        raise ValueError(
+            f"low_lod=True builds an internal low-LOD body SOMALayer; "
+            f"{type(layer).__name__} refits on its own mesh, so pass low_lod=False.")
+    recipe = getattr(layer, "_build_recipe", None)
+    if recipe is None:
+        raise ValueError(
+            "low_lod=True rebuilds this layer at the low LOD from its constructor "
+            "arguments, but it was not built by SOMALayer.load() or "
+            "SOMALayer.from_upstream_assets() (or was rebound since). Pass a "
+            "lod='low' layer, or low_lod=False.")
+    from ..body.soma import SOMALayer
+
+    kwargs = dict(recipe.kwargs)
+    identity_kwargs = kwargs.get("identity_model_kwargs")
+    if identity_kwargs and "mhr_model" in identity_kwargs:
+        # SOMA-JAX extra: a shared MHR model is the mid-LOD (lod1) one; the
+        # low-LOD backend reads its own lod6 model, as upstream's does.
+        kwargs["identity_model_kwargs"] = {
+            k: v for k, v in identity_kwargs.items() if k != "mhr_model"}
+    return getattr(SOMALayer, recipe.factory)(lod="low", **kwargs)
+
+
+class PoseInversion:
     """Invert posed vertices to SOMA skeleton rotations — faithful SOMA-X solver.
 
     Args:
-        soma_layer: a :class:`~soma_jax.SOMALayer`.
-        low_lod: assert that the layer handed in is low-LOD. Upstream builds a
-            *separate* internal low-LOD layer for the refit; SOMA-JAX refits on
-            whichever layer you pass, so build it with
-            ``SOMALayer.load(path, lod="low")`` and hand that in. Full-
-            resolution inputs are subsampled automatically when the layer is
-            low-LOD, so ``fit()`` still accepts mid-LOD vertices.
+        soma_layer: a :class:`~soma_jax.SOMALayer` (any LOD).
+        low_lod: refit on the low-LOD SOMA topology (4,505 vertices), as
+            upstream (default ``True``). When the layer handed in is mid-LOD, a
+            second low-LOD layer is built internally for the refit, from the
+            constructor arguments :meth:`SOMALayer.load` /
+            :meth:`SOMALayer.from_upstream_assets` recorded; ``fit()`` still
+            accepts mid-LOD vertices and subsamples them. XLO layers keep their
+            own topology. Hand, MANO and SMPL-family layers refit on their own
+            mesh and need ``low_lod=False``, as every upstream caller passes.
         skeleton_transfer_rotation_method: rotation extraction for the initial
             :class:`SkeletonTransfer` estimate (``"auto"``, ``"kabsch"``,
-            ``"newton-schulz"``).
+            ``"newton-schulz"``); validated on assignment too.
         refit_rotation_method: rotation extraction for the analytical
-            inverse-LBS refit.
-        root_joint_idx: index of the root joint (1 = Hips for full-body SOMA).
+            inverse-LBS refit; validated on assignment too.
+        root_joint_idx: index of the root joint. ``None`` (default) reads the
+            layer's ``root_joint_idx`` as upstream does: 1 (Hips, below the
+            virtual Root) for the body, 0 (the real wrist) for hand and
+            SMPL-family / MANO layers.
+
+    Any upstream-contract layer works: a :class:`~soma_jax.SOMALayer`, or a
+    :class:`~soma_jax.hand.SOMAHandLayer` / MANO / SMPL-family layer through
+    :class:`_LayerContractView`.
     """
 
     def __init__(
         self,
         soma_layer,
-        low_lod: bool = False,
+        low_lod: bool = True,
         skeleton_transfer_rotation_method: str = "auto",
         refit_rotation_method: str = "auto",
-        root_joint_idx: int = _HIPS_IDX,
+        root_joint_idx: Optional[int] = None,
     ) -> None:
         self._soma_orig = soma_layer
+        self._cache = None
+        self._skel_transfer = None
+        if root_joint_idx is None:
+            root_joint_idx = getattr(soma_layer, "root_joint_idx", _HIPS_IDX)
         self._root_joint_idx = int(root_joint_idx)
-        self.skeleton_transfer_rotation_method = _validate_rotation_method(
-            skeleton_transfer_rotation_method, "skeleton_transfer_rotation_method"
-        )
-        self.refit_rotation_method = _validate_rotation_method(
-            refit_rotation_method, "refit_rotation_method"
-        )
+        self.output_unit = getattr(soma_layer, "output_unit", None)
+        procedural_transforms_enabled = bool(
+            getattr(soma_layer, "procedural_transforms_enabled", False))
+        # Upstream: "XLO layers keep their own topology because there is no
+        # direct xlo-to-low vertex transfer" — `low_lod` is dropped for them.
+        if getattr(soma_layer, "lod", None) == "xlo":
+            low_lod = False
+        self.skeleton_transfer_rotation_method = skeleton_transfer_rotation_method
+        self.refit_rotation_method = refit_rotation_method
+
+        # Decide which layer the refit runs on: upstream builds an internal
+        # low-LOD SOMALayer when handed any other LOD.
+        if low_lod and not getattr(soma_layer, "low_lod", False):
+            soma_layer = _build_low_lod_refit_layer(soma_layer)
+        if not _is_soma_body_layer(soma_layer):
+            soma_layer = _LayerContractView(soma_layer)
 
         self.soma = soma_layer
         self._num_verts = int(soma_layer.v_template.shape[0])
@@ -700,16 +831,14 @@ class SOMAPoseInversion:
                 else int(self._mid_to_low.max()) + 1
             )
 
-        if low_lod and self._mid_to_low is None:
-            raise ValueError(
-                "low_lod=True but this layer is not low-LOD. SOMA-JAX refits on the "
-                "layer you pass rather than building an internal one, so load it "
-                "with SOMALayer.load(path, lod='low') and hand that layer in instead."
-            )
-        self._cache = None
-        self._skel_transfer = None
         self._rest_shape = None
         self._bind_world = None
+        self._scale_params = None
+        # Upstream (`PoseInversion.__init__`): a layer with procedural twist
+        # joints doubles as the autograd layer, so the autograd stage runs LBS
+        # through the twist rig (`_fit_autograd_public_layer`) while the
+        # analytical stages use the public rig view.
+        self._autograd_soma = self.soma if procedural_transforms_enabled else None
 
         # Upstream gates the dedicated MHR interpolator on exactly these three
         # conditions (`soma/pose_inversion.py`): a low-LOD layer, the MHR
@@ -728,6 +857,25 @@ class SOMAPoseInversion:
     @property
     def joint_names(self) -> list[str]:
         return list(self.soma.joint_names)
+
+    @property
+    def skeleton_transfer_rotation_method(self) -> str:
+        return self._skeleton_transfer_rotation_method
+
+    @skeleton_transfer_rotation_method.setter
+    def skeleton_transfer_rotation_method(self, method: str) -> None:
+        method = _validate_rotation_method(method, "skeleton_transfer_rotation_method")
+        self._skeleton_transfer_rotation_method = method
+        if self._skel_transfer is not None:
+            self._skel_transfer.rotation_method = method
+
+    @property
+    def refit_rotation_method(self) -> str:
+        return self._refit_rotation_method
+
+    @refit_rotation_method.setter
+    def refit_rotation_method(self, method: str) -> None:
+        self._refit_rotation_method = _validate_rotation_method(method, "refit_rotation_method")
 
     def _setup_pose_transfer(self) -> None:
         """Build the direct full-res-MHR -> low-SOMA interpolator.
@@ -759,8 +907,8 @@ class SOMAPoseInversion:
         """
         import trimesh
 
-        from .assets import resolve
-        from .geometry.barycentric_interp import compute_barycentric_coords
+        from ..assets import resolve
+        from ..geometry.barycentric_interp import compute_barycentric_coords
 
         mhr = trimesh.load(resolve("MHR/base_body_lod1.obj"),
                            maintain_order=True, process=False)
@@ -797,7 +945,7 @@ class SOMAPoseInversion:
         elif (self._pose_transfer is not None
               and V == self._pose_transfer_num_verts):
             # Upstream prefers this over the identity model whenever it exists.
-            from .geometry.barycentric_interp import barycentric_interpolate
+            from ..geometry.barycentric_interp import barycentric_interpolate
             faces, face_ids, bary = self._pose_transfer
             out = barycentric_interpolate(
                 vertices, jnp.asarray(faces), jnp.asarray(face_ids), jnp.asarray(bary))
@@ -816,6 +964,16 @@ class SOMAPoseInversion:
         correspondence instead of refusing the input.
         """
         model = getattr(self.soma, "identity_model", None)
+        interp = getattr(model, "_interp", None)
+        if interp is not None:
+            # Data-root and hand backends: upstream's `identity_model._to_soma_interp`.
+            from ..geometry.barycentric_interp import barycentric_interpolate
+            faces, face_ids, bary = interp
+            if int(np.asarray(faces).max()) >= V:
+                raise ValueError(
+                    f"Vertex count {V} does not match the refit topology "
+                    f"({self._num_verts}) or the identity model's source mesh.")
+            return barycentric_interpolate(vertices, faces, face_ids, bary)
         face_ids = getattr(model, "_face_ids", None)
         bary = getattr(model, "_bary_coords", None)
         src_faces = getattr(model, "src_faces", None)
@@ -833,7 +991,7 @@ class SOMAPoseInversion:
                 f"Vertex count {V} does not match the identity model's source "
                 f"topology ({int(np.asarray(src_template).shape[0])})."
             )
-        from .geometry.barycentric_interp import barycentric_interpolate
+        from ..geometry.barycentric_interp import barycentric_interpolate
         out = barycentric_interpolate(
             vertices, jnp.asarray(src_faces), jnp.asarray(face_ids), jnp.asarray(bary))
         if out.shape[-2] != self._num_verts:
@@ -852,6 +1010,7 @@ class SOMAPoseInversion:
         scale_params: Optional[jnp.ndarray] = None,
         repose_to_bind_pose: bool = True,
         skeleton_fit: str = "auto",
+        kwargs: Optional[dict] = None,
     ) -> None:
         """Fit the rig for an identity, then build the refit caches.
 
@@ -864,9 +1023,14 @@ class SOMAPoseInversion:
             scale_params: optional (B, S) body-part scales.
             repose_to_bind_pose: repose the rest shape into SOMA's bind pose.
             skeleton_fit: forwarded to ``SOMALayer.prepare_identity``.
+            kwargs: forwarded to the identity model (upstream's ``kwargs``,
+                e.g. MHR's per-frame ``bone_length_flexibles``).
         """
-        coeffs = identity_coeffs[None] if identity_coeffs.ndim == 1 else identity_coeffs
-        if scale_params is not None and scale_params.ndim == 1:
+        coeffs = (identity_coeffs[None]
+                  if not isinstance(identity_coeffs, dict) and identity_coeffs.ndim == 1
+                  else identity_coeffs)
+        if (scale_params is not None and not isinstance(scale_params, dict)
+                and scale_params.ndim == 1):
             scale_params = scale_params[None]
 
         rest_shape, _, bind_world = self.soma.prepare_identity(
@@ -875,6 +1039,7 @@ class SOMAPoseInversion:
             repose_to_bind_pose=repose_to_bind_pose,
             skeleton_fit=skeleton_fit,
             return_bind_transforms=True,
+            kwargs=kwargs,
         )
         if bind_world is None:
             raise RuntimeError(
@@ -883,12 +1048,18 @@ class SOMAPoseInversion:
             )
         self._rest_shape = rest_shape
         self._bind_world = bind_world
+        self._scale_params = scale_params
 
         bind_world_0 = np.asarray(bind_world[0])
         bind_shape_0 = np.asarray(rest_shape[0])
         parents = np.asarray(self.soma._parents_np).astype(np.int64)
 
-        src = self.soma.skeleton_transfer
+        # Upstream passes `soma.excluded_vert_ids`: the facial inner geometry in
+        # the layer's own mesh indexing. On an xlo layer that differs from the
+        # layer's skeleton-fit exclusion, which lives on the low LOD.
+        excluded = getattr(self.soma, "excluded_vert_ids", None)
+        if excluded is None and self.soma.skeleton_transfer is not None:
+            excluded = self.soma.skeleton_transfer.vertex_ids_to_exclude
         if self._skel_transfer is None:
             self._skel_transfer = SkeletonTransfer(
                 parents,
@@ -896,14 +1067,17 @@ class SOMAPoseInversion:
                 bind_shape_0,
                 np.asarray(self.soma.weights),
                 rotation_method=self.skeleton_transfer_rotation_method,
-                vertex_ids_to_exclude=(
-                    src.vertex_ids_to_exclude if src is not None else None
-                ),
+                vertex_ids_to_exclude=excluded,
+                root_joint_idx=self._root_joint_idx,
             )
         else:
             self._skel_transfer.update_bind(bind_world_0, bind_shape_0)
 
-        t_pose_world = self.soma.t_pose_world
+        # Upstream: the public view's T-pose on a SOMA layer, else the layer's own.
+        public_view = (self.soma.public_rig_view(bind_world)
+                       if hasattr(self.soma, "public_rig_view") else None)
+        t_pose_world = (public_view.t_pose_world if public_view is not None
+                        else self.soma.t_pose_world)
         if t_pose_world is None:
             t_pose_world = np.broadcast_to(np.eye(4, dtype=np.float32), (len(parents), 4, 4))
 
@@ -1070,6 +1244,8 @@ class SOMAPoseInversion:
             return None
         return {
             "rest_shape": rest,
+            "bind_world": self._bind_world,
+            "scale_params": self._scale_params,
             "bind_local_t": cache.get("bind_local_t"),
             "W_bind_inv": cache.get("W_bind_inv"),
             "bind_verts_arm": {j: jc["bind_verts_arm"]
@@ -1081,6 +1257,11 @@ class SOMAPoseInversion:
         """Narrow the per-identity cache entries to identities ``[start:end)``."""
         cache = self._cache
         self._rest_shape = saved["rest_shape"][start:end]
+        # Read by the procedural autograd stage.
+        if saved["bind_world"] is not None and saved["bind_world"].shape[0] > 1:
+            self._bind_world = saved["bind_world"][start:end]
+        if saved["scale_params"] is not None and saved["scale_params"].shape[0] > 1:
+            self._scale_params = saved["scale_params"][start:end]
         for key in ("bind_local_t", "W_bind_inv"):
             if saved[key] is not None:
                 cache[key] = saved[key][start:end]
@@ -1091,6 +1272,8 @@ class SOMAPoseInversion:
         """Put the full-batch per-identity cache entries back."""
         cache = self._cache
         self._rest_shape = saved["rest_shape"]
+        self._bind_world = saved["bind_world"]
+        self._scale_params = saved["scale_params"]
         for key in ("bind_local_t", "W_bind_inv"):
             if saved[key] is not None:
                 cache[key] = saved[key]
@@ -1199,6 +1382,16 @@ class SOMAPoseInversion:
         )
         W_bind_inv_b = _bexpand4(W_bind_inv, B)
         pose_local = self._init_pose_local(target, cache, init_result)
+        # SOMA-X v0.2.4 ("fixed-root Lie-GN"), part 1 of 2: pin the full-body
+        # virtual Root to identity after the warm start. It is structural — an
+        # ancestor of the whole skeleton with no geometry of its own — so any
+        # rotation there is an unobservable global transform the solve would
+        # otherwise spend a degree of freedom on. Global orientation lives on
+        # the Hips. Hand-only rigs (root_idx == 0) have a real wrist at joint 0
+        # and keep it.
+        has_virtual_root = root_idx > 0
+        if has_virtual_root:
+            pose_local = pose_local.at[:, 0, :3, :3].set(jnp.eye(3, dtype=dtype))
 
         # A[j, k] = 1 when k lies in the subtree of j.
         A = np.zeros((J, J), dtype=np.float32)
@@ -1215,8 +1408,7 @@ class SOMAPoseInversion:
         AW = A @ W_weights.T  # (J, V) total descendant weight per vertex
         # Only joints whose subtree influences geometry are solvable; the rest
         # give structurally singular blocks and are factored out.
-        active_np = np.asarray(jnp.any(AW > 0, axis=1))
-        active_idx = np.where(active_np)[0]
+        active_idx = _active_lie_joint_indices(AW, root_idx)
         K_act = len(active_idx)
         eye3 = jnp.eye(3, dtype=dtype)
         V_verts = bind_shape.shape[-2]
@@ -1278,7 +1470,7 @@ class SOMAPoseInversion:
             accepted_err = pre_err
 
             for alpha in _LINE_SEARCH_ALPHAS:
-                dR = jax.vmap(jax.vmap(axis_angle_to_rotmat))(alpha * delta_omega)
+                dR = batch_rodrigues(alpha * delta_omega, dtype=dtype)
                 R_world_new = dR @ R_world
                 R_local_try = jnp.einsum("bjnm,bjnp->bjmp", R_world_parents, R_world_new)
                 R_local_try = jnp.where(
@@ -1308,6 +1500,11 @@ class SOMAPoseInversion:
         pose_prior=0.0, pose_prior_weights=None, init_result=None,
     ) -> PoseInversionResult:
         """Adam refinement of local 6D rotations + root translation through FK + LBS."""
+        if self._autograd_soma is not None:
+            return self._fit_autograd_public_layer(
+                target, cache, n_iters, lr, translation_lr_scale, leaf_weight,
+                pose_prior, pose_prior_weights, init_result,
+            )
         B = target.shape[0]
         dtype = target.dtype
         parents = cache["parents"]
@@ -1406,6 +1603,115 @@ class SOMAPoseInversion:
             root_translation_drift=jnp.linalg.norm(params["transl"] - root_t_init, axis=-1),
         )
 
+    def _autograd_bone_scales(self, B: int) -> Optional[jnp.ndarray]:
+        """Upstream ``SOMALayer._pose_batch_bone_scales``: SOMA-backend
+        ``scale_params`` are bone-length multipliers applied at pose time."""
+        scale_params = self._scale_params
+        if scale_params is None or getattr(self.soma, "identity_model_type", None) != "soma":
+            return None
+        bone_scales = self.soma.normalize_bone_scales(scale_params)
+        if bone_scales.shape[0] == 1 and B > 1:
+            return jnp.broadcast_to(bone_scales, (B, bone_scales.shape[1]))
+        if bone_scales.shape[0] != B:
+            raise ValueError(
+                "SOMA scale_params batch must be 1 or match the effective pose batch; "
+                f"got {bone_scales.shape[0]} and {B}")
+        return bone_scales
+
+    def _fit_autograd_public_layer(
+        self, target, cache, n_iters, lr, translation_lr_scale, leaf_weight,
+        pose_prior=0.0, pose_prior_weights=None, init_result=None,
+    ) -> PoseInversionResult:
+        """Autograd refinement through the procedural layer — upstream's
+        ``_fit_autograd_public_layer``.
+
+        The optimized variables remain the 78 public rotations (the virtual
+        root pinned to identity) and the root translation, but the forward pass
+        runs through the procedural layer — public FK, twist-joint expansion,
+        LBS on the expanded skinning, no correctives — so the loss sees the
+        twist-joint skinning those public rotations imply.
+        """
+        layer = self._autograd_soma
+        B = target.shape[0]
+        dtype = target.dtype
+        J = len(cache["parents"])
+        root_idx = self._root_joint_idx
+
+        pose_local_init = self._init_pose_local(target, cache, init_result)
+        R_local_init = pose_local_init[:, :, :3, :3].at[:, 0].set(jnp.eye(3, dtype=dtype))
+        root_t_init = pose_local_init[:, root_idx, :3, 3]
+
+        bind_shape = self._rest_shape_b(B)
+        bind_world = _bexpand4(self._bind_world, B)
+        bone_scales = self._autograd_bone_scales(B)
+        vert_weights = _normalized_vertex_weights(
+            cache["joint_names"], cache["parents"], cache["skinning_weights"], leaf_weight,
+            bind_shape=bind_shape, bind_joints=self._bind_joint_positions(cache),
+        )
+        joint_prior_weights = _joint_pose_prior_weights(cache["joint_names"], pose_prior_weights)
+
+        root_6d = jnp.broadcast_to(jnp.eye(3, dtype=dtype)[:2, :].reshape(1, 1, 6), (B, 1, 6))
+        params = {
+            "rot6d": R_local_init[:, 1:, :2, :].reshape(B, J - 1, 6),
+            "transl": root_t_init,
+        }
+
+        def vertices_of(rot6d, transl):
+            r6 = jnp.concatenate([root_6d, rot6d.reshape(B, J - 1, 6)], axis=1)
+            R_local = jax.vmap(jax.vmap(rotation_6d_to_rotmat))(r6)
+            verts = layer.pose(
+                R_local, transl, bind_shape, None, absolute_pose=True,
+                apply_correctives=False, bind_transforms=bind_world, bone_scales=bone_scales,
+            ).vertices
+            return verts, R_local
+
+        def loss_fn(p):
+            verts, R_local = vertices_of(p["rot6d"], p["transl"])
+            if vert_weights is not None:
+                loss = (vert_weights[None, :, None] * (verts - target) ** 2).mean()
+            else:
+                loss = ((verts - target) ** 2).mean()
+            if pose_prior > 0.0:
+                R_delta = R_local[:, 1:] - R_local_init[:, 1:]
+                if joint_prior_weights is not None:
+                    w = joint_prior_weights[1:].reshape(1, -1, 1, 1)
+                    loss = loss + pose_prior * (w * R_delta ** 2).mean()
+                else:
+                    loss = loss + pose_prior * (R_delta ** 2).mean()
+            return loss
+
+        optimizer = optax.multi_transform(
+            {"rot": optax.adam(lr), "transl": optax.adam(lr * translation_lr_scale)},
+            {"rot6d": "rot", "transl": "transl"},
+        )
+
+        def step(carry, _):
+            p, state = carry
+            grads = jax.grad(loss_fn)(p)
+            updates, state = optimizer.update(grads, state)
+            return (optax.apply_updates(p, updates), state), None
+
+        (params, _), _ = jax.lax.scan(
+            step, (params, optimizer.init(params)), None, length=n_iters
+        )
+
+        verts, R_local = vertices_of(params["rot6d"], params["transl"])
+        per_vertex_error = jnp.linalg.norm(verts - target, axis=-1)
+
+        R_rel = jnp.einsum("bjmn,bjpn->bjmp", R_local[:, 1:], R_local_init[:, 1:])
+        cos_angle = (jnp.trace(R_rel, axis1=-2, axis2=-1) - 1.0) * 0.5
+        drift = jnp.zeros((B, J), dtype=dtype).at[:, 1:].set(
+            jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0))
+        )
+
+        return PoseInversionResult(
+            rotations=R_local,
+            root_translation=params["transl"],
+            per_vertex_error=per_vertex_error,
+            local_rotation_drift=drift,
+            root_translation_drift=jnp.linalg.norm(params["transl"] - root_t_init, axis=-1),
+        )
+
     def roundtrip(self, posed_vertices, **kwargs) -> tuple[jnp.ndarray, PoseInversionResult]:
         """Invert then re-pose, for verification.
 
@@ -1426,3 +1732,8 @@ class SOMAPoseInversion:
             self._rest_shape_b(B), cache["bone_weights"], cache["bone_indices"], D
         )
         return vertices, result
+
+
+#: Upstream's name (``soma.fitting.pose_inversion.PoseInversion``).
+#: SOMA-JAX's name for upstream's ``PoseInversion`` (top-level ``soma_jax.SOMAPoseInversion``).
+SOMAPoseInversion = PoseInversion

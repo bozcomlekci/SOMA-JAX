@@ -1,67 +1,66 @@
-"""SMPL-family pose-transfer helpers (JAX port of soma.smpl).
+"""SMPL-family rig layers and pose transfer (JAX port of ``soma.smpl``).
 
-The reference implementation lives at third_party/SOMA-X/soma/smpl/. This
-package provides the same surface, scoped to what JAX backends actually need:
+Upstream: ``soma/smpl/__init__.py``, ``soma/smpl/transfer.py``.
 
-* :class:`BarycentricBridge` — port of SOMA-X's
-  ``SMPLFamilyTopologyBridge``. Computes a (face_ids, bary) wrap from a source
-  rest mesh + faces to a target rest mesh, then applies the resulting barycentric
-  weights to any posed source-mesh sequence.
+**Ported** (:mod:`soma_jax.smpl.transfer`, re-exported here):
+``SMPLFamilyPoseTransferResult``, ``SMPLFamilyTopologyBridge`` and
+``transfer_smpl_family_pose_parameters`` — pose the source rig, bridge its mesh
+onto the target topology, recover the target's absolute local rotations with
+:class:`~soma_jax.fitting.pose_inversion.PoseInversion`.
 
-* :class:`SMPLFamilyPoseTransferResult` — dataclass mirroring the SOMA-X result
-  with ``rotations``, ``root_translation``, ``per_vertex_error``, source / fit /
-  reconstructed vertices.
+**Ported** (:mod:`soma_jax.smpl.layers`): the native SMPL-family rig layers
+``SMPLLayer`` / ``SMPLXLayer``, ``create_smpl_family_layer`` (which also builds
+SOMA-X v0.3's ``MANOLayer``), ``load_smpl_family_model`` and the joint-name
+lists. They implement upstream's PoseInversion layer contract; like every
+SOMA-JAX layer, ``prepare_identity`` returns the identity instead of caching it.
 
-* :class:`SMPLFamilyTopologyBridge` — faithful port of upstream's two-stage
-  ``source -> SOMA wrap -> target`` bridge.
+**SOMA-JAX extras:**
 
-* :func:`transfer_pose_between_layers` — port of
-  ``transfer_smpl_family_pose_parameters``: retargets one SMPL-family model
-  onto another via the SOMA topology pivot (uses
-  :class:`soma_jax.PoseInversion`).
-
-Upstream: ``soma/smpl/__init__.py, soma/smpl/transfer.py``
-    **Ported:** ``SMPLFamilyPoseTransferResult``, ``SMPLFamilyTopologyBridge``
-    and ``transfer_smpl_family_pose_parameters``.
-
-    ``BarycentricBridge`` is a SOMA-JAX-only one-stage helper kept for callers
-    that want SOMA-topology output; it is *not* upstream's bridge — its second
-    stage embeds the target wrap in the canonical mesh rather than the target
-    base mesh, so it stops at SOMA topology. Use
-    :class:`SMPLFamilyTopologyBridge` for a real cross-model transfer.
-
-    **Not ported:** upstream's ``SMPLLayer``/``SMPLXLayer`` and
-    ``create_smpl_family_layer``. Those are SOMA-style ``BatchedSkinning`` rigs
-    with a ``.pose()`` method; this package drives
-    :mod:`soma_jax.body_models` instead, so identity arrives as ``betas``
-    rather than ``identity_coeffs``. See
-    ``tests/test_smpl_transfer.py`` for the pinned behaviour.
+* :class:`BarycentricBridge` — a one-stage helper for callers that want
+  SOMA-topology output. It is *not* upstream's bridge: its second stage embeds
+  the target wrap in the canonical mesh rather than the target base mesh, so it
+  stops at SOMA topology.
+* :func:`transfer_pose_between_layers` — retargets between
+  :mod:`soma_jax.body_models` layers (identity as ``betas``) through the spec
+  form of :class:`SMPLFamilyTopologyBridge` and the lightweight
+  :class:`soma_jax.PoseInversion`, returning local axis-angle. Use
+  :func:`transfer_smpl_family_pose_parameters` for upstream's behaviour.
 """
 from __future__ import annotations
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 import numpy as np
 import jax.numpy as jnp
 
+from .transfer import (  # noqa: E402
+    SMPLFamilyPoseTransferResult,
+    SMPLFamilyTopologyBridge,
+    transfer_smpl_family_pose_parameters,
+)
+from .layers import (  # noqa: E402
+    SMPL_JOINT_NAMES,
+    SMPLX_JOINT_NAMES,
+    SMPLFamilyIdentity,
+    SMPLLayer,
+    SMPLXLayer,
+    create_smpl_family_layer,
+    load_smpl_family_model,
+)
+
 __all__ = [
     "BarycentricBridge",
+    "SMPLFamilyIdentity",
     "SMPLFamilyPoseTransferResult",
     "SMPLFamilyTopologyBridge",
+    "SMPLLayer",
+    "SMPLXLayer",
+    "SMPL_JOINT_NAMES",
+    "SMPLX_JOINT_NAMES",
+    "create_smpl_family_layer",
+    "load_smpl_family_model",
     "transfer_pose_between_layers",
+    "transfer_smpl_family_pose_parameters",
 ]
-
-
-@dataclass
-class SMPLFamilyPoseTransferResult:
-    """Result of fitting target-rig rotations against a source SMPL-family
-    rig animation. Matches third_party/SOMA-X/soma/smpl/transfer.py."""
-    rotations: jnp.ndarray            # (T, J_target, 3) axis-angle
-    root_translation: jnp.ndarray     # (T, 3)
-    per_vertex_error: jnp.ndarray     # (T, V_target)
-    source_vertices: jnp.ndarray      # (T, V_source, 3)
-    fit_vertices: jnp.ndarray         # (T, V_target, 3) source mesh in target topology
-    reconstructed_vertices: jnp.ndarray  # (T, V_target, 3) — target model driven by `rotations`
 
 
 class BarycentricBridge:
@@ -184,133 +183,6 @@ class BarycentricBridge:
         return out[0] if added_T else out
 
 
-class SMPLFamilyTopologyBridge:
-    """Map posed vertices between SMPL-family topologies via the SOMA wrap.
-
-    Faithful port of ``soma.smpl.transfer.SMPLFamilyTopologyBridge``. Upstream
-    routes ``source -> canonical -> target`` through two
-    ``BarycentricInterpolator``\ s, where *canonical* is the **SOMA topology**:
-
-    ==============================  =========================================
-    upstream                        embedding (``BarycentricInterpolator``)
-    ==============================  =========================================
-    ``source_to_canonical``         ``(source_base_v, source_base_f, source_wrap_v)``
-    ``canonical_to_target``         ``(target_wrap_v, target_wrap_f, target_base_v)``
-    ==============================  =========================================
-
-    Read those as "embed the third argument in the mesh given by the first
-    two, then drive it with the deformed first mesh". So stage 1 lifts the
-    source model's own mesh onto SOMA topology, and stage 2 pushes SOMA
-    topology back down onto the *target* model's mesh. Getting the second
-    stage backwards (embedding ``target_wrap_v`` into the canonical mesh)
-    yields SOMA-topology output rather than target topology — that is the
-    distinction :class:`BarycentricBridge` does *not* make, which is why this
-    class exists alongside it.
-
-    ``<MODEL>/base_body.obj`` is the model's native mesh;
-    ``<MODEL>/SOMA_wrap.obj`` is SOMA topology wrapped onto that model. Both
-    ship in the SOMA-X asset packs.
-    """
-
-    #: ``model_spec`` -> (base mesh, SOMA-wrap mesh) relative asset paths.
-    ASSETS = {
-        "smpl": ("SMPL/base_body.obj", "SMPL/SOMA_wrap.obj"),
-        "smplh": ("SMPL/base_body.obj", "SMPL/SOMA_wrap.obj"),
-        "smplx": ("SMPLX/base_body.obj", "SMPLX/SOMA_wrap.obj"),
-        "anny": ("Anny/base_body.obj", "Anny/SOMA_wrap.obj"),
-        "mhr": ("MHR/base_body_lod1.obj", "MHR/SOMA_wrap_lod1.obj"),
-        "garment": ("GarmentMeasurements/mean.obj",
-                    "GarmentMeasurements/SOMA_wrap.obj"),
-    }
-
-    def __init__(
-        self,
-        source_spec: str,
-        target_spec: str,
-        *,
-        scale: float = 1.0,
-        asset_dir: str | Path | None = None,
-    ):
-        """Args:
-            source_spec, target_spec: model identifiers keyed into
-                :py:attr:`ASSETS` (``"smpl"``, ``"smplx"``, ``"mhr"``, ...).
-            scale: source-to-target unit ratio, upstream's ``_unit_scale``.
-            asset_dir: root holding the ``<MODEL>/`` packs. Defaults to
-                whatever :func:`soma_jax.assets.resolve` finds.
-        """
-        self.source_spec = str(source_spec).lower()
-        self.target_spec = str(target_spec).lower()
-        self.scale = float(scale)
-        self.direct = BarycentricBridge.can_use_direct_topology(
-            self.source_spec, self.target_spec)
-        if self.direct:
-            self._stage1 = self._stage2 = None
-            return
-
-        src_base_v, src_base_f = self._mesh(self.source_spec, 0, asset_dir)
-        src_wrap_v, _ = self._mesh(self.source_spec, 1, asset_dir)
-        tgt_base_v, _ = self._mesh(self.target_spec, 0, asset_dir)
-        tgt_wrap_v, tgt_wrap_f = self._mesh(self.target_spec, 1, asset_dir)
-
-        if src_wrap_v.shape[0] != tgt_wrap_v.shape[0]:
-            raise ValueError(
-                "SMPL-family topology bridge requires a shared SOMA wrap topology. "
-                f"{self.source_spec} wrap has {src_wrap_v.shape[0]} vertices, "
-                f"{self.target_spec} wrap has {tgt_wrap_v.shape[0]}."
-            )
-
-        from ..geometry.barycentric_interp import compute_barycentric_coords
-        f1, b1 = compute_barycentric_coords(src_wrap_v, src_base_v, src_base_f)
-        self._stage1 = (src_base_f, np.asarray(f1, np.int32), np.asarray(b1, np.float32))
-        f2, b2 = compute_barycentric_coords(tgt_base_v, tgt_wrap_v, tgt_wrap_f)
-        self._stage2 = (tgt_wrap_f, np.asarray(f2, np.int32), np.asarray(b2, np.float32))
-
-    @classmethod
-    def _mesh(cls, spec: str, which: int, asset_dir):
-        """Load ``base_body``/``SOMA_wrap`` for a model spec as (verts, faces)."""
-        import trimesh
-        try:
-            rel = cls.ASSETS[spec][which]
-        except KeyError:
-            raise ValueError(
-                f"No registered SMPL-family topology assets for {spec!r}. "
-                f"Known: {sorted(cls.ASSETS)}."
-            ) from None
-        if asset_dir is not None:
-            path = Path(asset_dir) / rel
-            if not path.exists():
-                raise FileNotFoundError(f"{path} not found (asset_dir={asset_dir})")
-        else:
-            from ..assets import resolve
-            path = resolve(rel)
-        mesh = trimesh.load(path, maintain_order=True, process=False)
-        return (np.asarray(mesh.vertices, np.float32),
-                np.asarray(mesh.faces, np.int32))
-
-    def __call__(self, vertices: jnp.ndarray) -> jnp.ndarray:
-        """Apply the bridge to a posed source sequence.
-
-        Args:
-            vertices: (..., V_source, 3); (T, V, 3) and (V, 3) both work.
-        Returns:
-            (..., V_target, 3) in target topology, unit-scaled.
-        """
-        from ..geometry.barycentric_interp import barycentric_interpolate
-        v = jnp.asarray(vertices)
-        added = v.ndim == 2
-        if added:
-            v = v[None]
-        if self.direct:
-            out = v * self.scale
-            return out[0] if added else out
-        for stage in (self._stage1, self._stage2):
-            faces, fid, bary = stage
-            v = barycentric_interpolate(
-                v, jnp.asarray(faces), jnp.asarray(fid), jnp.asarray(bary))
-        out = v * self.scale
-        return out[0] if added else out
-
-
 # Joint layout of each SMPL-family params NamedTuple, as
 # ``field -> (first joint index, joint count)``. Used to split a flat
 # ``(T, J, 3)`` axis-angle array into the per-field arguments our body models
@@ -403,8 +275,10 @@ def transfer_pose_between_layers(
 ) -> SMPLFamilyPoseTransferResult:
     """Retarget a SMPL-family motion clip onto another SMPL-family rig.
 
-    Port of ``soma.smpl.transfer.transfer_smpl_family_pose_parameters``. The
-    four upstream stages, in order:
+    SOMA-JAX extra modelled on ``soma.smpl.transfer.
+    transfer_smpl_family_pose_parameters`` (ported as
+    :func:`transfer_smpl_family_pose_parameters`) for :mod:`soma_jax.body_models`
+    layers. The four stages, in order:
 
     1. **Forward the source rig** at ``source_poses`` -> ``source_vertices``.
     2. **Bridge to the target topology** via
@@ -449,7 +323,7 @@ def transfer_pose_between_layers(
         :class:`SMPLFamilyPoseTransferResult`.
     """
     from ..geometry.transforms import rotmat_to_axis_angle
-    from ..pose_inversion import PoseInversion
+    from ..pose_inversion_lite import PoseInversion
 
     poses = jnp.asarray(source_poses, dtype=jnp.float32)
     if poses.ndim == 2:

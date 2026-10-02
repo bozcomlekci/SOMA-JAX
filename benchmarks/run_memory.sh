@@ -8,7 +8,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY=${PY:-python}                       # a python with torch + jax + warp (see docs/INSTALL.md)
 SCRIPT=$REPO/benchmarks/bench_memory.py
-TORCH_CUDA_LIBS=${TORCH_CUDA_LIBS:-$("$PY" -c 'import os,nvidia.cu13 as c; print(os.path.join(os.path.dirname(c.__file__),"lib"))' 2>/dev/null || true)}
+TORCH_CUDA_LIBS=${TORCH_CUDA_LIBS:-$("$PY" -c 'import os,nvidia.cu13 as c; print(os.path.join(list(c.__path__)[0],"lib"))' 2>/dev/null || true)}
 OUT=$REPO/benchmarks/results/memory.jsonl
 BATCHES=${BATCHES:-"1 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192"}
 export CUDA_VISIBLE_DEVICES=0

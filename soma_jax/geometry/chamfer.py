@@ -2,11 +2,14 @@
 
 Used as a loss for pose inversion when point correspondences are unknown.
 
-Upstream: none — SOMA-JAX-only.
-    **Not a port.** Upstream's `ChamferLoss` is a one-way source-point to
-    closest-point-on-*triangle* query. These functions are a JAX-only
-    point-cloud loss: bidirectional mean-squared distance between vertex
-    sets. Different direction, different target geometry, different value.
+Upstream: ``soma/geometry/chamfer_warp.py``
+    :class:`ChamferLoss` / :func:`chamfer_distance_to_mesh` port upstream's
+    ``ChamferLoss`` — a one-way source-point to closest-point-on-*triangle*
+    query (upstream's Warp kernel and autograd function have no JAX
+    counterpart; JAX differentiates the exact query directly).
+    ``chamfer_distance``, ``chamfer_distance_batched`` and
+    ``nearest_neighbor_indices`` are SOMA-JAX-only: a bidirectional
+    mean-squared distance between vertex sets.
 """
 from __future__ import annotations
 import jax
@@ -204,3 +207,65 @@ def chamfer_distance_to_mesh(
 
     out = jnp.mean(best, axis=-1)
     return out[0] if not (src_b or tgt_b) else out
+
+
+class ChamferLoss:
+    """One-way Chamfer loss from points to a target mesh — upstream ``ChamferLoss``.
+
+    The distances are :func:`chamfer_distance_to_mesh`'s exact point-to-surface
+    ones (upstream queries a Warp BVH). The calling contract is upstream's,
+    including its mesh cache: with ``target_faces``, the target geometry is
+    captured when the cache is built — on first use, or when the batch size
+    changes — and reused by later calls until ``refit=True`` swaps in the new
+    vertices (keeping the cached topology) or :meth:`clear_cache` drops it.
+    Point-cloud calls (``target_faces=None``) always rebuild, and what they
+    build is what a later same-size call without ``refit`` reuses, as upstream's
+    cache does.
+    """
+
+    def __init__(self) -> None:
+        self._cached_targets = None
+        self._cached_faces = None
+
+    def clear_cache(self) -> None:
+        self._cached_targets = None
+        self._cached_faces = None
+
+    def __call__(self, src_points, target_verts, target_faces=None, refit: bool = False):
+        """Mean squared distance from each source point to the target surface.
+
+        Args:
+            src_points: (B, N, 3) or (N, 3) source query points.
+            target_verts: (B, M, 3) or (M, 3) target vertices.
+            target_faces: (F, 3) static topology, or ``None`` for a point cloud.
+            refit: rebuild the cached target geometry from ``target_verts``.
+
+        Returns:
+            (B,) losses, or a scalar when the batch size is 1.
+        """
+        S = jnp.asarray(src_points)
+        T = jnp.asarray(target_verts)
+        if S.ndim == 3 and T.ndim == 3:
+            if S.shape[0] != T.shape[0]:
+                raise AssertionError(
+                    f"Batch size mismatch: src {S.shape[0]} vs target {T.shape[0]}")
+        elif S.ndim == 3:
+            T = jnp.broadcast_to(T[None], (S.shape[0],) + T.shape)
+        elif T.ndim == 3:
+            S = jnp.broadcast_to(S[None], (T.shape[0],) + S.shape)
+        else:
+            S, T = S[None], T[None]
+        batch_size = S.shape[0]
+
+        if target_faces is None:
+            self._cached_targets, self._cached_faces = T, None
+        else:
+            cached = self._cached_targets
+            if cached is None or cached.shape[0] != batch_size:
+                self._cached_targets, self._cached_faces = T, jnp.asarray(target_faces)
+            elif refit:
+                self._cached_targets = T
+        loss = chamfer_distance_to_mesh(S, self._cached_targets, self._cached_faces)
+        return loss[0] if batch_size == 1 else loss
+
+    forward = __call__

@@ -1,26 +1,30 @@
-"""Rebuild a correct SOMA joint regressor from the real NVlabs/SOMA-X rig.
+"""Build SOMA-JAX's runtime archive (``SOMA_neutral_fixed.npz``) from upstream's assets.
 
-The repackaged `SOMA_neutral.npz` shipped a synthesized `J_regressor` that places
-joints up to ~1.5 m away from the true skeleton (e.g. Root near the head). This
-corrupts the skeleton drawing AND the LBS bind (FK uses the rest joints), so every
-SOMA-family identity (SOMA, MHR, Anny, Garment) poses incorrectly.
+The archive is a SOMA-JAX-only cache: the 78-joint public rig in the layout
+``SOMALayer.load`` reads, so a runtime can skip ``usd-core``. It is built from
+the vendored SOMA-X assets with :func:`soma_jax.rig_build.save_runtime_archive`
+— the rig from ``SOMA_template_rig.usda`` (SOMA-X v0.3 asset contract: the npz
+no longer carries one), pruned to the public joints as upstream's
+``derive_soma_rig_without_procedural_joints`` does, plus shape PCA, LOD maps,
+segments and the reference-pose history from ``SOMA_neutral.npz``, plus the
+affine ``J_regressor`` below for ``skeleton_fit="linear"``.
 
-The HF `SOMA_neutral.npz` ships the real rig: `bind_pose_world` (J,4,4) joint
-transforms, `bind_shape` (V,3), and sparse `skinning_weights` (V,J). SOMA-X derives
-joints via skinning-masked RBF regressors (`SkeletonTransfer`). Here we fit a
-standard linear+affine joint regressor — restricted to each joint's skinning
-support — that reproduces `bind_pose_world` from `bind_shape`, then write a fixed
-asset that swaps in this regressor (everything else preserved).
+Rebuild it whenever the submodule moves: a cache built from an older template
+silently reproduces that template's rig.
 
 Usage::
 
-    python tools/build_soma_rig.py --hf assets/third_party/SOMA_neutral.npz \
-        --local SOMA_neutral.npz --out assets/SOMA_neutral_fixed.npz
+    python tools/pipeline/build_soma_rig.py                    # -> assets/SOMA_neutral_fixed.npz
+    python tools/pipeline/build_soma_rig.py --out other.npz
+
+``build_regressor`` is also what ``soma_jax.rig_build`` uses for the regressor:
+a linear+affine joint regressor restricted to each joint's skinning support,
+reproducing ``bind_pose_world`` from ``bind_shape``. Upstream has no SOMA joint
+regressor (it fits joints with ``SkeletonTransfer``); this is a SOMA-JAX extra.
 """
 from __future__ import annotations
 import argparse
 import numpy as np
-from scipy.sparse import csc_matrix
 
 
 def _fit_affine_row(verts_support, target):
@@ -71,43 +75,32 @@ def build_regressor(bind_shape, joints_t, W, parents, children, weight_thr=1e-4)
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--hf", default=None,
-                   help="full-schema SOMA_neutral.npz (default: resolved via soma_jax.assets)")
-    p.add_argument("--local", default="SOMA_neutral.npz")
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default="assets/SOMA_neutral_fixed.npz")
+    p.add_argument("--npz", default=None, help="SOMA_neutral.npz (default: resolved)")
+    p.add_argument("--usd", default=None, help="SOMA_template_rig.usda (default: resolved)")
+    p.add_argument("--no-regressor", action="store_true",
+                   help="skip the skeleton_fit='linear' regressor")
     args = p.parse_args()
 
-    hf = dict(np.load(args.hf, allow_pickle=True))
-    local = dict(np.load(args.local, allow_pickle=True))
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from soma_jax.rig_build import build_runtime_archive
 
-    bind_shape = hf["bind_shape"].astype(np.float64)                    # (V,3) cm
-    joints_t = hf["bind_pose_world"][:, :3, 3].astype(np.float64)       # (J,3) cm
-    W = csc_matrix(
-        (hf["skinning_weights_data"], hf["skinning_weights_indices"], hf["skinning_weights_indptr"]),
-        shape=tuple(hf["skinning_weights_shape"]),
-    ).toarray()                                                         # (V,J)
-    parents = hf["joint_parent_ids"].astype(int).copy(); parents[0] = 0
-    J = W.shape[1]
-    children = {j: [k for k in range(J) if parents[k] == j and k != j] for j in range(J)}
-
-    Jreg = build_regressor(bind_shape, joints_t, W, parents, children)
-
-    # Validate on the canonical bind shape (regressor is unit-independent & affine).
-    err = np.linalg.norm(Jreg @ bind_shape - joints_t, axis=1)
-    print(f"J_regressor fit error: mean {err.mean():.3f} cm  max {err.max():.3f} cm")
-
-    # Write a fixed asset: keep everything from the local file, swap J_regressor.
-    out = dict(local)
-    out["J_regressor"] = Jreg.astype(np.float32)
-    np.savez(args.out, **out)
-    print(f"Wrote {args.out}")
-
-    # Report joints on our actual v_template (= mean) for sanity.
-    lv = local["v_template"].astype(np.float64)
-    j_local = Jreg @ lv
-    print(f"Root joint on v_template: {j_local[0].round(3)} (expect near pelvis/origin)")
-    print(f"Head joint on v_template: {j_local[7].round(3)}")
+    asset = build_runtime_archive(args.npz, args.usd,
+                                  fit_joint_regressor=not args.no_regressor)
+    if "J_regressor" in asset:
+        joints = asset["bind_pose_world"][:, :3, 3].astype(np.float64)
+        err = np.linalg.norm(asset["J_regressor"] @ asset["bind_shape"].astype(np.float64)
+                             - joints, axis=1)
+        print(f"J_regressor fit error: mean {err.mean():.3f} cm  max {err.max():.3f} cm")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, **asset)
+    print(f"Wrote {out}: {len(asset['joint_names'])} public joints, "
+          f"{asset['v_template'].shape[0]} vertices, {len(asset)} arrays")
 
 
 if __name__ == "__main__":

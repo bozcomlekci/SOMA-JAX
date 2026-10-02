@@ -11,17 +11,17 @@ Requires: pyrender, trimesh, pillow (for image output)
 Usage::
 
     # Quick demo with default settings
-    python tools/demo_soma_vis.py --soma-model path/to/SOMA_neutral.npz
+    python tools/pipeline/demo_soma_vis.py --soma-model assets/SOMA_neutral_fixed.npz
 
     # Demo with multiple identity models
-    python tools/demo_soma_vis.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+    python tools/pipeline/demo_soma_vis.py \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --smpl-model path/to/SMPL_NEUTRAL.pkl \\
         --output-dir demo_renders/
 
     # Animated GIF from sample poses
-    python tools/demo_soma_vis.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+    python tools/pipeline/demo_soma_vis.py \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --gif demo.gif --num-frames 30
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def parse_args():
     p = argparse.ArgumentParser(description="SOMA-JAX visualization demo")
-    p.add_argument("--soma-model", required=True, help="SOMA_neutral.npz")
+    p.add_argument("--soma-model", required=True, help="SOMA-JAX runtime archive (assets/SOMA_neutral_fixed.npz; tools/pipeline/build_soma_rig.py)")
     p.add_argument("--smpl-model", default=None, help="Optional SMPL .pkl file")
     p.add_argument("--smplx-model", default=None, help="Optional SMPL-X .pkl/.npz file")
     p.add_argument("--smplh-model", default=None, help="Optional SMPL-H .pkl/.npz file")
@@ -771,7 +771,6 @@ def main():
                 # + level-order FK + LBS, mirroring third_party/SOMA-X BatchedSkinning.
                 from bvh_parser import load_soma_bvh
                 from soma_x_skinning import SomaXSkinning
-                from scipy.sparse import csc_matrix
                 bvh = load_soma_bvh(args.bvh_motion)
                 N_src = bvh["n_frames"]
                 # --target-fps overrides --num-frames: pick T so the GIF plays at
@@ -787,20 +786,22 @@ def main():
                 bvh_poses = bvh["poses"][idx]                                # (T, J, 3) rel-to-T-pose
                 bvh_rotmats = bvh["rotmats"][idx]                            # (T, J, 3, 3) exact
                 bvh_trans = bvh["root_translation"][idx]                     # (T, 3) meters
-                hf_soma = dict(np.load(Path(args.hf_dir) / "SOMA_neutral.npz", allow_pickle=True))
-                # SOMA-X rig in meters (HF translations are cm).
-                bind_world = hf_soma["bind_pose_world"].astype(np.float32).copy()
+                # The public SOMA-X rig. Since SOMA-X v0.3 it lives only in
+                # SOMA_template_rig.usda (SOMA_neutral.npz no longer carries
+                # rig arrays); a runtime archive passed as --soma-model already
+                # holds it, anything else is derived from the USD.
+                from soma_jax.rig_build import load_public_rig
+                pub_rig = load_public_rig(args.soma_model)
+                # SOMA-X rig in meters (native translations are cm).
+                bind_world = pub_rig["bind_pose_world"].astype(np.float32).copy()
                 bind_world[:, :3, 3] *= 0.01
-                bind_shape_cm = hf_soma["bind_shape"].astype(np.float32)
+                bind_shape_cm = pub_rig["bind_shape"].astype(np.float32)
                 bind_shape_m = bind_shape_cm * 0.01
-                t_pose_world = hf_soma["t_pose_world"].astype(np.float32)
-                W_full = csc_matrix((hf_soma["skinning_weights_data"],
-                                     hf_soma["skinning_weights_indices"],
-                                     hf_soma["skinning_weights_indptr"]),
-                                    shape=tuple(hf_soma["skinning_weights_shape"])).toarray().astype(np.float32)
-                names = [str(n) for n in hf_soma["joint_names"]]
+                t_pose_world = pub_rig["t_pose_world"].astype(np.float32)
+                W_full = pub_rig["weights"].astype(np.float32)
+                names = [str(n) for n in pub_rig["joint_names"]]
                 hips_idx = names.index("Hips")
-                parents = hf_soma["joint_parent_ids"].astype(int).copy(); parents[0] = 0
+                parents = pub_rig["parents"].astype(int).copy(); parents[0] = 0
                 soma_x_rig = dict(
                     parents=parents, weights=W_full, bind_world=bind_world,
                     bind_shape=bind_shape_m, t_pose_world=t_pose_world, hips_idx=hips_idx, names=names,
@@ -1296,7 +1297,7 @@ def main():
                     rest_v = np.asarray(rest.vertices[0])
                     # Canonical SOMA joints let the wrap place the zero-weight
                     # joints (eyes, tips) that the regressor can't; None-safe.
-                    _bpw = getattr(layer, "bind_pose_world", None)
+                    _bpw = layer.public_bind_transforms_world()
                     _canon = np.asarray(_bpw)[:, :3, 3] if _bpw is not None else None
                     soma_j = _soma_joints_for_model(
                         rest_v, fcs, str(wp), soma_J_regressor, vseq,

@@ -4,12 +4,12 @@ Usage::
 
     # Export a single rest mesh (no pose) from SOMA NPZ:
     python tools/vis_mesh_export.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --output mesh.obj
 
     # Export a posed mesh sequence:
     python tools/vis_mesh_export.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --animation path/to/anim.soma.npz \\
         --output-dir frames/ \\
         --format ply
@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export meshes to OBJ/PLY")
-    p.add_argument("--soma-model", required=True, help="SOMA_neutral.npz")
+    p.add_argument("--soma-model", required=True, help="SOMA-JAX runtime archive (assets/SOMA_neutral_fixed.npz; tools/pipeline/build_soma_rig.py)")
     p.add_argument("--animation", default=None, help="Optional animation NPZ to pose")
     p.add_argument("--output", default=None, help="Single mesh output path")
     p.add_argument("--output-dir", default=None, help="Directory for animation frames")

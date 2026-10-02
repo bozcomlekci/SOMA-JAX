@@ -7,18 +7,18 @@ Usage::
 
     # Static render of rest mesh
     python tools/vis_pyrender.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --output rest.png
 
     # Static render of a specific frame
     python tools/vis_pyrender.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --animation path/to/anim.soma.npz \\
         --frame 0 --output frame0.png
 
     # Interactive viewer
     python tools/vis_pyrender.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+        --soma-model assets/SOMA_neutral_fixed.npz \\
         --animation path/to/anim.soma.npz \\
         --interactive
 """
@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def parse_args():
     p = argparse.ArgumentParser(description="PyRender visualization for SOMA-JAX")
-    p.add_argument("--soma-model", required=True, help="SOMA_neutral.npz")
+    p.add_argument("--soma-model", required=True, help="SOMA-JAX runtime archive (assets/SOMA_neutral_fixed.npz; tools/pipeline/build_soma_rig.py)")
     p.add_argument("--animation", default=None, help="Optional animation NPZ")
     p.add_argument("--output", default=None, help="Output image path (PNG)")
     p.add_argument("--frame", type=int, default=0, help="Animation frame index")
@@ -116,7 +115,7 @@ def main():
     )
     if not args.no_smooth:
         # Compute vertex normals for smooth shading
-        tm.vertex_normals  # populates _cache
+        _ = tm.vertex_normals  # populates _cache
 
     material = pyrender.MetallicRoughnessMaterial(
         baseColorFactor=[*args.color, 1.0],

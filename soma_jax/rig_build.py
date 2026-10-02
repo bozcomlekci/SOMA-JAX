@@ -55,7 +55,8 @@ from typing import Any, Optional
 
 import numpy as np
 
-__all__ = ["build_soma_asset", "merge_template_rig", "prune_procedural_joints"]
+__all__ = ["build_runtime_archive", "build_soma_asset", "load_public_rig",
+           "merge_template_rig", "prune_procedural_joints", "save_runtime_archive"]
 
 #: The npz keys copied through unchanged (no unit or layout change).
 _PASSTHROUGH = (
@@ -134,6 +135,14 @@ def merge_template_rig(usd_path=None, lod: str = "mid") -> dict:
         "bind_pose_local": _local_from_world(bind_world, parents).astype(np.float32),
         "t_pose_local": t_local.astype(np.float32),
         "t_pose_world": _world_from_local(t_local, parents).astype(np.float32),
+        # Upstream `io._load_rig_from_usd_stage`: the skin mesh points are the
+        # bind shape. Native centimetres, like the rest of the rig.
+        "bind_shape": np.asarray(rig["points"], np.float32),
+        # The LOD's own polygon topology (upstream `face_vert_indices` /
+        # `face_vert_counts`); the npz only carries mid/low triangles. The
+        # SOMA Hand layer triangulates these for its low/xlo LODs.
+        "face_vert_indices": rig.get("face_vert_indices"),
+        "face_vert_counts": rig.get("face_vert_counts"),
     }
 
 
@@ -151,9 +160,14 @@ def build_soma_asset(
     and everything else from ``SOMA_neutral.npz``.
 
     Args:
-        npz_path: ``SOMA_neutral.npz`` (the **full-schema** archive — the
-            submodule's slim copy lacks the PCA and shape keys). Resolved when
-            omitted.
+        npz_path: ``SOMA_neutral.npz``. Either asset generation works: the
+            v0.3 contract ships it **without** rig fields (``bind_shape``,
+            ``bind_pose_*``, ``t_pose_*``, skinning, joint names) — its
+            metadata names ``SOMA_template_rig.usda`` as their only source —
+            while older archives still carry them. Rig data is always taken
+            from the USD here, exactly as upstream's ``rig_data.update(...)``
+            overrides whatever the npz holds, so both generations build the
+            same layer. Resolved when omitted.
         usd_path: ``SOMA_template_rig.usda``. Resolved when omitted.
         lod: which skin mesh supplies the weights.
         fit_joint_regressor: fit the ``J_regressor`` used by
@@ -181,12 +195,19 @@ def build_soma_asset(
         "shapedirs": (np.asarray(src["shapedirs"], np.float64)
                       .reshape(n_components, n_verts, 3)
                       .transpose(1, 2, 0) / _CM_PER_M).astype(np.float32),
-        # Canonical bind mesh stays in native cm — SkeletonTransfer fits there.
-        "bind_shape": np.asarray(src["bind_shape"], np.float32),
     }
+    # `rig` supplies `bind_shape` (the USD skin-mesh points, native cm — the
+    # frame SkeletonTransfer fits in) along with every other rig array.
     asset.update(rig)
     for key in _PASSTHROUGH:
         if key in src.files:
+            asset[key] = np.asarray(src[key])
+    # Historical reference T-poses (SOMA-X v0.3.1) — what
+    # `SOMALayer.get_reference_pose(version=...)` reads. Absent on older
+    # archives, which then simply have no reference history, as upstream.
+    from .reference_poses import _is_history_key
+    for key in src.files:
+        if _is_history_key(key):
             asset[key] = np.asarray(src[key])
 
     if fit_joint_regressor:
@@ -238,15 +259,15 @@ def _fit_joint_regressor(bind_shape, bind_world, weights, parents) -> np.ndarray
 def prune_procedural_joints(asset: dict, public_joint_names) -> dict:
     """Derive the legacy public rig from the expanded template rig.
 
-    Port of upstream ``derive_soma_rig_without_procedural_joints``. The v0026
-    template *is* the source rig; upstream derives the 78-joint public rig from
+    Port of upstream ``derive_soma_rig_without_procedural_joints``. The
+    template (v0027 since SOMA-X v0.2.2) *is* the source rig; upstream derives the 78-joint public rig from
     it on the fly by dropping the procedural and auxiliary joints, remapping the
     hierarchy, and **moving each pruned joint's skin weights onto its nearest
     kept parent** — the weights are aggregated, not discarded, so the pruned rig
     still sums to one per vertex.
 
     Args:
-        asset: output of :func:`build_soma_asset` (expanded, 122-joint).
+        asset: output of :func:`build_soma_asset` (expanded, 110-joint on v0027).
         public_joint_names: the joints to keep, in output order.
 
     Returns:
@@ -308,3 +329,84 @@ def prune_procedural_joints(asset: dict, public_joint_names) -> dict:
     )
     out.pop("J_regressor", None)
     return out
+
+
+def build_runtime_archive(npz_path=None, usd_path=None, *,
+                          fit_joint_regressor: bool = True) -> dict:
+    """The 78-joint public rig, in the layout :meth:`SOMALayer.load` reads.
+
+    This is the SOMA-JAX-only ``SOMA_neutral_fixed.npz`` cache: upstream's merge
+    (:func:`build_soma_asset`) pruned to the public rig exactly as upstream's
+    ``derive_soma_rig_without_procedural_joints`` does, plus the optional linear
+    ``J_regressor``. It carries the reference-pose history too, so
+    ``SOMALayer.load(..., reference_pose={"version": ...})`` works from it.
+
+    It exists so a runtime can skip ``usd-core``; it is a *cache* of the
+    template it was built from. Rebuild it whenever the vendored assets move —
+    a cache built from an older template silently reproduces that older rig.
+
+    Args:
+        npz_path, usd_path: as for :func:`build_soma_asset`.
+        fit_joint_regressor: add the ``skeleton_fit="linear"`` regressor.
+
+    Returns:
+        A dict for ``np.savez`` / ``SOMALayer.load``.
+    """
+    from .assets import resolve
+    from .procedural_transforms import load_definition
+
+    public_names = load_definition(resolve("SOMA_procedural_transforms.json")).main_joint_names
+    asset = prune_procedural_joints(
+        build_soma_asset(npz_path, usd_path, "mid", fit_joint_regressor=False), public_names)
+    if fit_joint_regressor:
+        asset["J_regressor"] = _fit_joint_regressor(
+            asset["bind_shape"], asset["bind_pose_world"], asset["weights"], asset["parents"])
+    # USD face topology is only needed while slicing LODs; drop it (and any
+    # other None) so the dict round-trips through np.savez.
+    return {k: np.asarray(v) for k, v in asset.items()
+            if v is not None and k not in ("face_vert_indices", "face_vert_counts")}
+
+
+def save_runtime_archive(path, npz_path=None, usd_path=None, *,
+                         fit_joint_regressor: bool = True) -> Path:
+    """Write :func:`build_runtime_archive` to ``path`` (compressed npz)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **build_runtime_archive(
+        npz_path, usd_path, fit_joint_regressor=fit_joint_regressor))
+    return path
+
+
+#: What :func:`load_public_rig` returns (all native centimetres).
+_PUBLIC_RIG_KEYS = ("joint_names", "parents", "weights", "bind_pose_world",
+                    "bind_pose_local", "t_pose_world", "t_pose_local", "bind_shape")
+
+
+def load_public_rig(path=None, usd_path=None) -> dict:
+    """The 78-joint public rig, from a runtime archive or the template USD.
+
+    For tools that need the raw rig arrays rather than a layer. A SOMA-JAX
+    runtime archive (``SOMA_neutral_fixed.npz``, see
+    :func:`build_runtime_archive`) already holds them and is read as-is. Any
+    other input — ``None``, or a ``SOMA_neutral.npz`` of either generation — is
+    rebuilt from ``SOMA_template_rig.usda``: since SOMA-X v0.3 the npz carries
+    no rig, and a pre-v0.3 npz's own rig arrays are what upstream always
+    overrode with the USD, so reading them would reproduce a stale rig.
+
+    Args:
+        path: a runtime archive or ``SOMA_neutral.npz``; resolved when omitted.
+        usd_path: the template USD, for the rebuild; resolved when omitted.
+
+    Returns:
+        ``joint_names``, ``parents`` (the root is its own parent, as in the
+        template), dense ``weights`` (V, 78),
+        ``bind_pose_world`` / ``bind_pose_local`` / ``t_pose_world`` /
+        ``t_pose_local`` (78, 4, 4) and ``bind_shape`` (V, 3), in centimetres.
+    """
+    if path is not None:
+        with np.load(path, allow_pickle=False) as src:
+            if all(k in src.files for k in _PUBLIC_RIG_KEYS):
+                return {k: np.asarray(src[k]) for k in _PUBLIC_RIG_KEYS}
+    asset = build_runtime_archive(path, usd_path, fit_joint_regressor=False)
+    return {k: asset[k] for k in _PUBLIC_RIG_KEYS}
+

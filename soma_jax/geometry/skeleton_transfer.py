@@ -11,24 +11,31 @@ Provides:
 * Mirror utility ``PoseMirror`` (existing) — kept as-is.
 
 Upstream: ``soma/geometry/skeleton_transfer.py``
-    Faithful port of that code. Per-joint RBF position regression + two-stage Kabsch rotation fit; PoseMirror.
+    Faithful port of that code: per-joint RBF position regression and the
+    two-stage Kabsch rotation fit, with upstream's constructor arguments
+    (``use_warp_for_rotations`` is recorded but selects nothing here — the JAX
+    fit implements the algorithm of both upstream paths). Device moves
+    (``.to()`` / ``.cpu()``) have no JAX counterpart. ``rotation_backend`` and
+    the rotations-only ``PoseMirror`` are SOMA-JAX extras.
 """
 from __future__ import annotations
+import logging
 from typing import Iterable, Optional
 import numpy as np
-import jax
 import jax.numpy as jnp
 
 from .transforms import (
+    _vector_norm,
     align_vectors,
     compute_covariance,
-    kabsch,
     rodrigues_rotation,
     rotation_from_covariance,
     se3_from_rt,
 )
 from .rig_utils import get_joint_children_ids
 from .interpolate import RadialBasisFunction
+
+logger = logging.getLogger(__name__)
 
 
 def _build_rbf_regressors(
@@ -110,8 +117,10 @@ class SkeletonTransfer:
         freeze_rotations: Optional[Iterable[int]] = None,
         skip_endjoints: bool = True,
         use_sparse_rbf_matrix: bool = True,
+        use_warp_for_rotations: bool = True,
         rotation_method: str = "auto",
         skip_inverse_lbs: bool = False,
+        root_joint_idx: int = 1,
         rotation_backend: str = "jax",
     ):
         """
@@ -131,7 +140,13 @@ class SkeletonTransfer:
             use_sparse_rbf_matrix: precompute a sparse (J, V) basis-weight
                 matrix so the position fit is one matmul per identity. Disable
                 only if memory matters more than speed.
-            rotation_method: 'kabsch' (SVD) or 'newton-schulz' (iterative).
+            use_warp_for_rotations: upstream's choice between its Warp
+                rotation kernels and its torch path, which implement the same
+                ``rotation_method``. The JAX fit here implements that
+                algorithm too, so the flag is recorded and does not change the
+                result; ``rotation_backend`` selects SOMA-JAX's own hybrid.
+            rotation_method: 'auto' (default), 'kabsch' (SVD) or
+                'newton-schulz' (iterative).
             skip_inverse_lbs: skip the per-joint vertex Kabsch and use the
                 identity initial rotation — useful when the skinning support
                 is too noisy to fit reliably.
@@ -165,9 +180,16 @@ class SkeletonTransfer:
         self.freeze_rotations = set(freeze_rotations) if freeze_rotations else set()
         self.skip_endjoints = bool(skip_endjoints)
         self.use_sparse_rbf_matrix = bool(use_sparse_rbf_matrix)
+        self.use_warp_for_rotations = bool(use_warp_for_rotations)
         self.rotation_method = rotation_method
         self.skip_inverse_lbs = bool(skip_inverse_lbs)
         self.rotation_backend = rotation_backend
+        # Upstream `root_joint_idx` (0 for hand models, 1 for full-body SOMA):
+        # joints below `_first_joint` are virtual roots that keep their bind
+        # position and rotation and get no regressor. The body's joint 0 is
+        # such a root; the hand's joint 0 is a real wrist and is fitted.
+        self.root_joint_idx = int(root_joint_idx)
+        self._first_joint = 0 if self.root_joint_idx == 0 else 1
         if rotation_backend not in ("jax", "warp"):
             raise ValueError(
                 f"rotation_backend must be 'jax' or 'warp', got {rotation_backend!r}")
@@ -242,6 +264,7 @@ class SkeletonTransfer:
         # Mirror SOMA-X special-case: if only Root + Hips lack support, fall
         # back to the Hips children's union.
         if np.array_equal(np.where(regressor_mask.sum(axis=0) == 0)[0], np.array([0, 1])):
+            logger.debug("Aggregating children of hips")
             children = self.joint_children_ids[1]
             if children:
                 regressor_mask[:, 1] = regressor_mask[:, list(children)].any(axis=1)
@@ -250,10 +273,12 @@ class SkeletonTransfer:
             regressor_mask[self.vertex_ids_to_exclude] = False
         self.regressor_mask = regressor_mask
 
-        # Build RBF per joint (skip Root — its position is read from bind).
+        # Build RBF per joint (skip virtual roots — their position is read
+        # from bind).
         bind_shape = self.bind_shape
-        regressors: list[Optional[RadialBasisFunction]] = [None]
-        for j in range(1, self.num_joints):
+        first = self._first_joint
+        regressors: list[Optional[RadialBasisFunction]] = [None] * first
+        for j in range(first, self.num_joints):
             ids = np.where(regressor_mask[:, j])[0]
             if len(ids) == 0:
                 regressors.append(None)
@@ -274,7 +299,7 @@ class SkeletonTransfer:
         # Dense (J, V) basis-weight matrix so that
         # ``new_joints = sparse_rbf_matrix @ target_shape``  recovers all
         # joint positions in one matmul. The Root row stays zero; we splice
-        # in the bind Root position at call time.
+        # in the bind position of each virtual root at call time.
         J = self.num_joints
         V = bind_shape.shape[0]
         mat = np.zeros((J, V), dtype=np.float32)
@@ -311,15 +336,17 @@ class SkeletonTransfer:
             flat = jnp.transpose(target_shapes, (1, 0, 2)).reshape(V, B * D)
             new_joints = self._sparse_rbf_matrix @ flat                    # (J, B*D)
             new_joints = jnp.transpose(new_joints.reshape(J, B, D), (1, 0, 2))
-            # Splice the bind Root position back in (its row is zero).
-            root_pos = jnp.broadcast_to(
-                jnp.asarray(self.bind_world_transforms[0, :3, 3])[None, None, :],
-                (B, 1, 3))
-            new_joints = new_joints.at[:, 0, :].set(root_pos[:, 0, :])
+            # Splice the bind positions of virtual roots back in (their rows
+            # are zero).
+            for i in range(self._first_joint):
+                root_pos = jnp.broadcast_to(
+                    jnp.asarray(self.bind_world_transforms[i, :3, 3])[None, :], (B, 3))
+                new_joints = new_joints.at[:, i, :].set(root_pos)
         else:
             cols = [jnp.broadcast_to(
-                jnp.asarray(self.bind_world_transforms[0, :3, 3])[None, None, :], (B, 1, 3))]
-            for j in range(1, J):
+                jnp.asarray(self.bind_world_transforms[i, :3, 3])[None, None, :], (B, 1, 3))
+                for i in range(self._first_joint)]
+            for j in range(self._first_joint, J):
                 rbf = self.joint_pos_regressors[j]
                 if rbf is None:
                     cols.append(jnp.broadcast_to(
@@ -375,23 +402,30 @@ class SkeletonTransfer:
 
         # First two support vertices per joint (ascending order — matches the
         # loop's np.where order) for the virtual-normal correction; zero-filled
-        # for joints with <2 support (their H is overridden / degenerate).
+        # for joints with <2 support, whose H the loop never builds.
         first2 = np.zeros((J, 2), dtype=np.int64)
-        sup1_joints, sup1_verts = [], []
+        has_first2 = np.zeros(J, dtype=bool)
+        sup0_joints, sup1_joints, sup1_verts = [], [], []
         for j in range(J):
             ids = np.where(M[:, j] > 0)[0]
             if len(ids) >= 2:
                 first2[j] = ids[:2]
+                has_first2[j] = True
             elif len(ids) == 1:
                 # Single-support joints take the loop's N==1 Rodrigues path.
                 sup1_joints.append(j)
                 sup1_verts.append(ids[0])
+            else:
+                # No support: the loop keeps R_init = I.
+                sup0_joints.append(j)
         self._rot_first2 = first2
+        self._rot_has_first2 = jnp.asarray(has_first2)
+        self._rot_sup0_joints = np.asarray(sup0_joints, dtype=np.int64)
         self._rot_sup1_joints = np.asarray(sup1_joints, dtype=np.int64)
         self._rot_sup1_verts = np.asarray(sup1_verts, dtype=np.int64)
 
         # ---- stage (b): padded children table -----------------------------
-        # joint_children_ids is a {joint_id: [child_ids]} mapping.
+        # joint_children_ids[j] lists joint j's children.
         child_lists = [list(self.joint_children_ids[j]) for j in range(J)]
         max_c = max((len(c) for c in child_lists), default=0)
         max_c = max(max_c, 1)
@@ -411,13 +445,14 @@ class SkeletonTransfer:
         n_children = np.asarray([len(c) for c in child_lists])
         is_leaf_skip = np.zeros(J, dtype=bool)
         is_frozen = np.zeros(J, dtype=bool)
-        for i in range(1, J):
+        first = self._first_joint
+        for i in range(first, J):
             if n_children[i] == 0 and self.skip_endjoints:
                 is_leaf_skip[i] = True
             elif i in self.freeze_rotations:
                 is_frozen[i] = True
         is_normal = ~is_leaf_skip & ~is_frozen
-        is_normal[0] = False                            # Root keeps bind R.
+        is_normal[:first] = False                       # Virtual roots keep bind R.
         self._rot_is_normal = is_normal
         self._rot_leaf_ids = np.where(is_leaf_skip)[0]
         self._rot_leaf_parents = parents[self._rot_leaf_ids]
@@ -452,6 +487,27 @@ class SkeletonTransfer:
         if vectorized:
             return self._fit_joint_rotations_batched(new_joint_positions, target_shapes)
         return self._fit_joint_rotations_loop(new_joint_positions, target_shapes)
+
+    def fit_rotations_warp(
+        self,
+        new_joint_positions: jnp.ndarray,
+        target_shapes: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Upstream's ``fit_rotations_warp``: :meth:`fit_joint_rotations`, batched.
+
+        Upstream runs the same two-stage fit through a Warp kernel that
+        processes all joints at once; here that is the vectorized JAX path
+        (:meth:`fit_joint_rotations` with ``vectorized=True``), which it
+        returns unchanged.
+
+        Args:
+            new_joint_positions: (J, 3) or (B, J, 3) joints.
+            target_shapes: (V, 3) or (B, V, 3) deformed mesh.
+
+        Returns:
+            (J, 4, 4) or (B, J, 4, 4) new bind-world transforms.
+        """
+        return self._fit_joint_rotations_batched(new_joint_positions, target_shapes)
 
     def _fit_joint_rotations_batched(
         self,
@@ -533,14 +589,23 @@ class SkeletonTransfer:
             b1 = jnp.asarray(self.bind_shape)[f2[:, 1]] - bj             # (J, 3)
             n_src = jnp.cross(a0, a1, axis=-1)
             n_dst = jnp.cross(b0, b1, axis=-1)
-            len_n_src = jnp.linalg.norm(n_src, axis=-1, keepdims=True)   # (B, J, 1)
-            len_n_dst = jnp.linalg.norm(n_dst, axis=-1, keepdims=True)   # (J, 1)
-            v_src = n_src * (jnp.linalg.norm(a0, axis=-1, keepdims=True) / (len_n_src + eps))
-            v_dst = n_dst * (jnp.linalg.norm(b0, axis=-1, keepdims=True) / (len_n_dst + eps))
-            valid = (len_n_src[..., 0] > 1e-9) & (len_n_dst[..., 0] > 1e-9)  # (B, J)
+            len_n_src = _vector_norm(n_src, keepdims=True)               # (B, J, 1)
+            len_n_dst = _vector_norm(n_dst, keepdims=True)               # (J, 1)
+            v_src = n_src * (_vector_norm(a0, keepdims=True) / (len_n_src + eps))
+            v_dst = n_dst * (_vector_norm(b0, keepdims=True) / (len_n_dst + eps))
+            # Joints with <2 support have no triangle: their zero-filled `f2`
+            # repeats one vertex, and XLA's fused multiply-add leaves
+            # cross(a, a) at rounding level instead of zero, which would pass
+            # the collinearity test and inject a spurious normal.
+            valid = ((len_n_src[..., 0] > 1e-9) & (len_n_dst[..., 0] > 1e-9)
+                     & self._rot_has_first2[None])                          # (B, J)
             contrib = jnp.einsum("bia,ic->biac", v_src, v_dst)
             H = H + jnp.where(valid[..., None, None], contrib, 0.0)
             R_init = _rot_from_cov(H)
+
+            # Joints without support keep the loop's identity.
+            if len(self._rot_sup0_joints) > 0:
+                R_init = R_init.at[:, self._rot_sup0_joints].set(jnp.eye(3, dtype=R_init.dtype))
 
             # Single-support joints take the loop's N==1 Rodrigues path.
             if len(self._rot_sup1_joints) > 0:
@@ -620,7 +685,7 @@ class SkeletonTransfer:
 
         bind_shape_j = jnp.asarray(self.bind_shape)
 
-        for i in range(1, J):
+        for i in range(self._first_joint, J):
             children = self.joint_children_ids[i]
             if not children and self.skip_endjoints:
                 p = self.joint_parent_ids[i]

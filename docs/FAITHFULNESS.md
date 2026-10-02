@@ -1,417 +1,440 @@
 # Faithfulness to SOMA-X
 
-Status of the JAX port against upstream
-[`third_party/SOMA-X`](https://github.com/NVlabs/SOMA-X), audited
-module-by-module.
+How SOMA-JAX corresponds to upstream [SOMA-X](https://github.com/NVlabs/SOMA-X)
+**v0.3.3** (the `third_party/SOMA-X` submodule, release commit `d6aa640`):
+what is ported, what is measured against upstream and how closely, what
+differs by design, which upstream defects are not reproduced, what SOMA-JAX
+adds, and what has no JAX counterpart.
 
-**On the test citations below.** Nearly every number here is produced by a
-module under `tests/`, and those are named so the measurement is attributable.
-The suite is developed and run locally rather than distributed — `tests/` is
-git-ignored — so a clone will not contain the file a citation names. The figures
-were all re-derived against upstream at the time of writing; see
-[`DESCRIPTION.md`](DESCRIPTION.md#testing) for what the suite reports.
+**On the test citations below.** The numbers come from modules under `tests/`,
+named so each figure is attributable. The suite is developed and run locally
+rather than distributed — `tests/` is git-ignored — so a clone will not contain
+the file a citation names. See [`DESCRIPTION.md`](DESCRIPTION.md#testing) for
+what the suite reports.
 
-**Read this first — scope of the word "port."** The verified-faithful core is
-the **LBS-only SOMA/PCA forward**: `identity_model_type="soma"`,
-`apply_correctives=False`, mid or low LOD. That path is pinned against upstream
-to 3.2e-6 m. Around it sit modules that are partial ports, approximations, or
-JAX-only alternatives — the [correspondence map](#correspondence-map)
-marks each one, and the differences are not all cosmetic.
+## Summary
 
-**Constructor defaults differ from upstream.** `SOMALayer.load()` defaults to
-the SOMA PCA backend with no correctives and no procedural transforms; upstream
-`SOMALayer` defaults to the MHR backend, the Warp path, procedural transforms
-*enabled*, and a real corrective checkpoint. A default-constructed layer on each
-side is therefore not the same model. `soma_jax` also builds a **zero-valued**
-corrective network when no checkpoint is given, so `apply_correctives=True`
-silently applies nothing, where upstream would raise.
+* **Scope.** Every upstream package module has a SOMA-JAX counterpart at the
+  same path (`soma_jax.body.soma`, `soma_jax.fitting.pose_inversion`, …), the
+  pre-0.3 paths resolve as upstream's do (`soma_jax.soma`,
+  `soma_jax.pose_inversion`, `soma_jax.pose_inversion_mhr`,
+  `soma_jax.rts_smoothing`), and every public name upstream exports exists here
+  under the same name, except four pieces of torch/Warp machinery
+  ([Not ported](#not-ported)). Upstream's test files are ported, except the
+  cases that test torch, Warp or upstream's release CI (listed there too).
+* **Call shapes.** Upstream's constructors and functions keep upstream's
+  parameters in upstream's order, so positional and keyword calls written for
+  SOMA-X bind the same way here; SOMA-JAX's own options are keyword-only extras.
+  The exceptions are `SOMALayer` itself, built by the classmethod
+  `from_upstream_assets(...)`, which takes upstream's constructor parameters,
+  and `SOMALayer.pose` ([below](#differences-by-design)).
+* **Forward parity.** The body layer matches upstream at every LOD, on both
+  rigs, with and without the pose-corrective network, to float32 rounding:
+  **≤ 3.1 µm** on vertices and **≤ 5.1 µm** on joints
+  ([table](#the-body-forward)).
+* **Layer surface.** All 68 public attributes of upstream's `SOMALayer` exist
+  here with upstream's meaning and values (torch state such as `device`
+  excepted); on a procedural layer `bind_pose_world`, `t_pose_world`,
+  `rig_data`, … describe the 110-joint skinning rig, exactly as upstream's do.
+* **Fitting.** `PoseInversion` matches upstream through all three stages, and
+  `MHRPoseInversion` through skeleton fit, DOF projection and refinement
+  ([below](#pose-inversion)).
+* **Differences** are listed in [By design](#differences-by-design),
+  [Upstream defects](#upstream-defects-not-reproduced) and
+  [SOMA-JAX additions](#soma-jax-additions).
 
-**One consequence is easy to mistake for a broken port.** Both sides tie the
-repose to the correctives — upstream `forward` and `SOMALayer.__call__` alike set
-`repose_to_bind_pose=apply_correctives`. But upstream defaults
-`apply_correctives=True` (its constructor loads a checkpoint) and this layer
-defaults it to `False` (it does not), so **at their respective defaults the two
-sit in different repose modes**. Comparing `soma_jax` `layer(params)` against
-upstream's default `prepare_identity` therefore shows ~**0.87 mm** at pose σ=0.2;
-pointing upstream at `repose_to_bind_pose=False` drops the same comparison to
-**0.0032 mm**. Both modes are parity-tested — see `tests/test_layer_parity.py`,
-which drives each through the matching API.
+## Measured against upstream
 
-## Verified exact (float32 precision)
+Each row runs upstream's torch implementation and the JAX one on identical
+input. Figures are measured maxima; the tests assert looser bounds so they hold
+across BLAS and driver versions.
 
-End-to-end forward parity is enforced by `tests/test_layer_parity.py`: with the
-template-merged asset, `SOMALayer.__call__` reproduces upstream
-`SOMALayer.forward` to **3.2e-6 m max vertex difference** (0.00032 cm; mean
-1.1e-6 m), for both `repose_to_bind_pose` settings — float32 round-off on an
-exact-algorithm comparison. The test guards at 5e-5 m to stay robust across
-BLAS/driver versions.
+### The body forward
 
-**Scope:** this parity run is **LBS-only** — both sides are called with
-`apply_correctives=False`. Pose correctives are implemented and unit-tested on
-the JAX side (`tests/test_soma_layer.py`), but there is **no test comparing a
-real corrective checkpoint against upstream**, so correctives are outside the
-"verified exact" claim below. The chain this covers:
+`tests/test_body_lod_parity.py`: `SOMALayer.from_upstream_assets(lod=…,
+procedural=…)` against upstream `SOMALayer(lod=…, enable_procedural_transforms=…)`,
+poses `N(0, 0.35²)` rad, translations `N(0, 0.1²)` m, a zero and a random
+(`N(0, 0.5²)`) identity, `identity_model_type="soma"`:
 
-| Stage | SOMA-JAX | Upstream match |
+| LOD (vertices) | rig | correctives | max \|Δ vertex\| | max \|Δ joint\| |
+|---|---|---|---|---|
+| mid (18,056) | legacy (78 joints) | — | 3.1 µm | 5.0 µm |
+| mid | procedural (110 joints) | off | 3.0 µm | 5.1 µm |
+| mid | procedural | **on** | 3.0 µm | 5.1 µm |
+| low (4,505) | legacy | — | 1.8 µm | 3.2 µm |
+| low | procedural | off / on | 1.9 µm | 3.4 µm |
+| xlo (612) | legacy | — | 1.6 µm | 2.5 µm |
+| xlo | procedural | off | 1.7 µm | 2.4 µm |
+| xlo | procedural | **on** | 1.9 µm | 2.4 µm |
+
+The same test pins the reposed rest shape, the identity rest shape and the
+fitted bind transforms of `prepare_identity(repose_to_bind_pose=True)` to
+upstream's cached `_cached_rest_shape` / `_cached_identity_rest_shape` /
+`_cached_bind_transforms_world`, and the faces and facial exclusion lists of
+every LOD exactly. `tests/test_layer_parity.py` and
+`tests/test_procedural_parity.py` repeat the comparison through the other entry
+points (`pose()`, the explicit reposed path, bone scales).
+
+The other identity backends, built from the same assets as upstream builds
+them (`tests/test_body_identity_backends.py`; poses `N(0, 0.3²)` rad, random
+identities and body-part scales, no correctives):
+
+| backend | max \|Δ vertex\| (mid / low / xlo) | max \|Δ joint\| |
 |---|---|---|
-| Identity blend | `SOMAIdentityModel` (`coeffs · √eigenvalues @ pca`) | exact |
-| Skeleton fit | `SkeletonTransfer.fit` (RBF + 2-stage Kabsch), default in `prepare_identity` | exact |
-| Repose to bind | `_repose_full` (rebind + `bind_pose_local` absolute pose) | exact |
-| Joint orient | `t_pose_world` remap applied by default in `__call__` | exact |
-| Skinning | `pose_from_bind` (rebind + level-order FK + LBS); `transl` drives the hips FK slot | exact |
-| Rig data | asset built from the **template-USD-merged** rig (see below) | exact |
+| GarmentMeasurement | 7.9 / 1.8 / 1.3 µm | 4.8 µm |
+| SMPL | 7.0 / 4.2 / 0.9 µm | 1.7 µm |
+| SMPL-X | 13.8 / 3.9 / 0.8 µm | 2.3 µm |
+| Anny | 59.7 / 59.0 / 30.4 µm | 3.4 µm |
+| MHR | 152 / 2.4 / 1.5 µm | 19.3 µm |
 
-**Low LOD.** `SOMALayer.load(path, lod="low")` mirrors upstream
-`SOMALayer(lod="low")`: the rig, identity model and skeleton fit are all built
-on the 4,505-vertex subset (not subsampled after the fact), the facial
-inner-geometry exclusion lists are remapped into low-LOD indices, and
-`triangles_low` becomes `faces`. Parity against upstream is enforced by
-`test_low_lod_forward_matches_upstream` — **1.4e-6 m max / 4.7e-7 m mean**,
-the same order as the mid-LOD result. `SOMAPoseInversion(layer, low_lod=True)`
-accepts such a layer and subsamples full-resolution input itself.
-`downsample_to_low_lod()` raises: subsetting an already-built layer leaves the
-identity model and skeleton transfer at full resolution, which cannot be made
-consistent.
+The source→SOMA correspondence is bit-identical in every case; the larger mid-LOD
+figures come from upstream's tetrahedral embedding, which is ill-conditioned on a
+few near-degenerate source triangles and amplifies float32 noise in the source
+forward. `tests/test_upstream_soma_layer.py` runs upstream's own layer cases on
+every backend and LOD.
 
-Additionally parity-tested (`tests/test_soma_x_parity.py`, 54 tests): rotation
-primitives, covariance/Kabsch/Newton–Schulz alignment, SE(3), quaternions,
-LBS forms, top-K skinning, world↔local rig utils, skeleton-transfer stages.
+### Pose inversion
 
-### The template-rig merge (matters!)
+`tests/test_pose_inversion_parity.py`, upstream `PoseInversion` against
+`soma_jax.fitting.PoseInversion` (`SOMAPoseInversion`) on the same posed mesh:
 
-Upstream SOMA-X does **not** use the `SOMA_neutral.npz` rig arrays as-is: it
-merges `SOMA_template_rig.usda` over them (`soma/soma.py` — "Merge rig tensors
-from the canonical template USD"). This is a **different skinning solve, not a
-refinement of the same one**: the raw npz carries 60,735 nonzero weights and the
-merged 78-joint rig carries 39,283, with 45,672 entries differing (mostly the
-legs) and `bind_pose_world` moving up to 0.1275 cm. An asset built from the npz
-alone diverges ~0.1–0.2 cm at leg/shoulder joints.
+| Stage | max \|ΔR\| | root translation | per-vertex error | mean error (upstream / JAX) |
+|---|---|---|---|---|
+| analytical refit | 1.0e-4 | 6.3e-7 m | 5.5e-6 m | 0.2827 / 0.2827 cm |
+| + Lie-algebra Gauss–Newton (default) | 3.8e-3 | 3.9e-6 m | 1.3e-4 m | 0.1657 / 0.1661 cm |
+| analytical + autograd (40 Adam steps) | 2.1e-4 | 1.6e-6 m | 7.8e-6 m | 0.2449 / 0.2449 cm |
 
-`SOMALayer.from_upstream_assets()` performs this merge directly from the two
-upstream files, with no torch and no upstream package in the loop.
-`docs/INSTALL.md` §4.2 builds the same archive **through the upstream layer**,
-which remains useful as an independent check of the merge.
+Upstream runs the analytical refit through a fused Warp kernel; this runs the
+per-joint torch path's algorithm in JAX. Lie-GN drifts more per joint because it
+solves a dense `(3K × 3K)` normal equation each iteration and the damping ladder
+can select differently (JAX has no `solve_ex` info flag, so solutions are
+validated by finiteness); the reconstruction stays equivalent.
 
-<a name="correspondence-map"></a>
-## Correspondence map — what reimplements what
+`MHRPoseInversion` (`tests/test_mhr_pose_inversion.py`): its two input files,
+`MHR/MHR_base_rig.npz` and `MHR/parameter_transform.npz`, are not in SOMA-X's
+public assets (git LFS or Hugging Face), and upstream's own tests skip without
+them. Both implementations therefore run on stand-ins written from the shipped
+`mhr_model_lod1.pt` (`tests/_mhr_stand_in.py`) — every array real, only joint
+and parameter names synthetic. Pose parameters agree to
+**6.5e-5** at rest and **5.3e-5** on a posed target through refit and Adam
+refinement (losses to 2e-6), **6.4e-4** with the reduced-DOF refit; the
+identity-reference, spine-bound, frozen-parameter, chunked and corrective
+modes agree to the same order. Upstream's own six tests pass on the stand-ins.
 
-Every module in `soma_jax/` and its upstream counterpart. Each module's
-docstring carries the same pointer, so the mapping is visible from the code as
-well as from here.
+### Components
 
-| SOMA-JAX | Upstream `soma/…` | Status |
+| Component | Test | Agreement |
 |---|---|---|
-| `soma.py` | `soma.py` (`SOMALayer`) | forward is a port — pinned at 3.2e-6 m (mid LOD), 1.4e-6 m (low LOD), both LBS-only with `identity_model_type="soma"`. **Constructor defaults differ** from upstream; `rebind()` updates only `v_template` |
-| `identity_model.py` | `identity_model.py` | **mixed.** `SOMAIdentityModel` (PCA) is a port. **MHR is now a real port** — `attach_native_archive()` runs the full `mhr_model_lod1.pt` forward in JAX (127-joint Momentum rig, parameter transform, pose correctives, LBS) to 7.6e-5–1.8e-4 cm depending on pose amplitude; without it the backend stays a linear-PCA stand-in. **Anny is a port too** — `anny_native.py` evaluates the rest shape (`template + B·coeffs`) exactly in JAX and delegates the phenotype→coefficient step to the `anny` package, which is what upstream itself does, so the delegation is the faithful behaviour rather than a gap. SMPL / Garment are transfer substitutes. Laplacian blend conditions + free/anchor set match upstream |
-| `correctives_model.py` | `correctives_model.py` | **partial.** The loaded, inference-only masked MLP equation corresponds at dropout 0 / scale 1. Constructor and checkpoint defaults differ (`use_tanh` False here, True upstream), training dropout and diagnostics are absent, and the forward adds offsets **unscaled** where upstream multiplies by the cached global scale and requires the procedural rig |
-| `rig_build.py` | `soma.py` (the rig-load path) | port of the parts of upstream's constructor that assemble the rig: the `SOMA_template_rig.usda` merge over `SOMA_neutral.npz`, world↔local conversion, the affine joint-regressor fit, and `derive_soma_rig_without_procedural_joints`. Torch-free, so `SOMALayer.from_upstream_assets()` needs neither PyTorch nor the upstream package. Checked against upstream's own `rig_data`: pruned weights 6e-8, `bind_pose_world` 0.0, parents and joint names exactly equal (`tests/test_rig_build.py`) |
-| `procedural_transforms.py` | `procedural_transforms.py` | port. Definition parse, all three channel extractors, bind-alignment quaternions, `twist_rotations_from_source` and `expand_world_transforms_from_source_fk`. `SOMALayer.from_upstream_assets()` drives the expanded rig at **0.34–1.16 mm** vs upstream's default, parity-tested by `tests/test_procedural_parity.py`. Per-procedural-joint mode dispatch is ported (see [Per-joint extraction modes](#the-procedural-rig-parity-achieved) below) |
-| `pose_inversion_soma.py` | `pose_inversion.py` (`PoseInversion`) | analytical + Lie-GN are parity-tested ports; autograd stage unverified. `transfer_to_soma` now covers all of upstream's routes: SOMA topology, full→low subsampling, the dedicated full-res-MHR→low-SOMA interpolator (`_setup_pose_transfer`, gated on low-LOD + MHR as upstream gates it), and the active identity model's correspondence |
-| `usd_io.py` | `io.py` (USD half) | port, including the LOD-discovery chain (`find_lod_skin_mesh_name` / `load_lod_rig`, verified at 18056/4505/612 verts) and `load_template_rig` for the 122-joint skeleton. UV primvar filtering now checks type **and** interpolation, matching upstream |
-| `io.py` | `io.py` (NPZ half) | port — `keep_root=False` default that actually strips Root from `poses`/`joint_names`, `absolute_pose` inferred from `joint_orient`, pose-shape `ValueError`, `global_scale`/`hand_type`. Verified interchangeable in both directions against upstream |
-| `units.py` | `units.py` | port |
-| `assets.py` | `assets.py` | same role, **different mechanism.** Upstream downloads a HuggingFace snapshot; this resolves the same files from `assets/third_party/` and the vendored submodule, and materialises a `data_root` view over them. Deliberate — the assets already ship in `third_party/SOMA-X`, so re-downloading them would be the divergence. `tools/download_assets.py` covers the fetch case |
-| `smpl/__init__.py` | `smpl/__init__.py`, `smpl/transfer.py` | `SMPLFamilyPoseTransferResult`, `SMPLFamilyTopologyBridge` (two-stage source→SOMA-wrap→target) and `transfer_pose_between_layers` all ported. `BarycentricBridge` is a SOMA-JAX-only one-stage helper that stops at SOMA topology. Upstream's `SMPLLayer`/`SMPLXLayer` rigs not ported — this package drives `soma_jax.body_models` |
-| `geometry/transforms.py` | `geometry/transforms.py` | alignment core is a port — matches upstream `align_vectors` in float64 to 1e-15 (CPU) / 1e-13 (GPU) for all three methods (float32: ≤1.5e-6 `auto`/`newton-schulz`, ≤9e-6 `kabsch` — SVD round-off, not algorithm). `rotmat_to_axis_angle` ports the three-branch form including near-π, with one **deliberate** divergence: upstream's small-angle branch returns 2× the correct vector, so this returns the correct one. Euler/quaternion conversions ported |
-| `geometry/lbs.py` | `geometry/lbs.py` | port |
-| `geometry/batched_skinning.py` | `geometry/batched_skinning.py` | port. Class defaults match upstream (`sparse_k=8`, `hips_idx=1`) and `align_translation` anchors X and Z on the translation joint as upstream does, leaving Y from FK |
-| `geometry/rig_utils.py` | `geometry/rig_utils.py` | port. World↔local conversion, upstream's `precompute_joint_orient`, and `PoseMirrorSOMA`/`PoseMirrorMHR` (bit-exact negate-parameter tables). The old heuristic is kept under its own name, `infer_joint_orient_from_rest` |
-| `geometry/skeleton_transfer.py` | `geometry/skeleton_transfer.py` | port (pure-PyTorch path) |
-| `geometry/barycentric_interp.py` | `geometry/barycentric_interp.py` | the 4-coord deformation path is a port, matching upstream to 1.2e-7 (`normal_scale="area"`) and 3.6e-7 (`"edge"`) in float32. The nearest-face search, singular-tetrahedron fallback, and the 3-coord compatibility mode are JAX-only; upstream's stateful `BarycentricInterpolator` correspondence API is not ported |
-| `geometry/interpolate.py` | `geometry/interpolate.py` | port — RBF basis weights match upstream to **2.3e-13 in float64** across all three kernels, i.e. the same algorithm. In float32 the linear solve's conditioning bounds it: 6.0e-6 (`linear`, the kernel `SkeletonTransfer` uses on both sides), 1.3e-6 (`gaussian`), 9.1e-5 (`thin_plate_spline`, the class default but unused by SOMA) |
-| `geometry/laplacian.py` → `LaplacianMesh` | `geometry/laplacian.py` (`LaplacianMesh`) | port — 6.9e-6 m |
-| `geometry/laplacian.py` → `laplacian_solve` | — | **JAX-only, different formulation** (zero-energy membrane) |
-| `geometry/chamfer.py` | — | **JAX-only point-cloud loss.** Bidirectional mean-squared vertex-to-vertex; upstream's `ChamferLoss` is a one-way point-to-*triangle* query. Different loss, not a port |
-| `geometry/warp_kabsch.py` | `geometry/align_vectors_warp.py` | **diverges** — implements `"kabsch"`, not upstream's default `"auto"` |
-| `body_models/model_io.py` | `_smpl_family_loader.py` | port |
-| `types.py` | — | JAX-only (`SOMAParams` / `SOMAOutput`) |
-| `pose_inversion.py` | — | JAX-only lightweight alternative inverter |
-| `body_models/{smpl,smplx}.py` | `smpl/__init__.py` (`SMPLLayer`, `SMPLXLayer`) | corresponding core math, different API/feature surface |
-| `body_models/{_base,smplh,mhr,anny}.py` | — | JAX-only standalone models |
-| `body_models/mhr_native.py` | `mhr_model_lod1.pt` (the shipped TorchScript archive) | transcription, not of a Python module but of the archive upstream calls into: blend shapes, face expressions, the parameter transform, local/global skeleton state, pose correctives and skinning, all in JAX. Agrees with the TorchScript forward to **7.6e-5–1.8e-4 cm** (rest pose to σ=0.25); `MHRIdentityModel.attach_native_archive()` wires it into the SOMA backend (`tests/test_mhr_native.py`) |
-| `body_models/anny_native.py` | `identity_model.py` (`AnnySimplified`) | port of the rest-shape evaluation (`template + B·coeffs`); the phenotype→coefficient step is delegated to the `anny` package exactly as upstream does |
+| `align_vectors` (`auto`, `kabsch`, `newton-schulz`) | `test_soma_x_parity.py`, `test_rotation_alignment.py` | ≤3e-15 in float64; in float32 against upstream's float64, ≤4e-7 on generic correspondences and ≤3e-6 on near-planar (rank-deficient) ones |
+| refit alignment `_align_vectors_auto` | `test_rotation_alignment.py` | ≤2.4e-7 forward; gradients equal torch's, including rank-deficient and zero covariances |
+| RBF basis weights | `test_skeleton_transfer.py` | 2.3e-13 (float64); 6.0e-6 `linear`, 1.3e-6 `gaussian`, 9.1e-5 `thin_plate_spline` (float32 conditioning) |
+| `SkeletonTransfer` | `test_upstream_skeleton_transfer.py`, `test_skeleton_transfer.py`, `test_mhr_pose_inversion.py` | joint by joint, to float32 rounding, on the SOMA and MHR rigs |
+| procedural transforms | `test_upstream_procedural_transforms.py`, `test_upstream_procedural_layer.py` | upstream's cases, except those that patch torch internals or move devices |
+| `BatchedSkinning` / `FKTopology` | `test_upstream_batched_skinning.py` | upstream's cases |
+| `LaplacianMesh` | `test_laplacian.py`, `test_upstream_laplacian.py` | 6.9e-6 m |
+| barycentric transfer | `test_upstream_barycentric_interp.py` | 1.2e-7 (`area`), 3.6e-7 (`edge`) |
+| `ChamferLoss` | `test_upstream_chamfer.py` | against the Warp kernel, cache contract included |
+| `CorrectivesMLP` | `test_soma_x_parity_modules.py`, `test_upstream_correctives_checkpoint.py` | forward 1e-4; checkpoints written here load upstream and vice versa |
+| MHR TorchScript forward (`MHRNativeModel`) | `test_mhr_native.py` | 7.6e-5–1.8e-4 cm |
+| SOMA Hand / MANO layers | `test_upstream_hand_layer.py`, `test_upstream_hand_tools.py` | upstream's hand-layer, template-regression and tool cases |
+| reference poses, RTS smoothing, identity conversion | `test_upstream_reference_*`, `test_upstream_rts_smoothing.py`, `test_upstream_identity_conversion.py` | upstream's cases |
+| SMPL-family transfer | `test_smpl_transfer.py` | all four stages of `transfer.py` |
+| NPZ clips | `test_soma_x_parity_modules.py::TestIoRigKeys` | written here, read upstream and vice versa |
+| template rig from USD | `test_rig_build.py` | bind transforms, joint names and parents exact; pruned weights 6e-8; derived local/world transforms 1 ulp (see below) |
 
+## Upstream API coverage
 
-**Reading the Status column.** "port" means the JAX code implements the same
-algorithm as the named upstream symbol. Where a row says *parity-tested*, a
-test in `tests/` runs both implementations on identical inputs and asserts
-agreement; where it says *not parity-tested*, the correspondence rests on
-reading both sources, which is weaker. The modules with no parity test are
-`correctives_model` — it needs a trained checkpoint — and `chamfer`, which is a
-different loss rather than a port, so there is nothing to compare against.
-Everything else in the map is exercised against upstream; `procedural_transforms`
-by `tests/test_procedural_parity.py` and the NPZ half of `io` by
-`tests/test_soma_x_parity_modules.py::TestIoRigKeys`, which round-trips clips in
-both directions.
+**Module level.** `soma`, `soma.body`, `soma.fitting`, `soma.hand`, `soma.smpl`,
+`soma.geometry` and every module under them map to `soma_jax` modules at the
+same paths; all of upstream's public names exist here (often alongside a
+SOMA-JAX-style name, e.g. `SE3_from_Rt` and `se3_from_rt`). The four that do
+not are torch/Warp machinery — see [Not ported](#not-ported). As upstream's
+`soma/__init__.py` does, `soma_jax/__init__.py` registers the pre-0.3 module
+paths as the implementation modules themselves, so imports, private helpers
+and pickled class references from those paths resolve to one implementation.
 
-**How this map was audited.** Both source trees were read side by side, by me
-and independently by a second model (GPT-5.6-sol), and their findings
-reconciled. Where a row cites a number, it came from running both
-implementations on the same input. Rows marked *not parity-tested* rest on
-source reading alone.
-
-Upstream modules with no port: `pose_inversion_mhr.py`,
-`geometry/lbs_warp.py`, `geometry/fused_refit_warp.py`,
-`geometry/chamfer_warp.py` (behaviour ported to pure JAX; the kernel is not),
-`geometry/align_vectors_warp.py` (partially — see above), `_warp_utils.py`,
-`geometry/_warp_init.py`, `geometry/_utils.py`. Rationale for each in
-[Not ported](#not-ported) below.
-
-## The procedural rig (parity achieved)
-
-Upstream's default is the expanded 122-joint twist skeleton. It is worth having:
-against upstream's own non-procedural mode the twist joints move the surface by
-a median **6.7 mm at pose σ=0.05** rising to **148 mm at σ=1.2** (5 seeds of
-`standard_normal((1, 77, 3)) * σ`; per-seed range 4.7–9.2 mm and 120–189 mm
-respectively), concentrated in bands on the limbs. Regenerate with
-`python benchmarks/plot_procedural_gap.py`
-(`benchmarks/figures/procedural_rig_gap.png`).
-
-Driving it takes **two** rigs. Measured on upstream's `SOMALayer` with
-`enable_procedural_transforms=True`:
-
-```
-rig_data['joint_names']                 -> 122
-skeleton_transfer.skinning_weights      -> (18056, 78)
-skeleton_transfer.bind_world_transforms -> (78, 4, 4)
-```
-
-Identity, the per-identity skeleton fit and the bind data stay on the **78-joint
-public rig in both modes**; only FK and LBS use the expanded skeleton. The public
-pose contract is 78 joints / 77 posable, and `pose()` returns those either way.
-
-`SOMALayer.from_upstream_assets()` reproduces this, pinned by
-`tests/test_procedural_parity.py` against a captured upstream reference:
-
-| clip | max | mean |
-|---|---|---|
-| rest | **0.34 mm** | 0.009 mm |
-| σ=0.15 rad | **0.74 mm** | 0.024 mm |
-| σ=0.45 rad | **1.16 mm** | 0.062 mm |
-
-Four things had to be right *together* — each was found by measurement, and any
-one alone leaves 16–52 mm:
-
-1. **Order.** Upstream does not expand rotations and run FK on 122 joints. It
-   runs FK on the public 78 and expands the resulting *world transforms*
-   (`expand_world_transforms_from_source_fk`, `procedural_transforms.py:1405`,
-   reached from `soma.py:1580` via `transform_expander=`). A twist joint is a
-   single local step off its public parent, not an FK-chain link — driving it
-   through FK lets the bind absorb its rotation exactly.
-2. **Frame.** `aligned_x_swing_twist` reads the **posed world** transforms
-   (`_twist_angles_from_source(source_rotations, source_world_transforms)`).
-   Feeding local rotmats put the emitted twist rotations 1.87 out; threading the
-   world transforms through brought them to 2.4e-4.
-3. **Bind.** `_apply_translation_parameters` rewrites only the **translation
-   column** and leaves every rotation block alone. Zeroing the twist bind
-   rotation to identity desynchronises the bind from the posed transform.
-4. **Local step.** The base rotation and local translation each joint composes
-   come from *that identity's* expanded bind — `rebind()` recomputes them as
-   `joint_world_to_local(bind_world)` (`batched_skinning.py:312`) — not from the
-   static template T-pose.
-
-A unit bug fell out of (3): `rig_build` keeps the USD/npz transforms in native
-centimetres while the fitted `bind_transforms` are metres. The rejected
-intermediate variants and their numbers are in the branch history.
-
-**Bone scales** work through the expanded rig: upstream's
-`_apply_target_bone_scales` maps each public scale on via `target_to_public` and
-overrides every twist joint to follow its segment's **end** joint, so a stretched
-forearm carries its twist helpers. Verified both ways — varying the scales moves
-the mesh by 71.443 mm on *both* implementations identically, and parity holds at
-1.30 mm with and without scaling.
-
-**Both upstream rigs build from upstream's two assets.**
-`from_upstream_assets(procedural=False)` ports
-`derive_soma_rig_without_procedural_joints`: it prunes the procedural and
-auxiliary joints from the template and aggregates each dropped joint's skin
-weights onto its nearest kept parent. Against upstream's own non-procedural
-`rig_data` the pruned weights agree to 6e-8, `bind_pose_world` to 0.0 and the
-parents exactly; the forward matches at 0.34/0.74/1.16 mm.
-
-**Per-joint extraction modes** are dispatched as upstream does — each twist
-joint's parameter-matrix row routed into its own mode and the per-mode
-contributions summed. Every published asset is uniform, so this only runs on a
-mixed definition; `tests/test_soma_x_parity_modules.py` exercises one
-synthetically and checks that switching a single joint disturbs no other.
-
-## Faithful defaults vs. alternatives
-
-| Behaviour | Default (SOMA-X) | Alternative (SOMA-JAX-only) |
-|---|---|---|
-| Skeleton fit | `skeleton_fit="auto"` → full RBF+Kabsch | `skeleton_fit="linear"` (J_regressor; used by benchmarks/tools) |
-| Repose | `repose_to_bind_pose=True` | `False` (T-pose rest) |
-| Translation | hips FK slot (via `bind_transforms`) | additive post-LBS shift (when `bind_transforms=None`) |
-| Sparse LBS | top-K=8 (matches Warp path) | any `sparse_k`, or dense |
-| Correctives input | absolute (orient-remapped) rotations | — |
-
-Legacy assets without `bind_shape`/`eigenvalues` degrade gracefully to the
-linear/unscaled paths (a warning-free fallback used by the synthetic test
-fixtures).
-
-## Implemented with a different (verified-equivalent) structure
-
-`laplacian`, `interpolate`, `units`, and the deformation paths of
-`batched_skinning`, `barycentric_interp`, `transforms` and `rig_utils` — APIs
-are reorganised for JAX/equinox, numerics parity-tested against upstream.
-
-**This section does not cover** `chamfer`,
-`correctives_model` or `io`; those are *not* verified-equivalent, and the
-[correspondence map](#correspondence-map) states what
-each actually is. Nor does it cover the non-deformation surfaces of the four
-modules above (public class defaults, name-colliding helpers, search and
-degeneracy handling) — the map row for each names the divergence.
-
-Known deliberate divergence: upstream's sparse-RBF path zeroes the *virtual
-root* row; both dense paths return the bind position
-(`test_upstream_sparse_rbf_zeroes_the_virtual_root`).
-
-Two gaps in this group, both currently unguarded by tests:
-
-* **MHR Laplacian blend — now ported and called.** Upstream re-solves the SOMA
-  inner-face vertices (eye bags + mouth bag, 691 on this rig) after topology
-  transfer, because a source mesh like MHR has no geometry there
-  (`soma/identity_model.py`: `self._laplacian_mesh.solve(...)`).
-  `soma_jax.geometry.laplacian.LaplacianMesh` ports upstream's `LaplacianMesh`
-  for the configuration SOMA uses (order 1, hard constraints), including the
-  detail that matters: the right-hand side is the **template's own Laplacian
-  coordinates** (`L_U @ V_ref`), not zero, so the filled region reproduces the
-  template's local shape instead of collapsing to a membrane.
-  `tests/test_laplacian.py` pins it to upstream at **6.9e-6 m** max.
-
-  Backend note: upstream builds the system in `torch.sparse`. The port
-  assembles and factorises once on the host with SciPy — the cotangent build
-  needs ragged scatter-add over faces, and shapes depend on the constraint set
-  — while **every per-call solve is pure JAX** (gather, segment-sum, dense
-  Cholesky solve on the small `(691, 691)` block, scatter), so it is `jit`-able,
-  batched and differentiable.
-* **NPZ animation format.** Now semantically interchangeable with upstream, not
-  merely field-name compatible. `save_soma_npz` defaults to `keep_root=False`
-  and **strips Root from both `poses` and `joint_names`** (upstream
-  `soma/io.py:1008`) rather than only recording the flag; `absolute_pose` is
-  inferred as `joint_orient is None`; the unparseable-pose-shape `ValueError`
-  and the optional `global_scale` / `hand_type` fields are ported. Verified in
-  both directions — upstream-written clips load here and port-written clips load
-  in SOMA-X — by `tests/test_soma_x_parity_modules.py::TestIoRigKeys`.
-
-## Pose inversion (faithful multi-stage solver)
-
-`SOMAPoseInversion` (`soma_jax/pose_inversion_soma.py`) is the faithful port of
-upstream `soma.pose_inversion.PoseInversion`, covering all three stages:
-SkeletonTransfer warm start → top-down per-joint inverse-LBS Procrustes refit
-(body / finger / full passes with `_update_root_translation` between rounds) →
-Lie-algebra Gauss–Newton with the Kinematic Lever Arm Jacobian and per-frame
-backtracking line search → optional autograd FK refinement. Also ported:
-`PoseInversionResult`, `roundtrip`, `transfer_to_soma`, `prepare_identity`,
-1-DOF elbow/knee constraints, heel/extremity vertex weighting, and joint pose
-priors.
-
-`tests/test_pose_inversion_parity.py` pins it against upstream (which runs the
-analytical refit through a **fused Warp kernel**):
-
-| Stage | Agreement with upstream |
+| SOMA-JAX | Upstream |
 |---|---|
-| Analytical refit | `max |ΔR| = 1.3e-4`, root translation `4.8e-7 m`, per-vertex error `8.6e-6 m` |
-| + Lie-GN | mean per-vertex error: upstream `0.1618 cm`, SOMA-JAX `0.1626 cm`; root translation `5.6e-6 m` |
+| `body/soma.py` (pre-0.3 path `soma_jax.soma`) | `body/soma.py` (`SOMALayer`, `SOMAPoseOutput`, `SOMAPublicRigView`) |
+| `body/`, `body/identity_model.py` | `body/`, `body/identity_model.py` (SOMA, MHR, Anny, SMPL-family, GarmentMeasurement backends) |
+| `identity_model.py` | `identity_model.py` (`BaseIdentityModel`, coordinate transforms, `create_identity_model`) |
+| `fitting/pose_inversion.py`, `fitting/pose_inversion_mhr.py`, `fitting/rts_smoothing.py` (pre-0.3 paths `soma_jax.pose_inversion`, `…pose_inversion_mhr`, `…rts_smoothing`) | `fitting/` (`PoseInversion`, `MHRPoseInversion`, `smooth_pose`, …) |
+| `hand/` | `hand/` (`SOMAHandLayer`, `MANOLayer`, identity model, loader) |
+| `smpl/`, `smpl/layers.py`, `smpl/transfer.py` | `smpl/__init__.py` (`SMPLLayer`, `SMPLXLayer`, `create_smpl_family_layer`), `smpl/transfer.py` |
+| `correctives_model.py` | `correctives_model.py` |
+| `procedural_transforms.py` | `procedural_transforms.py` |
+| `reference_poses.py` | `reference_poses.py` |
+| `io.py`, `usd_io.py` | `io.py` (NPZ and USD halves) |
+| `assets.py`, `units.py`, `_smpl_family_loader.py` | same names |
+| `geometry/transforms.py`, `lbs.py`, `batched_skinning.py`, `rig_utils.py`, `skeleton_transfer.py`, `interpolate.py`, `laplacian.py`, `barycentric_interp.py` | same names |
+| `geometry/chamfer.py` | `geometry/chamfer_warp.py` (`ChamferLoss`) |
+| `body_models/mhr_native.py`, `body_models/anny_native.py` | the MHR TorchScript archive and the `anny` package upstream calls into |
+| `rig_build.py` | the rig-assembly part of upstream's `SOMALayer` constructor |
 
-**What the parity test actually guards:** the analytical refit and the Lie-GN
-stage are both compared against upstream. The **autograd stage is not** — 
-`test_pose_inversion_parity.py` only checks that it improves on its own warm
-start and returns the right shapes; upstream's autograd path is never run.
+**Class level.** Upstream's classes keep their constructor signatures and
+members; the members that cannot exist on an immutable JAX object are listed in
+[By design](#differences-by-design). Upstream's `SOMALayer` attributes all
+exist with upstream's meaning:
 
-Lie-GN drifts slightly more per joint because it solves a dense `(3K x 3K)`
-normal equation each iteration — torch uses LU via `solve_ex`, JAX its own
-solver, and the damping ladder/line-search branch can select differently. JAX
-has no `solve_ex` info flag, so candidate solutions are validated by
-finiteness instead. The reconstruction callers consume stays equivalent.
+* `bind_pose_world`, `bind_pose_local`, `t_pose_world`, `t_pose_local`,
+  `bind_shape` and `rig_data` describe the **skinning** rig — the expanded
+  110-joint twist rig on a procedural layer — in the asset's native
+  centimetres, read from a `rig_data` assembled as upstream's constructor
+  assembles it. The public 78-joint rig's are in `public_rig_view()`, as
+  upstream's are.
+* `rig_data` is built on first access from the same `SOMA_neutral.npz` and
+  `SOMA_template_rig.usda`, so it exists on layers built by
+  `from_upstream_assets`; layers loaded from a SOMA-JAX archive or built from a
+  `soma_data` dict report their (public) rig instead.
+* The rig's derived transforms (`t_pose_world` from `t_pose_local`,
+  `bind_pose_local` from `bind_pose_world`) are computed in float64 here and in
+  float32 by upstream's torch, and agree to 1 ulp (1.5e-5 cm). Everything read
+  straight from the files is bit-identical.
 
-`soma_jax.PoseInversion` remains as the lightweight SOMA-JAX **alternative**
-(single Kabsch init + one autograd refine + 1-DOF constraints).
+## Differences by design
 
-## SOMALayer surface
+**Immutable layers.** SOMA-JAX layers are `equinox` modules. Upstream's
+`prepare_identity()` caches the identity on the layer (`_cached_rest_shape`,
+`_cached_bind_transforms_world`, …) for later `pose()` / `forward()` calls; here
+`prepare_identity()` takes upstream's parameters and *returns* the identity
+(rest shape and joints; the fitted binds with `return_bind_transforms=True`),
+and `forward()` / `__call__` fit the identity per call. The hand and
+SMPL-family layers keep upstream's `pose(...)` signature plus one `identity=`
+argument, the object their `prepare_identity` returns. Upstream methods that
+default to "the cached identity" (`public_rig_view()`,
+`public_bind_transforms_world()`, …) default to the rig's bind pose instead, or
+take the fitted binds as an argument. `SOMAPoseInversion.prepare_identity` keeps
+upstream's stateful contract, since the inversion object is mutable on both
+sides.
 
-Ported: bone-scale posing (`scale_params`), `fk_only`, the `transforms` output
-field, and the public rig view (`public_rig_view`, `to_public_rotations`,
-`public_skinning_weights`, `public_joint_names`). The bone-scale control layout
-derives independently to exactly upstream's **56** active joints
-(`NUM_BONE_SCALE_PARAMS`), with `scale_param_names` / `scale_param_segments`
-naming each `(parent, child)` edge.
+**`SOMALayer.pose` is SOMA-JAX-shaped.** Upstream's
+`pose(poses, transl=None, pose2rot=True, apply_correctives=True, absolute_pose=False, fk_only=False, return_transforms=None, *, reference_pose=None)`
+poses the cached identity. SOMA-JAX's `pose(rotmats, transl, rest_verts,
+rest_joints, ...)` is a lower-level entry point under the same name: it takes
+78-joint local rotation matrices (Root included; no `pose2rot`), the prepared
+rest shape and joints and, on the faithful path, `bind_transforms`; `transl` is
+required; `apply_correctives` defaults to "apply when a checkpoint is loaded";
+and it applies the T-pose orient only when given `joint_orient` or
+`reference_pose` (upstream's orients unless `absolute_pose=True`). Code written
+for upstream's `pose()` should call `forward()`, which has upstream's signature,
+semantics and 77-joint output.
 
-Two deliberate API shape differences, both because the JAX layer is immutable
-and has no `_cached_*` identity state:
+**No torch state.** `device`, `dtype`, `.to()`, `training`, registered buffers
+and the stateful `batched_skinning` / `public_batched_skinning` objects do not
+exist. Arrays live on JAX's default device (`jax.default_device` chooses it).
+Every `device=` parameter upstream's signatures take is accepted in upstream's
+position and ignored (identity models record it as `.device`).
 
-* `bone_scales` are passed to `pose()` per call rather than cached by
-  `prepare_identity()`.
-* `public_rig_view()` returns a plain dict rather than a frozen dataclass, and
-  takes the fitted binds as an argument.
+**Construction.** `SOMALayer` is built by classmethods.
+`SOMALayer.from_upstream_assets(...)` is upstream's constructor — upstream's
+parameters in upstream's order, reading upstream's own two files — and
+`SOMALayer.load(...)` reads a single-file SOMA-JAX archive. The default identity
+backend is SOMA's own PCA (`identity_model_type="soma"`), where upstream's is
+`"mhr"`: SOMA-JAX's MHR backend reads the MHR TorchScript archive and so needs
+`torch`, which a default layer should not. Everything else defaults as
+upstream: mid LOD, the procedural rig, the packaged corrective checkpoint on a
+procedural layer, `mode="warp"` (top-8 sparse skinning; any other mode keeps
+every influence, as upstream's dense fallback does), metres. SOMA-JAX's own
+options (`npz_path`, `identity_model_path`, `sparse_k`, `fit_joint_regressor`)
+are keyword-only, and its earlier keyword names (`procedural=`,
+`correctives_path=`, `usd_path=`) remain as aliases. A missing or explicitly
+requested but absent asset raises upstream's errors in upstream's order.
 
-The 78-vs-77 joint convention still differs: SOMA-JAX takes all 78 joints with
-Root at index 0 (which must be identity for parity), where upstream takes 77
-public joints and pads Root internally.
+**Strict keyword arguments.** Upstream's identity-model constructors take
+`**kwargs`, pop the keys they know (`nv_lod_mid_to_low`, `soma_low_lod_faces`,
+`vertex_ids_to_exclude`) and drop the rest silently. SOMA-JAX names those keys
+and rejects unknown ones, so a misspelled option raises instead of being
+ignored.
 
-## USD I/O
+**Optional where upstream requires a value.** `device` (ignored), the hand
+identity models' `low_lod` (`False`), `CorrectivesMLP`'s `bindpose` /
+`cors_per_joint` / `num_verts`, `ReferencePoseHistory.get_reference_pose`'s
+`dtype` (float32), `single_axis_rotation_matrices`' `axis_signs` (1.0),
+`batch_rodrigues`' `dtype` (the input's), and the MANO and SMPL-family layers'
+`prepare_identity` `identity_coeffs` (the zero identity, as upstream's own
+`_identity_coeffs` treats `None`). Calls that pass them behave as upstream's.
 
-`soma_jax/usd_io.py` ports upstream's USD half of `io.py`: `save_soma_usd`,
-`save_vertex_animation_usd`, `export_soma_usd`, `write_usd_mesh`,
-`load_usd_mesh`, `load_usd_skeleton`, `load_usd_animation`,
-`load_usd_skinning`, `list_usd_meshes`, `fan_triangulate`. `pxr` is imported
-lazily, so `usd-core` stays optional. Round-trips are covered by
-`tests/test_usd_io.py`: bind transforms, weights and rest vertices round-trip to
-`atol=1e-6`; the animation round-trip is currently shape-checked, not compared
-frame-by-frame.
+**Output joints.** `SOMALayer.__call__` returns all 78 joints with the virtual
+Root at index 0; `SOMALayer.forward(...)` has upstream's signature and returns
+upstream's 77.
 
-`export_soma_usd` takes the fitted rig explicitly (`bind_transforms_world`,
-`rest_shape`) since there is no cached identity to read it from.
+**Gradients at degenerate inputs.** `jnp.linalg.norm` differentiates `‖x‖` at
+`x = 0` as NaN; torch defines that gradient as zero. Where upstream's formulas
+take such norms (`compute_covariance`'s virtual normal, `quaternion_log_xyzw`,
+`quaternion_exp_xyzw`, `rotvec_to_matrix`) SOMA-JAX uses a norm with torch's
+gradient, and its `jnp.where` branches feed unused SVDs well-conditioned
+placeholders, so collinear or zero covariances backpropagate the same zeros
+upstream's do. Forward values are unchanged.
 
-The LOD-discovery chain used to *build* the asset is ported:
-`find_lod_skin_mesh_name` and `load_lod_rig` (`usd_io.py`), verified against the
-template USD at 18056 / 4505 / 612 vertices for mid / low / xlo, plus
-`load_template_rig` for the 122-joint skeleton. `SOMALayer.from_upstream_assets()`
-merges the npz and the template USD directly, so building the runtime rig no
-longer requires torch or the upstream package; `docs/INSTALL.md` §4.2 remains as
-the route that builds the archive *through* the upstream layer, which is useful
-as an independent check of the merge.
+**Host-side precompute.** The skeleton transfer's per-joint RBF systems are
+assembled and LU-factored with NumPy/SciPy when their inputs are concrete
+(bit-identical to `jax.scipy.linalg.lu_factor` on CPU, which calls the same
+LAPACK routine); traced inputs keep the JAX path.
+
+## Upstream defects not reproduced
+
+Each was confirmed against the v0.3.3 code; SOMA-JAX implements what the code
+evidently intends.
+
+* **`PoseInversion(soma, low_lod=True)` — the default — fails on a mid or xlo
+  `SOMALayer`**: `soma/fitting/pose_inversion.py` builds its internal low-LOD
+  layer after `from .body import SOMALayer`, which resolves to the nonexistent
+  `soma.fitting.body` (`ModuleNotFoundError`). Upstream's `smpl2soma`,
+  `mhr2soma` and `convert_amass_to_soma` construct exactly that. SOMA-JAX builds
+  the low-LOD layer from the original's recorded construction.
+* **`PoseInversion(low_lod=True)` on a hand, MANO or SMPL-family layer** would
+  build a *body* `SOMALayer`; SOMA-JAX raises instead.
+* **Upstream's conversion tools on the default (procedural) layer**: they remove
+  `soma._t_pose_orient` — computed on the 110-joint skinning rig — from the 78
+  public rotations `PoseInversion` returns (`RuntimeError` on the shape), label
+  clips with `rig_data["joint_names"]`, the 110 skinning joints (every public
+  joint from `RightShoulder` on mislabelled), and render through
+  `batched_skinning.pose` with public rotations. The tool ports use the public
+  rig's orient and names and the layer's own pose. `mhr2soma --autograd-iters`
+  ≥ 2 also fails upstream ("backward through the graph a second time": the
+  TorchScript parameters require grad, so the prepared identity carries graph
+  history); the port's identity is a constant.
+* **`matrix_to_rotvec`** returns twice the rotation vector below 1e-3 rad (its
+  small-angle series applies the `w` factor to a vector that is `2w`).
+* **`rotvec_to_matrix`** (unused upstream) does not return rotation matrices.
+* **Negative-index roots.** Upstream's torch indexing treats a parent id of `-1`
+  as "the last joint" in several helpers; SOMA-JAX treats it as a root, as the
+  self-parented convention upstream's own assets use.
+
+Reproduced on purpose, because they are part of a public contract:
+`ChamferLoss`'s mesh cache (a target mesh is captured on first use and reused,
+even when later calls pass different vertices, until `refit=True` or
+`clear_cache()`), and `CorrectivesMLP.save_checkpoint(native_unit=…)` accepting
+and not recording the unit.
+
+## SOMA-JAX additions
+
+Everything below is absent upstream. None of it changes what the upstream-named
+API computes.
+
+**Modules.**
+
+* `types.py` — `SOMAParams` / `SOMAOutput`, the pytree input and output of
+  `SOMALayer.__call__`.
+* `identity_packs.py` — identity backends built from precomputed packs
+  (`tools/pipeline/build_identity_packs.py`) instead of the source model files.
+* `rig_build.py` — the torch-free rig assembly behind `from_upstream_assets`
+  (template merge, procedural-joint pruning, an optional linear joint
+  regressor).
+* `pose_inversion_lite.py` — a lightweight inverter (Kabsch + Newton–Schulz
+  init, one Adam refinement, explicit DOF constraints); exported at top level as
+  `soma_jax.PoseInversion`, which is therefore **not** upstream's
+  `PoseInversion` (that is `soma_jax.fitting.PoseInversion`, also reachable as
+  `soma_jax.pose_inversion.PoseInversion` and `soma_jax.SOMAPoseInversion`;
+  upstream has no top-level `PoseInversion`).
+* `body_models/` — standalone JAX SMPL, SMPL-H, SMPL-X, MHR and Anny models
+  with their own parameter types.
+* `geometry/warp_kabsch.py` — an optional Warp `svd3` covariance→rotation kernel
+  for the benchmarks' hybrid pipeline. It is plain Kabsch, **not** upstream's
+  default `auto` method; the two agree on well-conditioned covariances and
+  differ on ill-conditioned ones (on the posed mesh: 0.66 mm max / 2.9 µm mean
+  against the pure-JAX pipeline at the benchmark operating point, 0.69 mm max
+  against SOMA-X's own meshes; `benchmarks/verify_fairness.py`).
+
+**On upstream classes.**
+
+* `SOMALayer`: `load`, `from_upstream_assets`, `rebind`, `attach_procedural_rig`,
+  `build_skinning_rig`, `extend_rig_with_procedural_transforms`,
+  `downsample_to_low_lod` (raises; kept to explain why), and public names for
+  helpers upstream keeps private (`normalize_bone_scales`, `full_bone_scales`,
+  `num_bone_scale_params`, `bone_scale_param_names` / `_segments`); its fields
+  `v_template`, `weights`, `weight_values` / `weight_indices`,
+  `J_regressor`, `joint_names`, `skeleton_levels`, `correctives` (the loaded
+  `CorrectivesMLP`, or `None` without a checkpoint, as `correctives_model`).
+  `prepare_identity(skeleton_fit="linear")` places the skeleton with the fitted
+  `J_regressor` instead of the skeleton transfer, and `pose()` applies
+  translation as an additive shift when no fitted binds are given.
+* `SkeletonTransfer(rotation_backend=…)` selects the optional Warp kernel;
+  `SkeletonTransfer.fit_joint_rotations(vectorized=False)` runs the per-joint
+  loop the vectorized path is checked against; upstream's `fit_rotations_warp`
+  runs the vectorized JAX fit (upstream's runs the same fit in a Warp kernel).
+* `CorrectivesMLP.offsets()` returns just the vertex offsets; `n_joints`,
+  `n_vertices`, `cors_per_joint` name upstream's `J`, `V`, `K`.
+* `SOMAHandLayer.prepare_identity` returns a `SOMAHandIdentity`; the SMPL family
+  an `SMPLFamilyIdentity` (immutability, as above).
+* `PoseMirrorSOMA` / `PoseMirrorMHR` (aliased to upstream's `PoseMirror_SOMA` /
+  `PoseMirror_MHR`) expose their permutation tables.
+* Keyword-only extras on upstream signatures: `SOMALayer.prepare_identity`'s
+  `skeleton_fit`, `return_bind_transforms`, `return_identity_rest_shape`;
+  `PoseInversion(root_joint_idx=…)` and its `prepare_identity(skeleton_fit=…)`;
+  `save_soma_npz`'s `rotation_repr` / `absolute_pose` (overriding what upstream
+  infers); `export_soma_usd`'s `bind_transforms_world` / `rest_shape` (the
+  identity a stateful layer would have cached); the identity backends'
+  `mhr_model` / `anny_model` (share a loaded model), the hand backends'
+  `output_unit` / `model_path`; `CorrectivesMLP(n_joints, n_vertices, W1, W2,
+  key)` and `forward(training, key)` for dropout;
+  `SMPLFamilyTopologyBridge(scale, asset_dir)`;
+  `SOMAProceduralTransformDefinition(template_joint_count)`.
+
+**Module-level names** (beside upstream's own, per module):
+
+* `soma_jax`: the standalone body models and their parameter types,
+  `SOMAParams`, `SOMAOutput`, `SOMAPoseInversion`, `PoseInversion` (the
+  lightweight inverter), `PoseInversionResult`, `BatchedSkinning`,
+  `CorrectivesMLP`, `PoseMirror*`, `chamfer_distance`, `apply_dof_constraints`,
+  joint-orient helpers, `export_soma_usd`, `save_vertex_animation_usd`,
+  `load_soma_npz`, `load_smpl_data`, `BodyModelOutput`.
+* `assets`: local resolution of the asset set (`data_root`, `resolve`,
+  `missing_assets` and the file-set constants), alongside upstream's Hugging
+  Face `get_assets_dir`.
+* `usd_io`: the LOD skin-mesh discovery helpers (`load_lod_rig`,
+  `load_template_rig`, `LOD_*` constants).
+* `correctives_model`: `load_correctives_pt`, `resolve_correctives_model_path`.
+* `procedural_transforms`: `ProceduralTransforms` (the layer's internal
+  evaluator) and its helpers.
+* `geometry`: SOMA-JAX names for upstream's transforms (`axis_angle_to_rotmat`,
+  `rotmat_to_axis_angle`, `se3_from_rt`, `se3_inverse`, `rotmat_to_6d`, …),
+  level-order FK and sparse LBS forms (`forward_kinematics`, `fk_levelorder`,
+  `lbs_sparse`, `lbs_blend`, `lbs_transforms`), `RestJointSkinning`,
+  `pose_from_bind`, `kabsch_points`, `rotation_from_covariance`,
+  `laplacian_solve` (a zero-energy membrane fill, a different formulation from
+  `LaplacianMesh`), the bidirectional vertex-set `chamfer_distance*`,
+  `PoseMirror`, `infer_joint_orient_from_rest`, and skeleton utilities
+  (`get_joint_subtree`, `compute_bone_lengths`, `group_body_part_vertex_ids`).
+* `smpl`: `BarycentricBridge` (one-stage source → SOMA topology),
+  `transfer_pose_between_layers`.
+
+**Tools** with no upstream counterpart: `tools/download_assets.py`'s `--check`
+(report what the local asset set lacks) and `--extras` (fetch
+`GarmentMeasurements/point.npz`, which upstream does not ship) beside upstream's
+own options; `tools/pipeline/` (rig and identity-pack builders, BVH parsing,
+SMPL-X retargeting, the batch renderer),
+`tools/compare_render/` (the SOMA-X vs SOMA-JAX comparison renders),
+`tools/vis/`, `tools/audit_soma_features.py`,
+`tools/convert/convert_correctives_pt_to_npz.py`,
+`tools/convert/pack_gm_matrices_to_npz.py`,
+`tools/convert/shape_space_convert.py`. Upstream's tools are ported under
+their own names (see `tools/README.md`).
 
 <a name="not-ported"></a>
 ## Not ported
 
-* **`pose_inversion_mhr`** — deliberately not ported. Upstream documents it as
-  *"Private native-MHR pose inversion utilities … so MHR-specific DOF handling,
-  co-located ankle distribution, and parameter-matrix projection can be removed
-  or hidden for public releases"*, and it requires `MHR/MHR_base_rig.npz` +
-  `MHR/parameter_transform.npz`, neither of which ships in the public
-  `nvidia/SOMA-X` asset dump. Porting it would mean shipping code that cannot
-  be verified against upstream.
-* **Warp/CUDA kernels** (`lbs_warp`, `fused_refit_warp`, `chamfer_warp`,
-  `align_vectors_warp`) — these are backends, not behaviour. The JAX
-  implementations are parity-tested against them.
-
-  One caveat: `soma_jax/geometry/warp_kabsch.py` is an *optional* Warp
-  covariance→rotation kernel of SOMA-JAX's own (the benchmarks' "SVD in Warp"
-  pipeline). It implements plain SVD Procrustes, i.e. `method="kabsch"`, **not**
-  upstream's default `method="auto"` (Newton–Schulz on a gauge-regularized
-  covariance), for which upstream's `align_vectors_warp` ships a dedicated
-  kernel. The two agree on well-conditioned covariances and diverge on
-  rank-deficient ones — measured **209 µm max / 0.944 µm mean** on the posed mesh
-  at the benchmark operating point (`benchmarks/verify_fairness.py`, which needs
-  a GPU: the kernel registers an XLA FFI handler for CUDA only, and
-  `tests/test_skeleton_transfer.py` skips its Warp case on CPU for the same
-  reason). **The pure-JAX path is the faithful one**: across 4096 problems, half
-  of them near-planar (rank-deficient covariance), it reproduces upstream
-  `align_vectors` to **1e-15 (CPU) / 1e-13 (GPU) in float64** — either way the
-  two are the same algorithm, the backends differing only in which SVD they call.
-  In float32 the agreement is bounded by SVD round-off rather than by the
-  algorithm: ≤1.5e-6 for `auto` and `newton-schulz`, ≤9e-6 for `kabsch`, on both
-  backends (`python benchmarks/verify_fairness.py --align-only` runs just this
-  probe and needs no GPU; the parity test `tests/test_soma_x_parity.py` asserts
-  at `TOL = 1e-5`).
-* **`soma.smpl.SMPLLayer` / `SMPLXLayer` / `create_smpl_family_layer`** — the
-  SOMA-style `BatchedSkinning` rigs upstream wraps the SMPL assets in. This port
-  drives `soma_jax.body_models` instead, so `transfer_pose_between_layers` takes
-  `betas` where upstream takes `identity_coeffs`. The transfer itself *is*
-  ported (all four upstream stages); see `tests/test_smpl_transfer.py`.
-* **Maya / Blender procedural plugins**, docs tooling — out of scope.
-
-These are missing *features*, not silent behavioural differences: calling
-patterns that exercise them fail loudly (missing argument/attribute) rather
-than returning wrong numbers.
+* **torch / Warp machinery.** `setup_warp_for_ddp` (Warp under torch
+  distributed), `NonPersistentModuleWrapper` (keeps a submodule out of a torch
+  `state_dict`), `ChamferBatchedFunction` (a `torch.autograd.Function`) and
+  `chamfer_distance_batched_kernel` (a Warp kernel), plus the Warp backends
+  `lbs_warp`, `fused_refit_warp`, `align_vectors_warp`, `chamfer_warp`'s kernels
+  and the `_warp_init` / `_warp_utils` / `_utils` helpers. Their behaviour is
+  implemented in JAX and compared against them above.
+* **Tests of that machinery**: `test_device.py` (torch device moves),
+  `test_dataloader*.py` (torch `DataLoader` workers with Warp under fork/spawn),
+  `test_warp_kernel_cache.py`, and these cases of otherwise-ported files:
+  `test_skeleton_transfer.py`'s CPU↔GPU round trips;
+  `test_soma_layer.py::test_soma_layer_pose_uses_explicit_fk_lbs_pipeline`
+  (monkeypatches torch `BatchedSkinning.pose`); `test_reference_poses.py`'s
+  float64 / TF32 dtype cases (`test_reference_cast_preserves_gradient`,
+  `test_float32_reference_validation_with_tf32_enabled`), and the
+  "before identity mutation" halves of four cases whose error checks are
+  ported — an immutable layer holds no cached identity to protect.
+* **Release infrastructure**: `tools/ci/` (Hugging Face asset packaging,
+  publishing and verification), `tools/docker-entrypoint.sh`, and
+  `test_hf_release_assets.py` (which tests those scripts; its one library-level
+  case, the top-level hand-layer exports, is ported).
+* **DCC plugins**: `tools/soma_procedural_blender` and `tools/soma_procedural_maya`
+  evaluate the procedural definition inside Blender and Maya; they are not part
+  of the Python library.

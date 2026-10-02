@@ -1,6 +1,6 @@
-"""Anny: children's body model in JAX.
+"""Anny body model in JAX.
 
-Anny is designed for children's body proportions. Native coordinate system
+Anny spans infant-to-elder body proportions through anthropometric controls. Native coordinate system
 is Z-up, -Y-forward (vs SOMA's Y-up, Z-forward).
 
 The forward pass first runs SMPL-style LBS, then applies the coordinate
@@ -51,7 +51,7 @@ def from_soma_coords(vertices: jnp.ndarray) -> jnp.ndarray:
 
 
 class AnnyModel(BaseBodyModel):
-    """Anny children's body model."""
+    """Anny body model (anthropometric controls with broad age coverage)."""
 
     def __init__(
         self,

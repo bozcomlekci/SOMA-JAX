@@ -1,4 +1,4 @@
-"""Pose inversion for SOMA-JAX.
+"""Lightweight pose inversion for SOMA-JAX (the top-level ``soma_jax.PoseInversion``).
 
 Recovers per-joint rotation matrices from posed mesh vertices via two stages:
   1. Analytical init: weighted Kabsch SVD per joint + Newton-Schulz orthogonalization.
@@ -13,7 +13,11 @@ References:
   - Zhou et al. (2019): continuous 6D rotation representation
 
 Upstream: none — SOMA-JAX-only.
-    Lightweight alternative inverter (single Kabsch init + one autograd refine). The faithful solver is pose_inversion_soma.py.
+    Lightweight alternative inverter (single Kabsch init + one autograd refine).
+    Upstream's solver is :mod:`soma_jax.fitting.pose_inversion`, which the
+    pre-0.3 path ``soma_jax.pose_inversion`` also resolves to, as upstream's
+    ``soma.pose_inversion`` does; this module lived at that path before
+    SOMA-JAX adopted upstream's v0.3 layout.
 """
 from __future__ import annotations
 from typing import Optional
@@ -23,7 +27,7 @@ import jax.numpy as jnp
 import optax
 
 from .geometry.transforms import (
-    kabsch,
+    kabsch_points,
     newton_schulz,
     rotation_6d_to_rotmat,
     rotmat_to_6d,
@@ -32,7 +36,7 @@ from .geometry.transforms import (
 from .geometry.lbs import (
     forward_kinematics,
     lbs_transforms,
-    lbs,
+    lbs_blend,
     lbs_sparse,
     compute_skeleton_levels,
     fk_levelorder,
@@ -62,7 +66,7 @@ def _weighted_kabsch_per_joint(
 
     def per_joint(j):
         w = weights[:, j]
-        R = kabsch(rest_verts, posed_verts, weights=w)
+        R = kabsch_points(rest_verts, posed_verts, weights=w)
         return R
 
     return jax.vmap(per_joint)(jnp.arange(J))
@@ -86,7 +90,7 @@ def _analytical_init(
         (J, 3, 3) orthogonal rotation matrices (initial estimate).
     """
     R_init = _weighted_kabsch_per_joint(posed_verts, rest_verts, weights)
-    return jax.vmap(lambda R: newton_schulz(R, num_iter=ns_iters))(R_init)
+    return jax.vmap(lambda R: newton_schulz(R, num_iters=ns_iters))(R_init)
 
 
 def _build_fk_lbs_fn(rest_verts, weights, rest_joints, parents, skeleton_levels):
@@ -95,7 +99,7 @@ def _build_fk_lbs_fn(rest_verts, weights, rest_joints, parents, skeleton_levels)
     def fk_lbs(rotmats):
         G = fk_levelorder(rotmats, rest_joints, parents, skeleton_levels)
         bone_T = lbs_transforms(G[None], rest_joints[None])  # (1, J, 3, 4)
-        posed = lbs(
+        posed = lbs_blend(
             rest_verts[None],
             jnp.zeros_like(rest_verts[None]),
             bone_T,
@@ -388,7 +392,7 @@ class PoseInversion:
                         R_all = rotmats[b_idx].at[j].set(R)
                         G = fk_levelorder(R_all, self.rest_joints, self.parents, self.skeleton_levels)
                         bone_T = lbs_transforms(G[None], self.rest_joints[None])
-                        pred = lbs(self.rest_verts[None], jnp.zeros_like(self.rest_verts[None]), bone_T, self.weights)[0]
+                        pred = lbs_blend(self.rest_verts[None], jnp.zeros_like(self.rest_verts[None]), bone_T, self.weights)[0]
                         diff = pred - posed_verts[b_idx]
                         return jnp.sum(v_w[:, None] * diff ** 2)
 

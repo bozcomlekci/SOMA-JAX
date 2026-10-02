@@ -7,59 +7,61 @@ Provides helpers for skeleton manipulation:
   - Body-part vertex grouping
 
 Upstream: ``soma/geometry/rig_utils.py``
-    World<->local conversion and joint-hierarchy queries are a faithful port.
-    Two name collisions: `precompute_joint_orient` here infers a frame from
-    joint positions, where upstream's same-named function consumes authored
-    orientation matrices; and `PoseMirror` (in skeleton_transfer.py) mirrors
-    rotations only, where upstream's `PoseMirror_SOMA` mirrors full world
-    transforms including positions. `PoseMirror_MHR` is not ported.
+    Faithful port of every public helper under upstream's names
+    (``PoseMirror_SOMA`` / ``PoseMirror_MHR`` are aliases of
+    ``PoseMirrorSOMA`` / ``PoseMirrorMHR``). ``apply_joint_orient_local`` and
+    ``remove_joint_orient_local`` also accept parent indices in place of
+    upstream's precomputed ``orient_parent_T``. SOMA-JAX extras:
+    ``get_joint_subtree``, ``group_body_part_vertex_ids``,
+    ``infer_joint_orient_from_rest``, ``compute_bone_lengths``; the
+    rotations-only ``PoseMirror`` lives in ``skeleton_transfer.py``.
 """
 from __future__ import annotations
-from typing import Optional
+import logging
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .transforms import se3_from_rt, se3_inverse
+from .transforms import se3_inverse
+
+logger = logging.getLogger(__name__)
 
 
-def get_joint_children_ids(parents: np.ndarray) -> dict[int, list[int]]:
-    """Return a dict mapping each joint to the list of its immediate children.
+def get_joint_children_ids(joint_parent_ids) -> list[list[int]]:
+    """Each joint's immediate children, as upstream's list of lists.
+
+    Upstream ``rig_utils.get_joint_children_ids`` scans joints ``1..J-1``, so
+    the self-parented root (SOMA's joint 0) is never its own child. A negative
+    parent (an SMPL-style root) is skipped here, where upstream's Python
+    indexing would file the joint under the last joint.
 
     Args:
-        parents: (J,) integer parent indices; root has parent < 0.
+        joint_parent_ids: (J,) parent indices.
 
     Returns:
-        Dict {joint_id: [child_ids]} with all children for each joint.
+        ``children[j]`` — the children of joint ``j``.
     """
-    J = len(parents)
-    children: dict[int, list[int]] = {j: [] for j in range(J)}
-    for j in range(J):
-        p = int(parents[j])
-        # A self-parented root (SOMA's joint 0) is not its own child — listing
-        # it would make subtree walks such as `get_joint_descendents` recurse
-        # forever. Upstream sidesteps this by starting the scan at index 1.
-        if p >= 0 and p != j:
-            children[p].append(j)
+    parents = [int(p) for p in np.asarray(joint_parent_ids).reshape(-1)]
+    children: list[list[int]] = [[] for _ in range(len(parents))]
+    for i in range(1, len(parents)):
+        if 0 <= parents[i] != i:
+            children[parents[i]].append(i)
     return children
 
 
-def get_joint_descendents(parents: np.ndarray, root_joint: int) -> list[int]:
-    """Return all descendants of a joint (excluding the joint itself).
+def get_joint_descendents(joint_parent_ids, joint_id: int) -> list[int]:
+    """All descendants of a joint (excluding it), in upstream's depth-first pre-order.
 
     Args:
-        parents: (J,) parent indices.
-        root_joint: index of the joint whose descendants we want.
-
-    Returns:
-        List of descendant joint indices in BFS order.
+        joint_parent_ids: (J,) parent indices.
+        joint_id: the joint whose descendants to list.
     """
-    children = get_joint_children_ids(parents)
+    children = get_joint_children_ids(joint_parent_ids)
     result: list[int] = []
-    queue = list(children[root_joint])
-    while queue:
-        j = queue.pop(0)
+    stack = list(reversed(children[joint_id]))
+    while stack:
+        j = stack.pop()
         result.append(j)
-        queue.extend(children[j])
+        stack.extend(reversed(children[j]))
     return result
 
 
@@ -69,11 +71,26 @@ def get_joint_subtree(parents: np.ndarray, root_joint: int) -> list[int]:
 
 
 def get_body_part_vertex_ids(
+    skinning_weights,
+    joint_parent_ids,
+    root_joint_id: int,
+    include_root: bool = True,
+    weight_threshold: float = 0.01,
+) -> list[int]:
+    """Vertex IDs influenced by a body part: a root joint and its descendants.
+
+    Upstream ``rig_utils.get_body_part_vertex_ids``; see :func:`body_part_vertex_ids`.
+    """
+    return body_part_vertex_ids(skinning_weights, joint_parent_ids, root_joint_id,
+                                include_root=include_root, weight_threshold=weight_threshold)
+
+
+def group_body_part_vertex_ids(
     weights: np.ndarray,
     joint_groups: dict[str, list[int]],
     threshold: float = 0.1,
 ) -> dict[str, np.ndarray]:
-    """Group vertices by body part based on skinning weight influence.
+    """Group vertices by body part based on skinning weight influence (SOMA-JAX extra).
 
     Args:
         weights: (V, J) skinning weight matrix.
@@ -99,12 +116,11 @@ def body_part_vertex_ids(
     weight_threshold: float = 0.01,
 ) -> list[int]:
     """Vertices influenced by a joint's subtree — SOMA-X's
-    ``rig_utils.get_body_part_vertex_ids``.
+    ``rig_utils.get_body_part_vertex_ids`` (also available under that name).
 
-    Differs from :func:`get_body_part_vertex_ids` (which groups by a
-    ``{name: joint_ids}`` dict): this walks the joint hierarchy from
-    ``root_joint_id`` and unions the influence masks of every descendant, which
-    is what the pose-inversion vertex weighting expects.
+    Walks the joint hierarchy from ``root_joint_id`` and unions the influence
+    masks of every descendant, which is what the pose-inversion vertex
+    weighting expects.
 
     Args:
         skinning_weights: (V, J) dense skinning weights.
@@ -127,72 +143,94 @@ def body_part_vertex_ids(
 
 
 def joint_world_to_local(
-    world_transforms: jnp.ndarray,
-    parents: np.ndarray,
-) -> jnp.ndarray:
+    joint_world_transforms: jnp.ndarray,
+    joint_parent_ids: np.ndarray,
+    return_inverse: bool = False,
+):
     """Convert global (world) joint transforms to local (parent-relative).
 
     For each joint j: T_local[j] = T_world[parent[j]]^-1 @ T_world[j]
     For root joints: T_local[j] = T_world[j]
 
-    A joint counts as a root when ``parents[j] < 0`` (SMPL convention) **or**
-    ``parents[j] == j`` (SOMA's own rig self-parents joint 0). SOMA-X handles
+    A joint counts as a root when ``joint_parent_ids[j] < 0`` (SMPL convention) **or**
+    ``joint_parent_ids[j] == j`` (SOMA's own rig self-parents joint 0). SOMA-X handles
     the self-parented form explicitly; treating it as an ordinary joint would
     return identity for the root and break the world→local→world round trip.
 
     Args:
-        world_transforms: (..., J, 4, 4) global joint transforms.
-        parents: (J,) parent indices.
+        joint_world_transforms: (..., J, 4, 4) transforms or (..., J, 3, 3)
+            rotations, as upstream accepts.
+        joint_parent_ids: (J,) parent indices.
+        return_inverse: also return every joint's inverse world transform,
+            as upstream's ``return_inverse=True``.
 
     Returns:
-        (..., J, 4, 4) local joint transforms.
+        Local transforms, same shape as ``joint_world_transforms`` — and, with
+        ``return_inverse``, the inverse world transforms too.
     """
-    J = world_transforms.shape[-3]
-    parents_arr = np.asarray(parents)
+    parents_arr = np.asarray(joint_parent_ids)
     is_root = (parents_arr < 0) | (parents_arr == np.arange(len(parents_arr)))
     safe_parents = np.maximum(parents_arr, 0)
 
-    parent_world = world_transforms[..., safe_parents, :, :]   # (..., J, 4, 4)
-    parent_inv = se3_inverse(parent_world)                      # (..., J, 4, 4)
-    local = jnp.einsum("...jik,...jkl->...jil", parent_inv, world_transforms)
+    parent_world = joint_world_transforms[..., safe_parents, :, :]   # (..., J, M, M)
+    if joint_world_transforms.shape[-2:] == (3, 3):
+        parent_inv = jnp.swapaxes(parent_world, -2, -1)
+    elif joint_world_transforms.shape[-2:] == (4, 4):
+        parent_inv = se3_inverse(parent_world)
+    else:
+        raise ValueError(
+            "Expected joint_world_transforms to have shape (...,4,4) or (...,3,3); "
+            f"got {joint_world_transforms.shape}")
+    local = jnp.einsum("...jik,...jkl->...jil", parent_inv, joint_world_transforms)
 
     # Root joints keep their world transforms
     root_mask = jnp.asarray(is_root, dtype=local.dtype)[:, None, None]  # (J, 1, 1)
-    local = jnp.where(root_mask > 0.5, world_transforms, local)
+    local = jnp.where(root_mask > 0.5, joint_world_transforms, local)
+    if return_inverse:
+        inverse = (jnp.swapaxes(joint_world_transforms, -2, -1) if joint_world_transforms.shape[-1] == 3
+                   else se3_inverse(joint_world_transforms))
+        return local, inverse
     return local
 
 
 def joint_local_to_world(
-    local_transforms: jnp.ndarray,
-    parents: np.ndarray,
+    joint_local_transforms: jnp.ndarray,
+    joint_parent_ids: np.ndarray,
 ) -> jnp.ndarray:
     """Convert local (parent-relative) joint transforms to world.
 
     Sequential FK along the kinematic chain.
 
     Args:
-        local_transforms: (J, 4, 4) local joint transforms.
-        parents: (J,) parent indices.
+        joint_local_transforms: (..., J, 4, 4) transforms or (..., J, 3, 3)
+            rotations — upstream accepts ``(J, M, M)`` or ``(B, J, M, M)``.
+        joint_parent_ids: (J,) parent indices; a root is ``< 0`` or its own parent.
 
     Returns:
-        (J, 4, 4) world (global) joint transforms.
+        World transforms, same shape as ``joint_local_transforms``.
     """
-    parents_arr = jnp.asarray(parents)
+    joint_local_transforms = jnp.asarray(joint_local_transforms)
+    M = joint_local_transforms.shape[-1]
+    if joint_local_transforms.shape[-2:] not in ((3, 3), (4, 4)):
+        raise ValueError(
+            "Expected joint_local_transforms to have shape (...,4,4) or (...,3,3); "
+            f"got {joint_local_transforms.shape}")
+    parents_arr = jnp.asarray(joint_parent_ids)
     safe_parents = jnp.maximum(parents_arr, 0)
-    J = local_transforms.shape[0]
-    G = jnp.eye(4, dtype=local_transforms.dtype)[None].repeat(J, axis=0)
+    J = joint_local_transforms.shape[-3]
+    local_j = jnp.moveaxis(joint_local_transforms, -3, 0)            # (J, ..., M, M)
+    eye = jnp.broadcast_to(jnp.eye(M, dtype=joint_local_transforms.dtype), local_j.shape[1:])
+    G = jnp.zeros_like(local_j)
 
     def step(G, i):
-        p = safe_parents[i]
         # Root = parent < 0 (SMPL) or self-parented (SOMA); mirrors
         # joint_world_to_local so the two are exact inverses.
         is_root = (parents_arr[i] < 0) | (parents_arr[i] == i)
-        parent_T = jnp.where(is_root, jnp.eye(4, dtype=G.dtype), G[p])
-        world_T = parent_T @ local_transforms[i]
-        return G.at[i].set(world_T), None
+        parent_T = jnp.where(is_root, eye, G[safe_parents[i]])
+        return G.at[i].set(parent_T @ local_j[i]), None
 
     G, _ = jax.lax.scan(step, G, jnp.arange(J))
-    return G
+    return jnp.moveaxis(G, 0, -3)
 
 
 def infer_joint_orient_from_rest(
@@ -237,85 +275,59 @@ def infer_joint_orient_from_rest(
     return jnp.stack(orients, axis=0)
 
 
+def _orient_pair(orient, orient_parent_T):
+    """``(orient, orient_parent_T)`` from upstream's pair or from parent indices."""
+    orient = jnp.asarray(orient)[..., :3, :3]
+    if np.ndim(orient_parent_T) == 1:
+        return precompute_joint_orient(orient, orient_parent_T)
+    return orient, jnp.asarray(orient_parent_T)
+
+
 def apply_joint_orient_local(
-    local_rotmats: jnp.ndarray,
-    joint_orient: jnp.ndarray,
-    parents: Optional[np.ndarray] = None,
+    local_rotations: jnp.ndarray,
+    orient: jnp.ndarray,
+    orient_parent_T,
 ) -> jnp.ndarray:
-    """Apply joint-orient remap to T-pose-relative local rotations.
+    """Apply joint orient as a per-joint local operation (no FK loop).
 
-    Matches NVlabs/SOMA-X's `rig_utils.apply_joint_orient_local`:
+    Upstream ``rig_utils.apply_joint_orient_local``::
 
-        R_out[j] = orient[parent[j]].T @ R_in[j] @ orient[j]
+        R_out[j] = orient_parent_T[j] @ R_in[j] @ orient[j]
 
-    i.e. conjugate by the PARENT's bind orient on the left and SELF's bind
-    orient on the right. This is what takes a rotation expressed in the
-    joint's own bind frame ("rotate the elbow by X around its bone axis")
-    and rewrites it in the parent's bind frame so the standard FK chain
-    (which composes in parent space) produces the intended pose.
-
-    For backward compatibility, if `parents` is None we fall back to the
-    legacy formula `R_out = orient @ R @ orient.T` (a same-joint conjugation,
-    which is wrong whenever the parent's bind differs from the joint's bind).
-    Callers should always pass `parents`.
+    equivalent to rotating each world transform by its joint's orient. The
+    third argument is upstream's ``orient_parent_T`` from
+    :func:`precompute_joint_orient`, or — SOMA-JAX convenience — the (J,)
+    parent indices to precompute it from. It is required, as upstream's is.
 
     Args:
-        local_rotmats: (..., J, 3, 3) T-pose-relative local rotations.
-        joint_orient:  (J, 3, 3) per-joint world bind orientation.
-        parents:       (J,) parent indices, root encoded as <0 or self.
+        local_rotations: (..., J, 3, 3) T-pose-relative local rotations.
+        orient: (J, 3, 3) per-joint world orientation (``orient`` of the pair).
+        orient_parent_T: (J, 3, 3) parents' transposed orients, or (J,) parents.
 
     Returns:
-        (..., J, 3, 3) rotations remapped to the parent-relative skinning frame.
+        (..., J, 3, 3) oriented local rotations.
     """
-    if parents is None:
-        return jnp.einsum("jrs,...jsk,jkt->...jrt",
-                          joint_orient, local_rotmats,
-                          jnp.swapaxes(joint_orient, -2, -1))
-    parents_np = np.asarray(parents).astype(int)
-    safe_parents = np.where(parents_np < 0, np.arange(len(parents_np)), parents_np)
-    # Root: orient_parent = identity (root has no bound parent in world).
-    is_root = (parents_np < 0) | (parents_np == np.arange(len(parents_np)))
-    orient_parent_T = jnp.swapaxes(joint_orient[safe_parents], -2, -1)
-    # Replace root rows with identity so we don't conjugate by self.T at root.
-    eye3 = jnp.broadcast_to(jnp.eye(3, dtype=joint_orient.dtype), orient_parent_T.shape)
-    orient_parent_T = jnp.where(is_root[:, None, None], eye3, orient_parent_T)
-    return jnp.einsum("jrs,...jsk,jkt->...jrt",
-                      orient_parent_T, local_rotmats, joint_orient)
+    orient, orient_parent_T = _orient_pair(orient, orient_parent_T)
+    return orient_parent_T @ local_rotations @ orient
 
 
 def remove_joint_orient_local(
-    local_rotmats: jnp.ndarray,
-    joint_orient: jnp.ndarray,
-    parents: Optional[np.ndarray] = None,
+    local_rotations: jnp.ndarray,
+    orient: jnp.ndarray,
+    orient_parent_T,
 ) -> jnp.ndarray:
-    """Inverse of `apply_joint_orient_local` — SOMA-X's reverse remap.
+    """Remove joint orient — inverse of :func:`apply_joint_orient_local`.
 
-        R_in[j] = orient[parent[j]] @ R_out[j] @ orient[j].T
+    Upstream ``rig_utils.remove_joint_orient_local``::
 
-    Used by pose-inversion + smpl2soma to convert absolute skinning frames
-    back to T-pose-relative locals for export.
+        R_rel[j] = orient_parent_T[j]^T @ R_abs[j] @ orient[j]^T
 
-    Args:
-        local_rotmats: (..., J, 3, 3) joint-orient-aligned rotations.
-        joint_orient: (J, 3, 3) joint orient matrices.
-        parents:       (J,) parent indices.
-
-    Returns:
-        (..., J, 3, 3) local rotations with joint orient removed.
+    converting absolute local rotations (PoseInversion output) back to the
+    T-pose-relative convention. Arguments as for
+    :func:`apply_joint_orient_local`.
     """
-    if parents is None:
-        return jnp.einsum("jrs,...jst,jtk->...jrk",
-                          jnp.swapaxes(joint_orient, -2, -1), local_rotmats,
-                          joint_orient)
-    parents_np = np.asarray(parents).astype(int)
-    safe_parents = np.where(parents_np < 0, np.arange(len(parents_np)), parents_np)
-    is_root = (parents_np < 0) | (parents_np == np.arange(len(parents_np)))
-    orient_parent = joint_orient[safe_parents]
-    eye3 = jnp.broadcast_to(jnp.eye(3, dtype=joint_orient.dtype), orient_parent.shape)
-    orient_parent = jnp.where(is_root[:, None, None], eye3, orient_parent)
-    return jnp.einsum("jrs,...jst,jtk->...jrk",
-                      orient_parent, local_rotmats,
-                      jnp.swapaxes(joint_orient, -2, -1))
+    orient, orient_parent_T = _orient_pair(orient, orient_parent_T)
+    return jnp.swapaxes(orient_parent_T, -2, -1) @ local_rotations @ jnp.swapaxes(orient, -2, -1)
 
 
 def compute_bone_lengths(
@@ -427,6 +439,10 @@ class PoseMirrorSOMA:
         adjust[center_idx] = np.diag([1.0, 1.0, -1.0, 1.0]).astype(np.float32)
         if root_index != -1:
             adjust[root_index] = np.diag([-1.0, 1.0, 1.0, 1.0]).astype(np.float32)
+        else:
+            logger.warning(
+                "Root joint '%s' not found in joint list. Root rotation fix not applied.",
+                root_name)
         self.local_adjust = jnp.asarray(adjust)
 
     def __call__(self, pose_world: jnp.ndarray) -> jnp.ndarray:
@@ -526,3 +542,61 @@ class PoseMirrorMHR:
         if p.shape[-1] != self.num_params:
             raise ValueError(f"Expected (..., {self.num_params}), got {p.shape}")
         return p[..., self.perm] * self.signs
+
+
+# ---------------------------------------------------------------------------
+# Upstream names (``soma.geometry.rig_utils``)
+# ---------------------------------------------------------------------------
+
+#: ``(joint_ids, parent_ids)`` index pairs, one per tree depth.
+SkeletonLevels = list[tuple[np.ndarray, np.ndarray]]
+
+PoseMirror_SOMA = PoseMirrorSOMA
+PoseMirror_MHR = PoseMirrorMHR
+
+
+def compute_skeleton_levels(joint_parent_ids, device=None) -> SkeletonLevels:
+    """Group joints by tree depth for level-order forward kinematics.
+
+    Upstream ``rig_utils.compute_skeleton_levels``: depths follow
+    ``depth[i] = depth[parent[i]] + 1`` over joints ``1..J-1`` (parents precede
+    children), and level ``d`` is the pair of int64 arrays ``(joint_ids,
+    parent_ids)``. ``device`` is accepted for signature compatibility. (The
+    list-of-joint-lists :func:`soma_jax.geometry.lbs.compute_skeleton_levels`
+    is the SOMA-JAX FK helper.)
+    """
+    parent_ids = [int(p) for p in np.asarray(joint_parent_ids).reshape(-1)]
+    num_joints = len(parent_ids)
+    depth = [0] * num_joints
+    for i in range(1, num_joints):
+        depth[i] = depth[parent_ids[i]] + 1
+    max_depth = max(depth) if num_joints > 0 else 0
+    levels = []
+    for d in range(max_depth + 1):
+        jids = [i for i in range(num_joints) if depth[i] == d]
+        levels.append((np.asarray(jids, np.int64),
+                       np.asarray([parent_ids[i] for i in jids], np.int64)))
+    return levels
+
+
+def joint_local_to_world_levelorder(joint_local_transforms, levels: SkeletonLevels) -> jnp.ndarray:
+    """Level-order forward kinematics — upstream ``joint_local_to_world_levelorder``.
+
+    Equivalent to :func:`joint_local_to_world`, composing every joint of a
+    depth level in one batched matmul.
+
+    Args:
+        joint_local_transforms: (J, M, M) or (B, J, M, M) with M = 3 or 4.
+        levels: output of :func:`compute_skeleton_levels`.
+
+    Returns:
+        World transforms, same shape as the input.
+    """
+    local = jnp.asarray(joint_local_transforms)
+    added_batch = local.ndim == 3
+    if added_batch:
+        local = local[None]
+    world = local
+    for joint_ids, parent_ids in levels[1:]:
+        world = world.at[:, joint_ids].set(world[:, parent_ids] @ local[:, joint_ids])
+    return world[0] if added_batch else world

@@ -1,7 +1,7 @@
-"""Measure and plot what upstream's 122-joint procedural rig actually changes.
+"""Measure and plot what upstream's 110-joint procedural rig actually changes.
 
 Writes ``figures/procedural_rig_gap.png`` (+ ``.pdf``) and prints the numbers
-quoted in ``docs/FAITHFULNESS.md`` under "The procedural rig".
+quoted in ``benchmarks/README.md`` under "The procedural rig".
 
 This is an **upstream-vs-upstream** measurement: the same SOMA-X layer built
 with ``enable_procedural_transforms=True`` and ``False``, driven by the same
@@ -12,7 +12,10 @@ the question the port's motivation rests on.
 Two panels:
 
 * **left** -- maximum surface change against pose amplitude, as a median over
-  ``--seeds`` random clips with the per-seed range shaded. The effect is
+  ``--seeds`` random clips with the per-seed range shaded. σ = 0 is included:
+  the zero pose is a T-pose while the bind pose is an A-pose, so the two rigs
+  already differ there (the arms swing from A to T on both, and only the
+  procedural rig spreads that swing over its twist joints). The effect is
   strongly seed-dependent (a clip that happens to twist a forearm hard moves
   far more surface than one that does not), so a single number without its
   spread is not reproducible; the shaded band is the honest form of the claim.
@@ -39,7 +42,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 FIGURES = Path(__file__).resolve().parent / "figures"
-SIGMAS = (0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0, 1.2)
+SIGMAS = (0.0, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 0.8, 1.0, 1.2)
 
 
 def _upstream(procedural: bool, data_root: str):
@@ -198,7 +201,7 @@ def main() -> int:
     ax.plot(SIGMAS, med, "o-", color="#3b6ea5", ms=3.5, label="median")
     ax.set_xlabel("pose amplitude σ (rad)")
     ax.set_ylabel("max surface change (mm)")
-    ax.set_title("What the 122-joint twist rig changes\n"
+    ax.set_title("What the 110-joint twist rig changes\n"
                  "(upstream procedural vs upstream non-procedural)", fontsize=9)
     ax.legend(fontsize=7, frameon=False)
     for side in ("top", "right"):

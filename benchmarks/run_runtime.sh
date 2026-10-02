@@ -12,7 +12,7 @@ SCRIPT=$REPO/benchmarks/bench_forward_pass.py
 
 # CUDA 13 NVRTC for torch — auto-detected from the torch env's nvidia-cu13 wheel;
 # override by exporting TORCH_CUDA_LIBS.
-TORCH_CUDA_LIBS=${TORCH_CUDA_LIBS:-$("$PY" -c 'import os,nvidia.cu13 as c; print(os.path.join(os.path.dirname(c.__file__),"lib"))' 2>/dev/null || true)}
+TORCH_CUDA_LIBS=${TORCH_CUDA_LIBS:-$("$PY" -c 'import os,nvidia.cu13 as c; print(os.path.join(list(c.__path__)[0],"lib"))' 2>/dev/null || true)}
 
 # The timing self-sizes for low variance: a wall-clock warmup pins boost clocks
 # and inner-batching amortizes host/launch overhead; the reported value is the

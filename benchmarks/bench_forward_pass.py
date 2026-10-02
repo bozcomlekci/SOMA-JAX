@@ -256,15 +256,10 @@ def bench_soma_jax_st(hf_asset_dir: str, batches: list[int],
     a *different* algorithm — see ``bench_soma_jax``.
 
     This benchmark constructs the faithful JAX ports from the same upstream
-    archive SOMA-X reads (``SOMA_neutral.npz``), with matching dimensions,
-    identity coefficients, pose, FK structure and top-8 LBS.
-
-    NOTE — not a bit-identical rig: upstream's ``SOMALayer`` additionally merges
-    ``SOMA_template_rig.usda`` over those NPZ arrays, which this path loads raw.
-    The rigs differ in ~46k skinning-weight entries, so the FLOP count and
-    therefore the timing are matched, but the posed meshes are not numerically
-    comparable here. Numerical parity lives in ``tests/test_layer_parity.py``,
-    which builds against the merged rig.
+    assets SOMA-X reads — the public rig from ``SOMA_template_rig.usda``, the
+    shape data from ``SOMA_neutral.npz`` (``benchmarks/_rig.py``) — with
+    matching dimensions, identity coefficients, pose, FK structure and top-8
+    LBS, so the two sides pose the same meshes (``verify_fairness.py`` checks).
 
     The constructed pipeline:
 
@@ -284,25 +279,21 @@ def bench_soma_jax_st(hf_asset_dir: str, batches: list[int],
     # matmuls to TF32 on Ampere+, ~1.5-1.7x faster but lower precision).
     # "highest" = float32 (fair); "default" = TF32 (JAX-only, not comparable).
     jax.config.update("jax_default_matmul_precision", matmul_precision)
-    from scipy.sparse import csc_matrix
     from soma_jax.geometry.skeleton_transfer import SkeletonTransfer
     from soma_jax.geometry.batched_skinning import pose_from_bind, topk_skinning
     from soma_jax.geometry.lbs import compute_skeleton_levels
     from soma_jax.geometry.rig_utils import apply_joint_orient_local, joint_world_to_local
     from soma_jax.geometry.transforms import se3_inverse
 
-    print(f"\n[soma_jax_st] loading upstream rig from {hf_asset_dir}/SOMA_neutral.npz")
-    rig = dict(np.load(Path(hf_asset_dir) / "SOMA_neutral.npz", allow_pickle=False))
+    from _rig import public_rig
+
+    print(f"\n[soma_jax_st] loading upstream's public rig from {hf_asset_dir}")
+    rig = public_rig(hf_asset_dir)
     bind_shape = np.asarray(rig["bind_shape"], dtype=np.float32)             # (V, 3) cm
     bind_world = np.asarray(rig["bind_pose_world"], dtype=np.float32)        # (J, 4, 4) cm
-    parents_raw = np.asarray(rig["joint_parent_ids"], dtype=np.int64)
-    parents = parents_raw.copy()
+    parents = np.asarray(rig["parents"], dtype=np.int64).copy()
     parents[0] = -1                                                           # root sentinel
-    weights = np.asarray(csc_matrix(
-        (rig["skinning_weights_data"], rig["skinning_weights_indices"],
-         rig["skinning_weights_indptr"]),
-        shape=tuple(rig["skinning_weights_shape"]),
-    ).todense(), dtype=np.float32)                                            # (V, J)
+    weights = np.asarray(rig["weights"], dtype=np.float32)                    # (V, J)
     mean = np.asarray(rig["mean"], dtype=np.float32).reshape(-1)              # (3V,) cm
     shapedirs = np.asarray(rig["shapedirs"], dtype=np.float32)                # (K, 3V)
     eigenvalues = np.asarray(rig["eigenvalues"], dtype=np.float32)            # (K,)
@@ -432,7 +423,12 @@ def main():
         idx = args.device.split(":")[-1] if ":" in args.device else "0"
         os.environ["CUDA_VISIBLE_DEVICES"] = idx
 
-    payload = {"args": vars(args), "results": []}
+    # Repo-relative provenance: absolute paths would publish the local layout.
+    payload = {"args": {k: (str(Path(v).resolve().relative_to(REPO))
+                            if isinstance(v, str) and Path(v).is_absolute()
+                            and Path(v).resolve().is_relative_to(REPO) else v)
+                        for k, v in vars(args).items()},
+               "results": []}
     if not args.skip_soma_x:
         payload["results"].append(
             bench_soma_x(args.soma_asset, args.batches, args.warmup, args.iters, args.device)

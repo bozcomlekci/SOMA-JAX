@@ -3,16 +3,23 @@
 All functions operate on JAX arrays and are compatible with jit/vmap/grad.
 
 Upstream: ``soma/geometry/transforms.py``
-    Alignment core is a faithful port — `align_vectors` matches upstream to
-    <=1e-6 for all three methods, including rank-deficient covariances, and
-    covariance/Kabsch/Newton-Schulz/SE(3)/6D/quaternion composition agree.
-    Gaps: `rotmat_to_axis_angle` lacks upstream's near-pi branch and is
-    inaccurate near theta = pi; upstream's Euler and general rotvec
-    conversions have no counterpart here.
+    Faithful port of every public function, under upstream's names (listed at
+    the end of this module) as well as SOMA-JAX's (``axis_angle_to_rotmat``,
+    ``rotmat_to_axis_angle``, ``se3_inverse``, ...). `align_vectors` matches
+    upstream to <=1e-6 for all three methods, including rank-deficient
+    covariances. Two upstream defects are not reproduced:
+    ``matrix_to_rotvec`` doubles the rotation vector below 1e-3 rad, and
+    ``rotvec_to_matrix`` (unused upstream) does not return rotations.
+    ``kabsch_points`` is a SOMA-JAX extra (upstream's ``kabsch`` takes a
+    covariance).
 """
 from __future__ import annotations
+from functools import partial
+from typing import Literal
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 # Rotation-estimation constants — values mirror
 # ``soma.geometry.transforms`` so ``align_vectors(method="auto")`` reproduces
@@ -21,6 +28,21 @@ NEWTON_SCHULZ_ITERS = 30
 AUTO_ROTATION_PRIOR_STRENGTH = 0.05
 AUTO_ROTATION_RANK_THRESHOLD = 2e-2
 AUTO_ROTATION_DEGENERATE_THRESHOLD = 1e-6
+
+
+# Jitted, as `jnp.linalg.norm` is, so eager callers get the same rounding.
+@partial(jax.jit, static_argnames=("axis", "keepdims"))
+def _vector_norm(x: jnp.ndarray, axis=-1, keepdims: bool = False) -> jnp.ndarray:
+    """L2 norm with a zero gradient at the origin, as ``torch.linalg.vector_norm``.
+
+    ``jnp.linalg.norm`` differentiates ``||x||`` at ``x = 0`` as NaN (0/0), and
+    the NaN leaks through any ``where`` that masks the value out; torch defines
+    that gradient as zero, so upstream's formulas backpropagate finite values
+    through degenerate inputs. The value is the same as ``jnp.linalg.norm``.
+    """
+    sq = jnp.sum(x * x, axis=axis, keepdims=keepdims)
+    nonzero = sq > 0
+    return jnp.where(nonzero, jnp.sqrt(jnp.where(nonzero, sq, 1.0)), 0.0)
 
 
 def safe_normalize(x: jnp.ndarray, axis: int = -1, eps: float = 1e-12) -> jnp.ndarray:
@@ -164,8 +186,27 @@ def rotation_6d_to_rotmat(r6d: jnp.ndarray) -> jnp.ndarray:
     return jnp.stack([b1, b2, b3], axis=-2)  # rows are basis vectors
 
 
-def kabsch(src: jnp.ndarray, tgt: jnp.ndarray, weights: jnp.ndarray | None = None) -> jnp.ndarray:
-    """Kabsch algorithm: find optimal rotation R such that R @ src ≈ tgt.
+def kabsch(H: jnp.ndarray) -> jnp.ndarray:
+    """Rotation from a covariance via the Kabsch algorithm (SVD).
+
+    Upstream ``soma.geometry.transforms.kabsch``: ``H = U S Vh`` and
+    ``R = U diag(1, 1, ±1) Vh`` with the sign fixing ``det(R) = +1``.
+
+    Args:
+        H: (..., 3, 3) covariance, e.g. from :func:`compute_covariance`.
+
+    Returns:
+        (..., 3, 3) rotation matrices with ``det(R) = 1``.
+    """
+    return rotation_from_covariance(H, method="kabsch")
+
+
+def kabsch_points(src: jnp.ndarray, tgt: jnp.ndarray,
+                  weights: jnp.ndarray | None = None) -> jnp.ndarray:
+    """Kabsch algorithm on point sets: optimal rotation R such that R @ src ≈ tgt.
+
+    SOMA-JAX extra (centred, optionally weighted); upstream's :func:`kabsch`
+    takes a precomputed covariance instead.
 
     Args:
         src: (N, 3) source points.
@@ -223,10 +264,12 @@ def compute_covariance(
         q0, q1 = B[..., 0, :], B[..., 1, :]
         n_src = jnp.cross(p0, p1, axis=-1)
         n_dst = jnp.cross(q0, q1, axis=-1)
-        len_n_src = jnp.linalg.norm(n_src, axis=-1, keepdims=True)
-        len_n_dst = jnp.linalg.norm(n_dst, axis=-1, keepdims=True)
-        scale_src = jnp.linalg.norm(p0, axis=-1, keepdims=True) / (len_n_src + eps)
-        scale_dst = jnp.linalg.norm(q0, axis=-1, keepdims=True) / (len_n_dst + eps)
+        # torch-style norms: a collinear triangle (zero normal) or a zero first
+        # point backpropagates zeros, not NaN, as upstream's do.
+        len_n_src = _vector_norm(n_src, keepdims=True)
+        len_n_dst = _vector_norm(n_dst, keepdims=True)
+        scale_src = _vector_norm(p0, keepdims=True) / (len_n_src + eps)
+        scale_dst = _vector_norm(q0, keepdims=True) / (len_n_dst + eps)
         v_src = n_src * scale_src
         v_dst = n_dst * scale_dst
         valid = (len_n_src[..., 0] > 1e-9) & (len_n_dst[..., 0] > 1e-9)
@@ -330,77 +373,194 @@ def rotation_from_covariance(
     elif method != "newton-schulz":
         raise ValueError(f"Unknown method: {method}. Use 'auto', 'kabsch', or 'newton-schulz'.")
 
-    # Guard the SVD fallback against an all-zero covariance: jnp.where evaluates
-    # both branches, and an SVD of a degenerate matrix poisons the JVP with NaN.
+    R = newton_schulz(H, num_iters=NEWTON_SCHULZ_ITERS, eps=eps)
+    use_kabsch = ~rotation_matrices_are_valid(R)
+    if method == "auto":
+        # SOMA-X v0.2.2, `align_vectors_warp._create_newton_schulz_auto_kernel`:
+        # a reflected covariance needs Kabsch's singular-vector correction.
+        # Flipping a fixed Newton-Schulz output column is not the nearest SO(3)
+        # projection and can select a substantially different rotation. The sign
+        # is read off the REGULARIZED H, exactly where upstream reads it (after
+        # the degenerate-rank prior is added to the diagonal, not before).
+        use_kabsch = use_kabsch | (jnp.linalg.det(H) < 0)
+
+    # `jnp.where` evaluates the SVD for EVERY covariance, and the SVD's
+    # gradient is infinite wherever singular values coincide — so any slot the
+    # Kabsch branch does not serve, and any all-zero covariance, gets a
+    # placeholder with well-separated singular values. Its Kabsch rotation is
+    # the identity, so forward values are unchanged; the placeholder only keeps
+    # masked-out gradients finite. (Upstream computes the SVD only where it is
+    # used, so torch never sees the placeholder at all.)
     H_norm = jnp.linalg.norm(H, axis=(-2, -1), keepdims=True)
     degenerate = H_norm < eps * 100
-    I3 = jnp.broadcast_to(jnp.eye(3, dtype=H.dtype), H.shape)
-    safe_H = jnp.where(degenerate, I3, H)
-
-    R = newton_schulz(H, num_iter=NEWTON_SCHULZ_ITERS, eps=eps)
-    valid = rotation_matrices_are_valid(R)
-    return jnp.where(valid[..., None, None], R, _kabsch_svd(safe_H))
+    placeholder = jnp.broadcast_to(jnp.diag(jnp.asarray([3.0, 2.0, 1.0], H.dtype)), H.shape)
+    svd_input = jnp.where(use_kabsch[..., None, None] & ~degenerate, H, placeholder)
+    return jnp.where(use_kabsch[..., None, None], _kabsch_svd(svd_input), R)
 
 
 # ----------------------------------------------------------------------------
 # Quaternion helpers (xyzw layout — matches SOMA-X's `quaternion_order: xyzw`)
 # ----------------------------------------------------------------------------
-def matrix_to_quaternion_xyzw(R: jnp.ndarray) -> jnp.ndarray:
-    """Convert rotation matrices to xyzw quaternions (stable branchful).
+def matrix_to_quaternion_xyzw(R: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """Convert rotation matrices to XYZW unit quaternions.
 
-    Picks one of four formulas based on which trace/diagonal element is largest,
-    so the divisor never collapses to zero, and is differentiable under
-    ``jax.grad`` — no branch takes ``where`` over a sqrt-of-near-zero in a way
-    that NaNs the derivative.
-
-    Agrees with ``soma.geometry.transforms.matrix_to_quaternion_xyzw`` to ~1e-14
-    in float64. (Upstream's ``matrix_to_quaternion_xyzw_stable`` is the same
-    formula with ``+ eps`` inside each sqrt, which shifts the result by ~1e-10
-    and makes its own round-trip slightly less accurate; this uses a clamp
-    instead, so it stays exact.) The result is canonicalized to **non-negative
-    w**, matching both upstream variants' documented contract — ``q`` and ``-q``
-    are the same rotation, so the sign must be pinned for the outputs to be
-    comparable at all.
+    Port of upstream ``soma.geometry.transforms.matrix_to_quaternion_xyzw``
+    (v0.3.3): every row ``4 q_i q`` is formed from the matrix entries, the row
+    of the largest squared component is selected — its ``|q_i| >= 1/2``, so it
+    normalizes without a small divisor — and the result is standardized to
+    unit norm and non-negative ``w``. Recovering all components from one row
+    preserves their relative signs near 180 degrees, and the gradient stays
+    finite at identity and at half turns.
 
     Args:
         R: (..., 3, 3) rotation matrices.
+        eps: Small constant used when normalizing quaternions.
 
     Returns:
-        (..., 4) quaternions in xyzw order, with ``w >= 0``.
+        (..., 4) quaternions ordered as x, y, z, w with non-negative w.
     """
+    if R.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (...,3,3), got {R.shape}")
     m00, m01, m02 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
     m10, m11, m12 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
     m20, m21, m22 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
-    t = m00 + m11 + m22
-    eps = 1e-12
 
-    s_a = jnp.sqrt(jnp.maximum(t + 1.0, eps)) * 2.0
-    qa = jnp.stack([(m21 - m12) / s_a, (m02 - m20) / s_a,
-                    (m10 - m01) / s_a, 0.25 * s_a], axis=-1)
-    s_b = jnp.sqrt(jnp.maximum(1.0 + m00 - m11 - m22, eps)) * 2.0
-    qb = jnp.stack([0.25 * s_b, (m01 + m10) / s_b,
-                    (m02 + m20) / s_b, (m21 - m12) / s_b], axis=-1)
-    s_c = jnp.sqrt(jnp.maximum(1.0 + m11 - m00 - m22, eps)) * 2.0
-    qc = jnp.stack([(m01 + m10) / s_c, 0.25 * s_c,
-                    (m12 + m21) / s_c, (m02 - m20) / s_c], axis=-1)
-    s_d = jnp.sqrt(jnp.maximum(1.0 + m22 - m00 - m11, eps)) * 2.0
-    qd = jnp.stack([(m02 + m20) / s_d, (m12 + m21) / s_d,
-                    0.25 * s_d, (m10 - m01) / s_d], axis=-1)
-
-    use_a = t > 0
-    use_b = (~use_a) & (m00 >= m11) & (m00 >= m22)
-    use_c = (~use_a) & (~use_b) & (m11 >= m22)
-    q = jnp.where(use_a[..., None], qa,
-        jnp.where(use_b[..., None], qb,
-        jnp.where(use_c[..., None], qc, qd)))
-    # Canonical sign: w >= 0 (upstream's documented convention).
-    return jnp.where(q[..., 3:] < 0.0, -q, q)
+    squared_components = jnp.stack((
+        1.0 + m00 - m11 - m22,
+        1.0 - m00 + m11 - m22,
+        1.0 - m00 - m11 + m22,
+        1.0 + m00 + m11 + m22,
+    ), axis=-1)
+    xx, yy, zz, ww = (squared_components[..., i] for i in range(4))
+    xy, xz, yz = m01 + m10, m02 + m20, m12 + m21
+    xw, yw, zw = m21 - m12, m02 - m20, m10 - m01
+    candidates = jnp.stack((
+        jnp.stack((xx, xy, xz, xw), axis=-1),
+        jnp.stack((xy, yy, yz, yw), axis=-1),
+        jnp.stack((xz, yz, zz, zw), axis=-1),
+        jnp.stack((xw, yw, zw, ww), axis=-1),
+    ), axis=-2)
+    largest = jnp.argmax(squared_components, axis=-1)
+    quaternion = jnp.take_along_axis(candidates, largest[..., None, None], axis=-2)[..., 0, :]
+    return quaternion_standardize_xyzw(quaternion, eps=eps)
 
 
-def quaternion_normalize_xyzw(q: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
-    """L2-normalize an xyzw quaternion. The ``+ eps`` floor keeps the gradient
-    well-defined at ||q|| → 0."""
-    return q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + eps)
+def matrix_to_quaternion_xyzw_stable(R: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """Convert rotation matrices to XYZW quaternions with finite branch gradients.
+
+    Upstream keeps this entry point for callers that need gradients through the
+    conversion; it is :func:`matrix_to_quaternion_xyzw`, whose largest-component
+    branch already avoids zero-valued square roots.
+    """
+    return matrix_to_quaternion_xyzw(R, eps=eps)
+
+
+def quaternion_normalize_xyzw(quaternion: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """L2-normalize an xyzw quaternion, flooring the norm at ``eps``.
+
+    Upstream ``soma.geometry.transforms.quaternion_normalize_xyzw``:
+    ``quaternion / ||quaternion||.clamp_min(eps)``. (An earlier ``quaternion / (||quaternion|| + eps)`` form shrank
+    every unit quaternion by ~1e-12 — negligible once, but the RTS smoother
+    normalizes on every frame — and was no better behaved: both forms have a
+    finite gradient everywhere except exactly ``quaternion = 0``.)
+    """
+    return quaternion / jnp.maximum(jnp.linalg.norm(quaternion, axis=-1, keepdims=True), eps)
+
+
+def quaternion_standardize_xyzw(quaternion: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """Normalize an xyzw quaternion and pick the non-negative-``w`` representative.
+
+    Upstream: ``soma.geometry.transforms.quaternion_standardize_xyzw`` (v0.3.1).
+    ``quaternion`` and ``-quaternion`` are the same rotation, so a canonical sign is what makes two
+    quaternions comparable at all.
+    """
+    quaternion = quaternion_normalize_xyzw(quaternion, eps=eps)
+    return jnp.where(quaternion[..., 3:] < 0.0, -quaternion, quaternion)
+
+
+def quaternion_log_xyzw(quaternion: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """Map xyzw unit quaternions to rotation vectors along the shortest arc.
+
+    Upstream: ``soma.geometry.transforms.quaternion_log_xyzw`` (v0.3.1).
+    Standardizing to ``w >= 0`` first is what makes the arc the short one.
+
+    Args:
+        quaternion: (..., 4) xyzw quaternions.
+        eps: numerical floor for the small-angle branch.
+
+    Returns:
+        (..., 3) rotation vectors (axis * angle).
+    """
+    quaternion = quaternion_standardize_xyzw(quaternion, eps=eps)
+    vec = quaternion[..., :3]
+    w = jnp.clip(quaternion[..., 3], -1.0, 1.0)
+    vec_norm = _vector_norm(vec)   # torch's zero gradient at the identity
+    angle = 2.0 * jnp.arctan2(vec_norm, w)
+    # jnp.where evaluates both branches, so both divisors are floored to keep
+    # the unused branch (and its gradient) finite.
+    small = vec_norm < eps
+    factor = jnp.where(
+        small,
+        2.0 / jnp.maximum(w, eps),
+        angle / jnp.maximum(vec_norm, eps),
+    )
+    return vec * factor[..., None]
+
+
+def quaternion_exp_xyzw(rotvec: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """Map rotation vectors to xyzw unit quaternions.
+
+    Upstream: ``soma.geometry.transforms.quaternion_exp_xyzw`` (v0.3.1). The
+    small-angle branch uses the same Taylor series as upstream
+    (``1/2 - θ²/48 + θ⁴/3840``) so ``θ → 0`` stays finite and accurate.
+
+    Args:
+        rotvec: (..., 3) rotation vectors (axis * angle).
+        eps: numerical floor for the large-angle divisor.
+
+    Returns:
+        (..., 4) xyzw unit quaternions with ``w >= 0``.
+    """
+    if rotvec.shape[-1] != 3:
+        raise ValueError(f"Expected (...,3), got {rotvec.shape}")
+    theta = _vector_norm(rotvec)   # torch's zero gradient at the zero vector
+    half_theta = 0.5 * theta
+    theta2 = theta * theta
+    theta4 = theta2 * theta2
+    small = theta < 1e-6
+    imag_scale = jnp.where(
+        small,
+        0.5 - theta2 / 48.0 + theta4 / 3840.0,
+        jnp.sin(half_theta) / jnp.maximum(theta, eps),
+    )
+    q = jnp.concatenate(
+        [rotvec * imag_scale[..., None], jnp.cos(half_theta)[..., None]], axis=-1
+    )
+    return quaternion_standardize_xyzw(q, eps=eps)
+
+
+def project_rotations_to_so3(rotations: jnp.ndarray) -> jnp.ndarray:
+    """Project matrices to the nearest proper rotations.
+
+    Upstream: ``soma.geometry.transforms.project_rotations_to_so3`` (v0.3.1).
+    Upstream branches on ``torch.any(det < 0)`` as a host-side fast path; that
+    would force a device sync under ``jit``, so the sign correction is applied
+    unconditionally here — the ``det >= 0`` case multiplies by ``+1`` and is a
+    no-op, so the result is identical either way.
+
+    Args:
+        rotations: (..., 3, 3) matrices, not necessarily orthonormal.
+
+    Returns:
+        (..., 3, 3) nearest matrices in SO(3).
+    """
+    if rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (...,3,3), got {rotations.shape}")
+    u, _, vh = jnp.linalg.svd(rotations, full_matrices=False)
+    det = jnp.linalg.det(u @ vh)
+    sign = jnp.where(det < 0, -1.0, 1.0)
+    u = u.at[..., :, -1].multiply(sign[..., None])
+    return u @ vh
 
 
 def quaternion_multiply_xyzw(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
@@ -416,36 +576,32 @@ def quaternion_multiply_xyzw(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     ], axis=-1)
 
 
-def quaternion_conjugate_xyzw(q: jnp.ndarray) -> jnp.ndarray:
+def quaternion_conjugate_xyzw(quaternion: jnp.ndarray) -> jnp.ndarray:
     """Conjugate of an xyzw quaternion (xyz negated). For unit quaternions this
     equals the inverse / rotational opposite."""
-    return jnp.concatenate([-q[..., :3], q[..., 3:4]], axis=-1)
+    return jnp.concatenate([-quaternion[..., :3], quaternion[..., 3:4]], axis=-1)
 
 
-_AXIS_BASIS_E = jnp.array([
-    [1.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0],
-    [0.0, 0.0, 1.0],
-])
-
-
-def quaternion_half_angle_xyzw(q: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+def quaternion_half_angle_xyzw(quaternion: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
     """Principal half-angle (square-root) quaternion for xyzw rotations.
 
     Port of ``soma.geometry.transforms.quaternion_half_angle_xyzw``: pick the
-    representation with non-negative ``w`` (``q`` and ``-q`` are the same
+    representation with non-negative ``w`` (``quaternion`` and ``-quaternion`` are the same
     rotation), then normalize ``[v, w + 1]``.
     """
-    q = quaternion_normalize_xyzw(q, eps=eps)
-    q = jnp.where(q[..., 3:] < 0.0, -q, q)
+    quaternion = quaternion_normalize_xyzw(quaternion, eps=eps)
+    quaternion = jnp.where(quaternion[..., 3:] < 0.0, -quaternion, quaternion)
     return quaternion_normalize_xyzw(
-        jnp.concatenate([q[..., :3], q[..., 3:] + 1.0], axis=-1), eps=eps,
+        jnp.concatenate([quaternion[..., :3], quaternion[..., 3:] + 1.0], axis=-1), eps=eps,
     )
 
 
-def quaternion_twist_angle_xyzw(q: jnp.ndarray, axis_idx: int = 0,
-                                eps: float = 1e-12) -> jnp.ndarray:
-    """Signed twist angle (radians) around a coordinate axis, from an xyzw quaternion.
+def quaternion_twist_angle_xyzw(
+    quaternion: jnp.ndarray,
+    axis_ids=0,
+    eps: float = 1e-12,
+) -> jnp.ndarray:
+    """Signed twist angles (radians) around local axes, from xyzw quaternions.
 
     Faithful port of ``soma.geometry.transforms.quaternion_twist_angle_xyzw``:
     the projection is taken on the **half-angle** quaternion and scaled by 4,
@@ -455,22 +611,35 @@ def quaternion_twist_angle_xyzw(q: jnp.ndarray, axis_idx: int = 0,
     procedural joints operate in.
 
     Args:
-        q: (..., 4) xyzw quaternions.
-        axis_idx: 0 / 1 / 2 for X / Y / Z.
+        quaternion: (..., 4) quaternions ordered as x, y, z, w.
+        axis_ids: scalar axis id or array broadcastable to
+            ``quaternion.shape[:-1]``; ``0=x``, ``1=y``, ``2=z``.
         eps: normalisation floor.
 
     Returns:
-        (...,) twist angle in radians.
+        ``quaternion.shape[:-1]`` twist angles in radians.
     """
-    if axis_idx not in (0, 1, 2):
-        raise ValueError(f"axis_idx must be 0, 1, or 2, got {axis_idx}")
-    q_half = quaternion_half_angle_xyzw(q, eps=eps)
-    return 4.0 * jnp.arctan2(q_half[..., axis_idx], q_half[..., 3])
+    q_half = quaternion_half_angle_xyzw(quaternion, eps=eps)
+    if not isinstance(axis_ids, jax.core.Tracer):
+        ids_host = np.asarray(axis_ids)
+        if np.any((ids_host < 0) | (ids_host > 2)):
+            raise ValueError("axis_ids must contain only 0, 1, or 2")
+        if ids_host.ndim == 0:
+            return 4.0 * jnp.arctan2(q_half[..., int(ids_host)], q_half[..., 3])
+    ids = jnp.asarray(axis_ids, dtype=jnp.int32)
+    try:
+        ids = jnp.broadcast_to(ids, q_half.shape[:-1])
+    except ValueError as e:
+        raise ValueError(
+            "axis_ids must be broadcastable to quaternion.shape[:-1], "
+            f"got {tuple(ids.shape)} for {tuple(q_half.shape[:-1])}") from e
+    twist_imag = jnp.take_along_axis(q_half[..., :3], ids[..., None], axis=-1)[..., 0]
+    return 4.0 * jnp.arctan2(twist_imag, q_half[..., 3])
 
 
 def single_axis_rotation_matrices(
-    angle: jnp.ndarray,
-    axis_idx: int,
+    angles: jnp.ndarray,
+    axis: int,
     axis_signs: jnp.ndarray | float = 1.0,
 ) -> jnp.ndarray:
     """Build a (..., 3, 3) rotation matrix around a coordinate axis from a
@@ -483,24 +652,24 @@ def single_axis_rotation_matrices(
     existing two-argument calls are unchanged.
 
     Args:
-        angle: (...,) rotation angles in radians.
-        axis_idx: 0 / 1 / 2 for X / Y / Z.
-        axis_signs: broadcastable per-element sign (±1) applied to ``angle``.
+        angles: (...,) rotation angles in radians.
+        axis: 0 / 1 / 2 for X / Y / Z.
+        axis_signs: broadcastable per-element sign (±1) applied to ``angles``.
     """
-    if axis_idx not in (0, 1, 2):
-        raise ValueError(f"axis_idx must be 0, 1, or 2, got {axis_idx}")
-    angle = angle * jnp.asarray(axis_signs, dtype=angle.dtype)
+    if axis not in (0, 1, 2):
+        raise ValueError(f"axis must be 0, 1, or 2, got {axis}")
+    angle = angles * jnp.asarray(axis_signs, dtype=angles.dtype)
     c = jnp.cos(angle)
     s = jnp.sin(angle)
     z = jnp.zeros_like(c)
     o = jnp.ones_like(c)
-    if axis_idx == 0:
+    if axis == 0:
         return jnp.stack([
             jnp.stack([o, z, z], -1),
             jnp.stack([z, c, -s], -1),
             jnp.stack([z, s,  c], -1),
         ], -2)
-    if axis_idx == 1:
+    if axis == 1:
         return jnp.stack([
             jnp.stack([ c, z, s], -1),
             jnp.stack([ z, o, z], -1),
@@ -514,8 +683,8 @@ def single_axis_rotation_matrices(
 
 
 def newton_schulz(
-    A: jnp.ndarray,
-    num_iter: int = NEWTON_SCHULZ_ITERS,
+    H: jnp.ndarray,
+    num_iters: int = NEWTON_SCHULZ_ITERS,
     eps: float = 1e-8,
 ) -> jnp.ndarray:
     """Newton-Schulz orthogonalization: iteratively refine A toward the nearest SO(3).
@@ -527,22 +696,29 @@ def newton_schulz(
     rotation rather than a roto-reflection.
 
     Args:
-        A: (..., 3, 3) matrix (typically a Kabsch covariance).
-        num_iter: number of refinement iterations (SOMA-X uses 30).
+        H: (..., 3, 3) matrix (typically a Kabsch covariance).
+        num_iters: number of refinement iterations (SOMA-X uses 30).
         eps: numerical floor for the scaling.
 
     Returns:
         (..., 3, 3) orthogonalized rotation matrix with det = +1.
     """
+    return _newton_schulz(H, num_iters, eps)
+
+
+def _newton_schulz_step(X, _):
+    # X_{k+1} = X_k (3I - X_kᵀ X_k) / 2
+    return X @ (3.0 * jnp.eye(3, dtype=X.dtype) - jnp.swapaxes(X, -2, -1) @ X) * 0.5, None
+
+
+# Jitted so eager callers (the pose-inversion refit calls this per joint and
+# per iteration) reuse one executable per shape; an eager scan over a fresh
+# closure would be retraced and recompiled on every call.
+@partial(jax.jit, static_argnums=(1,))
+def _newton_schulz(A, num_iter, eps):
     max_row_sum = jnp.max(jnp.sum(jnp.abs(A), axis=-1), axis=-1)[..., None, None]
     X = A / (max_row_sum + eps)
-
-    def step(X, _):
-        # X_{k+1} = X_k (3I - X_kᵀ X_k) / 2
-        return X @ (3.0 * jnp.eye(3, dtype=X.dtype) - jnp.swapaxes(X, -2, -1) @ X) * 0.5, None
-
-    X, _ = jax.lax.scan(step, X, None, length=num_iter)
-
+    X, _ = jax.lax.scan(_newton_schulz_step, X, None, length=num_iter)
     sign = jnp.where(jnp.linalg.det(X) < 0, -1.0, 1.0)
     return X.at[..., :, 2].set(X[..., :, 2] * sign[..., None])
 
@@ -567,6 +743,60 @@ def rotation_matrices_are_valid(
     return finite & det_valid & ortho_valid
 
 
+def _cofactor3(M: jnp.ndarray) -> jnp.ndarray:
+    """Cofactor matrix of (..., 3, 3) ``M``: ``d det(M) = sum(cofactor(M) * dM)``."""
+    a, b, c = M[..., 0, 0], M[..., 0, 1], M[..., 0, 2]
+    d, e, f = M[..., 1, 0], M[..., 1, 1], M[..., 1, 2]
+    g, h, i = M[..., 2, 0], M[..., 2, 1], M[..., 2, 2]
+    rows = [
+        jnp.stack([e * i - f * h, f * g - d * i, d * h - e * g], axis=-1),
+        jnp.stack([c * h - b * i, a * i - c * g, b * g - a * h], axis=-1),
+        jnp.stack([b * f - c * e, c * d - a * f, a * e - b * d], axis=-1),
+    ]
+    return jnp.stack(rows, axis=-2)
+
+
+@jax.custom_jvp
+def det3(M: jnp.ndarray) -> jnp.ndarray:
+    """``jnp.linalg.det`` for (..., 3, 3), with a gradient that exists everywhere.
+
+    The forward value is ``jnp.linalg.det``'s. Its built-in JVP solves against
+    ``M`` and turns NaN on singular matrices — e.g. the all-zero covariance of
+    a joint with no support — and the NaN survives the ``jnp.where`` that masks
+    that slot out. torch's ``det`` backward stays finite there. The analytic
+    derivative of a 3x3 determinant is its cofactor matrix, which is finite for
+    every input, so that is the JVP used here.
+    """
+    return jnp.linalg.det(M)
+
+
+@det3.defjvp
+def _det3_jvp(primals, tangents):
+    (M,), (dM,) = primals, tangents
+    return jnp.linalg.det(M), jnp.sum(_cofactor3(M) * dM, axis=(-2, -1))
+
+
+@jax.custom_jvp
+def _volume_score(abs_det: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
+    """``abs_det / scale ** 3`` — upstream's expression, with a torch-like JVP.
+
+    ``scale`` bottoms out at ``eps`` (1e-8) for an all-zero covariance. JAX's
+    division rule differentiates ``x / y`` as ``x * y**-2`` and ``(1e-24)**-2``
+    overflows float32, so the masked-out zero slot turns the whole gradient
+    NaN; torch's rule divides twice (``(x / y) / y``) and stays at 0. The JVP
+    below keeps that finite structure.
+    """
+    return abs_det / scale ** 3
+
+
+@_volume_score.defjvp
+def _volume_score_jvp(primals, tangents):
+    abs_det, scale = primals
+    d_abs_det, d_scale = tangents
+    value = abs_det / scale ** 3
+    return value, d_abs_det / scale ** 3 - 3.0 * (value / scale) * d_scale
+
+
 def regularize_covariance_with_reference(
     H: jnp.ndarray,
     reference_rotation: jnp.ndarray | None = None,
@@ -582,7 +812,7 @@ def regularize_covariance_with_reference(
     unconstrained subspace to ``reference_rotation`` (identity by default).
     """
     prior_scale = jnp.maximum(jnp.max(jnp.sum(jnp.abs(H), axis=-1), axis=-1), eps)
-    volume_score = jnp.abs(jnp.linalg.det(H)) / prior_scale ** 3
+    volume_score = _volume_score(jnp.abs(det3(H)), prior_scale)
     rank_weight = jnp.clip((rank_threshold - volume_score) / rank_threshold, 0.0, 1.0)
     if reference_rotation is None:
         reference_rotation = jnp.broadcast_to(jnp.eye(3, dtype=H.dtype), H.shape)
@@ -739,3 +969,85 @@ def quaternion_xyzw_to_rotmat(quaternion: jnp.ndarray, eps: float = 1e-12) -> jn
         2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
         2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y),
     ], axis=-1).reshape(quaternion.shape[:-1] + (3, 3))
+
+
+# ---------------------------------------------------------------------------
+# Upstream names (``soma.geometry.transforms``)
+# ---------------------------------------------------------------------------
+
+#: Rotation-extraction methods accepted by :func:`align_vectors`.
+AlignmentMethod = Literal["kabsch", "newton-schulz", "auto"]
+
+SE3_from_Rt = se3_from_rt
+SE3_inverse = se3_inverse
+euler_xyz_to_matrix = euler_xyz_to_rotmat
+matrix_to_euler_xyz = rotmat_to_euler_xyz
+quaternion_xyzw_to_matrix = quaternion_xyzw_to_rotmat
+
+
+def matrix_to_rotvec(R: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """(..., 3, 3) rotation matrices -> (..., 3) rotation vectors (axis * angle).
+
+    Upstream ``matrix_to_rotvec``, robust for small angles and near pi. Its
+    small-angle branch (theta <= 1e-3) returns twice the rotation vector;
+    this is :func:`rotmat_to_axis_angle`, which returns the true one there
+    (see its notes).
+    """
+    return rotmat_to_axis_angle(R, eps=eps)
+
+
+def rotvec_to_matrix(rotvec: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+    """(..., 3) rotation vectors -> (..., 3, 3) rotation matrices, robust near zero.
+
+    Upstream ``rotvec_to_matrix`` (unused upstream) builds ``K`` from the
+    *unit* axis but applies the ``sin(theta)/theta`` and
+    ``(1 - cos(theta))/theta^2`` coefficients meant for the unnormalized
+    vector, so it returns non-rotations for every angle other than about 1
+    radian (e.g. det 0.76 at pi/2). This returns the Rodrigues rotation its
+    docstring describes, switching to the first-order ``I + [rotvec]_x``
+    below ``1e-6`` as upstream switches to ``I + K``.
+    """
+    if rotvec.shape[-1] != 3:
+        raise ValueError(f"Expected (...,3), got {rotvec.shape}")
+
+    def skew(v):
+        zero = jnp.zeros_like(v[..., 0])
+        return jnp.stack([
+            zero, -v[..., 2], v[..., 1],
+            v[..., 2], zero, -v[..., 0],
+            -v[..., 1], v[..., 0], zero,
+        ], axis=-1).reshape(v.shape[:-1] + (3, 3))
+
+    theta = _vector_norm(rotvec)   # torch's zero gradient at the zero vector
+    K = skew(rotvec / jnp.where(theta < eps, eps, theta)[..., None])
+    eye = jnp.eye(3, dtype=rotvec.dtype)
+    R = (eye + jnp.sin(theta)[..., None, None] * K
+         + (1.0 - jnp.cos(theta))[..., None, None] * (K @ K))
+    small = theta < 1e-6
+    return jnp.where(small[..., None, None], eye + skew(rotvec), R)
+
+
+def _normalize(x: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    """``torch.nn.functional.normalize``: ``x / max(||x||, eps)`` (gradient-safe at 0)."""
+    return x / jnp.maximum(_vector_norm(x, keepdims=True), eps)
+
+
+def rotation_6d_to_matrix(d6: jnp.ndarray) -> jnp.ndarray:
+    """Convert the 6D rotation representation of Zhou et al. to rotation matrices.
+
+    Upstream ``rotation_6d_to_matrix``: Gram-Schmidt with
+    ``torch.nn.functional.normalize`` (``x / max(||x||, 1e-12)``); the basis
+    vectors are the **rows** of the result. :func:`rotation_6d_to_rotmat` is
+    the same map with a smooth ``sqrt(||x||^2 + 1e-12)`` normalizer.
+
+    Args:
+        d6: (..., 6) 6D rotation representation.
+
+    Returns:
+        (..., 3, 3) rotation matrices.
+    """
+    a1, a2 = d6[..., :3], d6[..., 3:]
+    b1 = _normalize(a1)
+    b2 = _normalize(a2 - jnp.sum(b1 * a2, axis=-1, keepdims=True) * b1)
+    b3 = jnp.cross(b1, b2)
+    return jnp.stack((b1, b2, b3), axis=-2)

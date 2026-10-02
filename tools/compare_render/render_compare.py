@@ -4,8 +4,9 @@ Reuses the proven demo_soma_vis rendering (``render_mesh_png``: ground plane +
 projection shadow + multi-light + shared framing camera) so the look matches the
 demo_renders/ outputs. Inputs are the two ``pose_*.py`` outputs (verts / faces /
 median fps). Both columns pose the identical rig over the identical motion
-with identical settings, so the vertices agree to ~cm — the ONLY thing
-that differs is how many frames each pipeline can afford in a fixed time budget.
+with identical settings, so the meshes agree to well under a millimetre (the
+delta is printed) — the ONLY visible difference is how many frames each
+pipeline can afford in a fixed time budget.
 
 Equal-time visualization
 ------------------------
@@ -34,12 +35,11 @@ def _benchmark_f32_ratio():
     """float32 SOMA-JAX/SOMA-X throughput ratio from ``benchmarks/results``.
 
     The capture npz files carry their own ``fps``, but those come from a single
-    ~30 ms timing run: at batch 2048 they put SOMA-X 6.8% faster than the
-    harness does, which moves the ratio 1.68 -> 1.60 and would show the viewer a
-    different speedup from the one every document quotes. ``runtime.json`` is a
-    median over 20 iters with p10/p90, so it is the number to draw. Returns
-    ``None`` when the results file is absent, and the caller falls back to the
-    capture fps.
+    20-call timing run, which can disagree with the harness by several percent
+    and would show the viewer a different speedup from the one every document
+    quotes. ``runtime.json`` is the benchmark harness's warmed median with its
+    standard error, so it is the number to draw. Returns ``None`` when the
+    results file is absent, and the caller falls back to the capture fps.
     """
     import json
     f = REPO / "benchmarks" / "results" / "runtime.json"
@@ -148,17 +148,17 @@ def main():
     jb = _mask_nonanatomical_joints(B["joints"][:T].astype(np.float32).copy(), B["joint_names"])
     pa, pb = A["parents"].astype(int), B["parents"].astype(int)
 
-    # How close are the two posed meshes? NOT a parity number: pose_somajax.py
-    # loads the raw SOMA_neutral.npz rig while SOMA-X merges SOMA_template_rig.usda
-    # over it, so ~1.7 cm here is the rig mismatch described under "the two timed
-    # sides do not use the identical rig" in benchmarks/README.md, plus the Warp
-    # svd3 rotation solve. The port's actual forward parity is 0.34-1.16 mm
-    # against a matched rig -- see docs/FAITHFULNESS.md.
+    # How close are the two posed meshes? Both sides skin the same public rig
+    # (SOMA_template_rig.usda), so what remains is the SOMA-JAX column's Warp
+    # svd3 Kabsch solve, which departs from upstream's "auto" rotation solve on
+    # ill-conditioned joints. Not the port's parity figure: the faithful
+    # pure-JAX path matches SOMA-X to micrometres (benchmarks/README.md,
+    # docs/FAITHFULNESS.md).
     if va.shape == vb.shape:
-        dmm = np.linalg.norm(va - vb, axis=-1)
+        dmm = np.linalg.norm(va - vb, axis=-1) * 1000.0
         print(f"[mesh delta] SOMA-X vs SOMA-JAX posed verts: "
-              f"max={dmm.max()*100:.3f} cm  mean={dmm.mean()*100:.4f} cm "
-              f"(rig mismatch + warp svd3, not a parity figure)")
+              f"max={dmm.max():.3f} mm  mean={dmm.mean():.4f} mm "
+              f"(Warp svd3 vs upstream auto, not a parity figure)")
 
     # Ground-lock each column: drop its lowest point (over the whole clip) to
     # Y=0 so both share one floor (SOMA rig is already Y-up; no view rotation).
@@ -232,7 +232,10 @@ def main():
     Path(args.gif).parent.mkdir(parents=True, exist_ok=True)
     ims = [Image.fromarray(x) for x in frames]
     ims[0].save(args.gif, save_all=True, append_images=ims[1:], duration=dur, loop=0)
-    Image.fromarray(banner).save(str(Path(args.gif).with_suffix(".png")))
+    # Poster still-frame goes to the git-ignored render dir (assets/media/ holds gifs).
+    poster = REPO / "demo_renders" / "compare" / (Path(args.gif).stem + "_poster.png")
+    poster.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(banner).save(str(poster))
     print(f"wrote {args.gif}  ({len(frames)} frames, {play_fps:.0f} fps realtime)  "
           f"{who} ~{ratio:.1f}x faster  ({max(n_a,n_b)} vs {min(n_a,n_b)} frames)")
 

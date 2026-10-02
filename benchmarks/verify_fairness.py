@@ -15,15 +15,18 @@ the *same, real* work on each side, so the numbers are comparable:
    spatial spread (not a collapsed constant), and must actually change when
    the input changes (proves the input flows end-to-end).
 
-3. **Cross-pipeline equivalence.** The JAX-SVD fair path and the Warp-svd3
-   hybrid must produce the same posed mesh (same algorithm, different SVD).
+3. **Cross-pipeline agreement.** The pure-JAX fair path and the Warp-svd3
+   hybrid must pose the same mesh to within the gap between their rotation
+   solves (upstream's ``auto`` vs plain Kabsch, which differ only on
+   ill-conditioned joint covariances).
 
-Run (JAX side, cu12):
-    python benchmarks/verify_fairness.py
+4. **Same meshes as SOMA-X.** Both sides skin upstream's public rig
+   (``_rig.py``), so the timed pipelines must reproduce SOMA-X's posed meshes
+   on random identities, poses and translations. SOMA-X runs in its own process
+   (torch and JAX keep separate CUDA stacks):
 
-The SOMA-X (torch+Warp) equivalence is checked separately by
-a SOMA-X side-run writing a posed-vertex summary that this script
-compares against when present.
+    python benchmarks/somax_reference.py     # torch side -> results/_somax_reference.npz
+    python benchmarks/verify_fairness.py     # JAX side: all four checks
 """
 from __future__ import annotations
 import sys
@@ -39,20 +42,17 @@ def _build_fair_pipeline(hf_dir: Path, rotation_backend: str):
     """Reconstruct the benchmark's fair/hybrid forward as a jitted fn."""
     import jax, jax.numpy as jnp
     jax.config.update("jax_default_matmul_precision", "highest")  # match SOMA-X float32
-    from scipy.sparse import csc_matrix
     from soma_jax.geometry.skeleton_transfer import SkeletonTransfer
     from soma_jax.geometry.batched_skinning import pose_from_bind, topk_skinning
     from soma_jax.geometry.lbs import compute_skeleton_levels
     from soma_jax.geometry.rig_utils import apply_joint_orient_local
+    from _rig import public_rig
 
-    rig = dict(np.load(hf_dir / "SOMA_neutral.npz", allow_pickle=False))
+    rig = public_rig(hf_dir)
     bind_shape = np.asarray(rig["bind_shape"], np.float32)
     bind_world = np.asarray(rig["bind_pose_world"], np.float32)
-    parents = rig["joint_parent_ids"].astype(np.int64).copy(); parents[0] = -1
-    weights = np.asarray(csc_matrix(
-        (rig["skinning_weights_data"], rig["skinning_weights_indices"],
-         rig["skinning_weights_indptr"]),
-        shape=tuple(rig["skinning_weights_shape"])).todense(), np.float32)
+    parents = np.asarray(rig["parents"], np.int64).copy(); parents[0] = -1
+    weights = np.asarray(rig["weights"], np.float32)
     mean = np.asarray(rig["mean"], np.float32).reshape(-1)
     shapedirs = np.asarray(rig["shapedirs"], np.float32)
     eig = np.asarray(rig["eigenvalues"], np.float32)
@@ -96,7 +96,7 @@ def _time(fn, args, warmup=5, n=30):
 
 
 def _probe_svd_nonuniqueness(hf_dir: Path):
-    """Characterise where the XLA-SVD and Warp-svd3 full-fit pipelines diverge.
+    """Characterise where the pure-JAX and Warp-svd3 full-fit pipelines diverge.
 
     Two separate effects get conflated easily, so this probe separates them on
     4096 synthetic alignment problems (half deliberately near-planar, i.e.
@@ -114,8 +114,8 @@ def _probe_svd_nonuniqueness(hf_dir: Path):
        land on genuinely different rotations. That is **upstream SOMA-X
        behaviour**, reproduced faithfully (``soma.geometry.transforms.
        align_vectors`` shows the same split), so it is *reported*, not
-       asserted away — but it does mean the Warp-SVD pipeline is not
-       bit-for-bit the same algorithm as the XLA-SVD one.
+       asserted away — but it does mean the Warp-svd3 pipeline is not
+       bit-for-bit the same algorithm as the pure-JAX one.
     """
     import jax, jax.numpy as jnp
     jax.config.update("jax_default_matmul_precision", "highest")  # match SOMA-X float32
@@ -274,13 +274,14 @@ def main():
     rot_r = jax.vmap(jax.vmap(axis_angle_to_rotmat))(jnp.asarray(aa))
     hips_r = jnp.asarray(rng.standard_normal((B, 3)).astype(np.float32) * 0.1)
 
-    results = {}
+    results, pipelines = {}, {}
     for backend in ["jax", "warp"]:
         try:
             fwd, (V, J, K) = _build_fair_pipeline(hf, backend)
         except Exception as e:
             print(f"[{backend}] pipeline unavailable: {type(e).__name__}: {e}")
             continue
+        pipelines[backend] = fwd
 
         zeros = (jnp.zeros((B, K), jnp.float32),
                  jnp.broadcast_to(jnp.eye(3), (B, J, 3, 3)),
@@ -310,18 +311,32 @@ def main():
         d = np.abs(results["jax"] - results["warp"])
         print(f"\n[fair vs hybrid] posed-vertex agreement at the benchmark "
               f"operating point: max|Δ|={d.max():.6f}m  mean={d.mean():.2e}m")
-        assert d.max() < 1e-2, "fair vs hybrid disagree beyond SVD tolerance"
+        assert d.max() < 1e-2, "fair vs hybrid disagree beyond the auto-vs-Kabsch tolerance"
         _probe_svd_nonuniqueness(hf)
 
     _probe_align_vectors_vs_upstream()
 
-    # Cross-check vs the SOMA-X posed-vertex summary, if present.
-    somax = REPO / "benchmarks" / "_somax_posed_summary.npz"
-    if somax.exists() and "jax" in results:
+    # Agreement with SOMA-X itself. Both sides skin upstream's public rig
+    # (benchmarks/_rig.py), so the timed pipelines must reproduce SOMA-X's
+    # meshes; somax_reference.py writes them from its own (torch) process.
+    somax = REPO / "benchmarks" / "results" / "_somax_reference.npz"
+    if somax.exists():
         ref = np.load(somax)
-        jax_bbox = np.ptp(results["jax"].reshape(-1, 3), axis=0)
-        print(f"\n[vs SOMA-X] posed bbox extent  JAX={jax_bbox.round(3)}  "
-              f"SOMA-X={ref['bbox'].round(3)}  (m; same human ⇒ comparable)")
+        coeffs = jnp.asarray(ref["coeffs"])
+        rot = jax.vmap(jax.vmap(axis_angle_to_rotmat))(jnp.asarray(ref["poses"]))
+        rot = jnp.concatenate(
+            [jnp.broadcast_to(jnp.eye(3), (rot.shape[0], 1, 3, 3)), rot], axis=1)
+        hips = jnp.asarray(ref["transl"]) * 100.0            # metres -> the rig's cm
+        print()
+        for backend, tol in (("jax", 5e-5), ("warp", 2e-3)):
+            if backend not in pipelines:
+                continue
+            d = np.abs(np.asarray(pipelines[backend](coeffs, rot, hips)) - ref["vertices"])
+            print(f"[vs SOMA-X] {backend}: posed vertices max|Δ|={d.max() * 1e3:.4f} mm  "
+                  f"mean={d.mean() * 1e3:.5f} mm  ({len(coeffs)} random identities + poses)")
+            assert d.max() < tol, f"{backend}: disagrees with SOMA-X ({d.max():.2e} m)"
+    else:
+        print(f"\n[vs SOMA-X] skipped: run benchmarks/somax_reference.py to write {somax.name}")
 
     print("\nALL FAIRNESS CHECKS PASSED")
 

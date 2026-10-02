@@ -19,26 +19,39 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _xp(x):
+    """``numpy`` for host arrays, ``jax.numpy`` otherwise — kernels run on either."""
+    return np if isinstance(x, np.ndarray) else jnp
+
+
 def _pairwise_dist(A: jnp.ndarray, B: jnp.ndarray) -> jnp.ndarray:
     """(Na, D) vs (Nb, D) → (Na, Nb) Euclidean distances."""
+    if isinstance(A, np.ndarray):
+        # Accumulated axis by axis: the same sum, in the same order, without
+        # an (Na, Nb, D) temporary.
+        sq = None
+        for k in range(A.shape[1]):
+            dk = A[:, None, k] - B[None, :, k]
+            sq = dk * dk if sq is None else sq + dk * dk
+        return np.sqrt(sq)
     diff = A[:, None, :] - B[None, :, :]
     return jnp.sqrt(jnp.sum(diff * diff, axis=-1))
 
 
 def _tps(r, eps=1e-10):
-    return (r * r) * jnp.log(r + eps)
+    return (r * r) * _xp(r).log(r + eps)
 
 
 def _gaussian(r, eps=0.1):
-    return jnp.exp(-((r / eps) ** 2))
+    return _xp(r).exp(-((r / eps) ** 2))
 
 
 def _multiquadric(r, eps=0.1):
-    return jnp.sqrt(1.0 + (r / eps) ** 2)
+    return _xp(r).sqrt(1.0 + (r / eps) ** 2)
 
 
 def _inverse_multiquadric(r, eps=0.1):
-    return 1.0 / jnp.sqrt(1.0 + (r / eps) ** 2)
+    return 1.0 / _xp(r).sqrt(1.0 + (r / eps) ** 2)
 
 
 def _inverse_quadratic(r, eps=0.1):
@@ -108,26 +121,40 @@ class RadialBasisFunction:
 
     def _precompute_system_matrix(self):
         scp = self.source_control_points
+        # Concrete control points (the skeleton transfer's static bind data)
+        # are factored on the host: every joint has its own support size, and
+        # eager JAX would compile the whole chain once per size. On CPU the
+        # result is bit-identical — jaxlib's LU is the same LAPACK getrf.
+        host = not isinstance(scp, jax.core.Tracer)
+        xp = np if host else jnp
+        if host:
+            scp = np.asarray(scp)
         N, D = self.n_control, self.dim
-        K = self._rbf(_pairwise_dist(scp, scp)).astype(self.dtype)
+        dtype = np.dtype(self.dtype)
+        K = self._rbf(_pairwise_dist(scp, scp)).astype(dtype)
         # Tiny diagonal jitter for conditioning (matches SOMA-X).
-        eps = 1e-8 if self.dtype in (jnp.float32, jnp.float64) else 1e-4
-        K = K + jnp.eye(N, dtype=self.dtype) * eps
+        eps = 1e-8 if dtype in (np.float32, np.float64) else 1e-4
+        K = K + xp.eye(N, dtype=dtype) * xp.asarray(eps, dtype=dtype)
 
         if self.include_polynomial:
-            ones = jnp.ones((N, 1), dtype=self.dtype)
-            P = jnp.concatenate([ones, scp], axis=1)          # (N, D+1)
-            Z = jnp.zeros((D + 1, D + 1), dtype=self.dtype)
-            top = jnp.concatenate([K, P], axis=1)             # (N, N+D+1)
-            bot = jnp.concatenate([P.T, Z], axis=1)            # (D+1, N+D+1)
-            A = jnp.concatenate([top, bot], axis=0)           # (N+D+1)²
+            ones = xp.ones((N, 1), dtype=dtype)
+            P = xp.concatenate([ones, scp], axis=1)           # (N, D+1)
+            Z = xp.zeros((D + 1, D + 1), dtype=dtype)
+            top = xp.concatenate([K, P], axis=1)              # (N, N+D+1)
+            bot = xp.concatenate([P.T, Z], axis=1)            # (D+1, N+D+1)
+            A = xp.concatenate([top, bot], axis=0)            # (N+D+1)²
         else:
             A = K
-        self.A = A
-        # JAX has no in-place LU "factor + solve" split; we keep A and rely on
-        # jax.scipy.linalg.lu_factor/lu_solve under jit. For tiny N (face/eye
-        # support is small) this is fast enough.
-        self._lu, self._piv = jax.scipy.linalg.lu_factor(A)
+        self._host_lu = None
+        if host:
+            import scipy.linalg
+            lu, piv = scipy.linalg.lu_factor(A, check_finite=False)
+            self._host_lu = (lu, piv)
+            self.A = jnp.asarray(A)
+            self._lu, self._piv = jnp.asarray(lu), jnp.asarray(piv.astype(np.int32))
+        else:
+            self.A = A
+            self._lu, self._piv = jax.scipy.linalg.lu_factor(A)
 
     def _lu_solve(self, b: jnp.ndarray) -> jnp.ndarray:
         """LU back-solve preserving the legacy (N, BD)-reshape batched path."""
@@ -150,6 +177,22 @@ class RadialBasisFunction:
         Returns:
             (N,) basis weights for the source control points.
         """
+        if self._host_lu is not None and not isinstance(query_point, jax.core.Tracer):
+            # Host-factored system and a concrete query: solve on the host too
+            # (LAPACK getrs, as upstream's CPU ``lu_solve``).
+            import scipy.linalg
+            dtype = np.dtype(self.dtype)
+            q = np.asarray(query_point, dtype=dtype).reshape(-1)
+            diff = np.asarray(self.source_control_points) - q[None, :]
+            dists = self._rbf_func(np.sqrt(np.sum(diff * diff, axis=1)),
+                                   **self.kernel_params).astype(dtype)
+            if self.include_polynomial:
+                rhs = np.concatenate([dists, np.ones((1,), dtype=dtype), q])
+            else:
+                rhs = dists
+            w_full = scipy.linalg.lu_solve(self._host_lu, rhs, check_finite=False)
+            return jnp.asarray(w_full[: self.n_control])
+
         q = jnp.asarray(query_point)
         if q.ndim == 2:
             q = q.reshape(-1)

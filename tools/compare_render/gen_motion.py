@@ -11,8 +11,14 @@ Two sources:
   the walk; the clip is evenly subsampled to ``--frames`` spanning the whole
   motion. The SOMA rig is already Y-up, so no view rotation is applied.
 
-* no ``--bvh``   — a synthetic in-place march + arm swing (T-pose-relative,
-  ``absolute=False``); fallback for when the dataset isn't mounted.
+* ``--npy PATH`` — a clip of SOMA local transforms ``(T, 78|94, 4, 4)``, e.g.
+  upstream's ``assets/example_animation.npy``, the motion SOMA-X's own
+  ``tools/demo_soma_vis.py`` plays (at 30 fps; 94-joint clips are reduced to
+  the 78 SOMA joints with that demo's ``nvskel93to77_idx``). Its rotations are
+  absolute local rotations like the BVH clips', and joint 1's translation is
+  the root translation in metres.
+* neither — a synthetic in-place march + arm swing (T-pose-relative,
+  ``absolute=False``).
 
 Both pipelines consume the identical arrays: SOMA-JAX uses all 78 joints,
 SOMA-X uses ``rotmats[:, 1:]`` (its 77 public joints; Root is identity and
@@ -62,6 +68,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--soma-npz", default=str(REPO / "assets" / "SOMA_neutral_fixed.npz"))
     p.add_argument("--bvh", default=None, help="SOMA-skeleton BVH motion clip")
+    p.add_argument("--npy", default=None,
+                   help="SOMA local-transform clip (T, 78|94, 4, 4), e.g. upstream's "
+                        "assets/example_animation.npy")
+    p.add_argument("--npy-fps", type=float, default=30.0,
+                   help="source frame rate of --npy (SOMA-X's demo plays its clip at 30)")
     p.add_argument("--seconds", type=float, default=6.0,
                    help="length of the clip window to extract (realtime playback duration)")
     p.add_argument("--start-frac", type=float, default=0.15,
@@ -99,6 +110,29 @@ def main():
         duration_s = win
         print(f"loaded BVH {Path(args.bvh).name}: {N}f @ {src_fps:.0f} FPS "
               f"({bvh['source_duration_s']:.1f}s) -> {win:.1f}s window @ {play_fps:.0f} FPS = {T} frames")
+    elif args.npy:
+        clip = np.load(args.npy).astype(np.float32)
+        if clip.shape[1] == 94:
+            # SOMA-X's demo layout: Root + the 93-joint NV skeleton.
+            sys.path.insert(0, str(REPO / "tools"))
+            from demo_soma_vis import nvskel93to77_idx
+            clip = clip[:, [0] + [i + 1 for i in nvskel93to77_idx]]
+        names = [str(n) for n in np.load(args.soma_npz, allow_pickle=True)["joint_names"]]
+        assert clip.shape[1] == len(names), (clip.shape, len(names))
+        N, src_fps = clip.shape[0], float(args.npy_fps)
+        win = min(args.seconds, N / src_fps)
+        T = max(2, int(round(win * play_fps)))
+        f0 = int(args.start_frac * N)
+        f1 = min(N - 1, f0 + int(round(win * src_fps)))
+        idx = np.linspace(f0, f1, T).astype(int)
+        rotmats = clip[idx, :, :3, :3]                            # (T,78,3,3) ABSOLUTE
+        trans = clip[idx, 1, :3, 3].copy()                        # (T,3) metres, Y-up
+        if not args.keep_translation:
+            trans[:, 0] = trans[0, 0]; trans[:, 2] = trans[0, 2]
+        absolute = True
+        duration_s = win
+        print(f"loaded {Path(args.npy).name}: {N}f @ {src_fps:.0f} FPS "
+              f"({N / src_fps:.1f}s) -> {win:.1f}s window @ {play_fps:.0f} FPS = {T} frames")
     else:
         d = dict(np.load(args.soma_npz, allow_pickle=True))
         names = [str(n) for n in d["joint_names"]]

@@ -20,13 +20,19 @@ REPO = Path(__file__).resolve().parents[2]
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--motion", required=True)
-    p.add_argument("--hf", default=str(REPO / "assets" / "hf"))
+    p.add_argument("--hf", default=None,
+                   help="upstream data_root (default: soma_jax.assets.data_root(), which "
+                        "links the v0.3 asset set incl. SOMA_template_rig.usda)")
     p.add_argument("--bench-batch", type=int, default=2048)
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
+    import sys
     import torch
     from soma import SOMALayer
+    sys.path.insert(0, str(REPO))
+    from soma_jax.assets import data_root
+    data_dir = args.hf or str(data_root())
 
     m = np.load(args.motion)
     rotmats77 = m["rotmats"].astype(np.float32)[:, 1:, :, :]     # drop Root (identity)
@@ -34,7 +40,7 @@ def main():
     absolute = bool(m["absolute"])
     T = rotmats77.shape[0]
 
-    layer = SOMALayer(data_root=str(args.hf), device="cuda:0",
+    layer = SOMALayer(data_root=data_dir, device="cuda:0",
                       identity_model_type="soma", mode="warp",
                       correctives_model_path=None,
                       enable_procedural_transforms=False).to("cuda:0")
@@ -77,9 +83,10 @@ def main():
     fps = B / total
 
     faces = layer.faces.detach().cpu().numpy().astype(np.int32)
-    rig = np.load(Path(args.hf) / "SOMA_neutral.npz")
-    names = [str(n) for n in rig["joint_names"]]
-    parents = rig["joint_parent_ids"].astype(int).copy(); parents[0] = 0
+    # SOMA-X v0.3: the rig lives in the template USD, not SOMA_neutral.npz.
+    names = list(layer.public_joint_names)
+    parents = layer.output_joint_parent_ids.detach().cpu().numpy().astype(int).copy()
+    parents[0] = 0
     np.savez(args.out, verts=verts, faces=faces, fps=fps, batch=B, bench_total_s=total,
              joints=joints, joint_names=np.asarray(names), parents=parents,
              duration_s=float(m["duration_s"]), play_fps=float(m["play_fps"]),

@@ -7,32 +7,36 @@ This product includes software developed by NVIDIA CORPORATION & AFFILIATES.
   Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   Licensed under the Apache License, Version 2.0.
 
-SOMA-JAX is a derivative work: it reimplements SOMA-X's pipeline (identity
-blend, skeletal abstraction, mesh topology abstraction, pose abstraction,
-forward FK/LBS and pose inversion) in JAX/equinox in place of the upstream
-PyTorch + NVIDIA Warp backend. Rig data, algorithms and API shape derive from
-SOMA-X. Upstream SOMA-X is vendored unmodified at `third_party/SOMA-X` as a git
-submodule and retains its own LICENSE.
+SOMA-JAX is a derivative work: it reimplements SOMA-X (v0.3.3) — its body,
+hand and SMPL-family layers, identity backends, skeletal and mesh-topology
+abstractions, procedural rig, pose correctives, pose inversion, smoothing, I/O
+and tools — in JAX/equinox in place of the upstream PyTorch + NVIDIA Warp
+backend. Rig data, algorithms and API shape derive from SOMA-X. Upstream SOMA-X
+is included unmodified at `third_party/SOMA-X` as a git submodule and retains
+its own LICENSE. `tools/vis_pyrender.py` and `tools/make_teaser.py` are copied
+from SOMA-X's `tools/`, keeping its copyright headers: the first with only a
+docstring added, the second with only a docstring and an import path changed.
 
 Summary of changes relative to SOMA-X, as required by Apache-2.0 section 4(b):
-see `docs/FAITHFULNESS.md`, which records module by module what is a faithful
-port, what is implemented with a different but verified-equivalent structure,
-what is an explicitly-flagged SOMA-JAX-only alternative, and what is not ported.
+see `docs/FAITHFULNESS.md`, which records what corresponds to what and how
+closely it is measured to agree, what differs by design, which upstream defects
+are not reproduced, what SOMA-JAX adds, and what is not ported.
 
 --------------------------------------------------------------------------------
 Model assets are NOT covered by this license
 --------------------------------------------------------------------------------
 
 The Apache-2.0 grant in LICENSE covers the source code in this repository only.
-No model weights, rigs, meshes or PCA bases are distributed here — `assets/` is
-git-ignored and its contents are fetched separately. Those files carry their own
-terms, several of which are more restrictive than Apache-2.0 and some of which
-are research-only / non-commercial. You are responsible for accepting each
-model's licence before use:
+No model weights, rigs, meshes or PCA bases are distributed here: they come
+with the SOMA-X submodule (git-lfs) or are fetched separately. Those files
+carry their own terms, several of which are more restrictive than Apache-2.0
+and some of which are research-only / non-commercial. You are responsible for
+accepting each model's licence before use:
 
   SOMA / SOMA_neutral.npz   https://huggingface.co/nvidia/SOMA-X
   SMPL                      https://smpl.is.tue.mpg.de/bodylicense.html
   SMPL-X / SMPL-H           https://smpl-x.is.tue.mpg.de/
+  MANO                      https://mano.is.tue.mpg.de/
   MHR                       https://github.com/facebookresearch/MHR
   Anny                      https://github.com/naver/anny
   GarmentMeasurements       https://github.com/mbotsch/GarmentMeasurements

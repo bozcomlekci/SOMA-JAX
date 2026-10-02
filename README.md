@@ -11,15 +11,18 @@ hardware-portable graph.
 
 ![SOMA-JAX vs SOMA-X](assets/media/soma_x_vs_soma_jax.gif)
 
-<sub>Identical rig and motion, equal wall-clock. The frame counters show what each
-pipeline gets through in that time.</sub>
+<sub>SOMA-X's own example animation on the identical rig, at equal wall-clock: the
+frame counters show what each pipeline gets through in that time. The SOMA-JAX
+column is the JAX + Warp hybrid (2.6× at batch 2048); the faithful pure-JAX path
+is 2.0×.</sub>
 
 ## Overview
 
-- **Faithful.** The forward matches upstream to **3.2e-6 m**, and upstream's
-  default 122-joint procedural rig to **0.34–1.16 mm**. Audited module by module
-  in [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md), which marks what is a port,
-  what is an alternative, and what is not ported.
+- **Faithful.** A port of SOMA-X v0.3.3: the body forward matches upstream at
+  every LOD, on the default 110-joint procedural rig and the legacy one, with
+  pose correctives, to **≤ 3.1 µm**. Audited module by module in
+  [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md), which also lists what differs
+  by design, which upstream defects are not reproduced, and what SOMA-JAX adds.
 - **Differentiable end to end.** Identity blend → skeleton fit → FK + LBS is a
   single JAX graph: `jit` it, `vmap` thousands of subjects, take gradients
   through it.
@@ -28,16 +31,20 @@ pipeline gets through in that time.</sub>
 - **Every SOMA identity model.** SOMA's own 128-coefficient PCA, MHR, Anny,
   SMPL / SMPL-X / SMPL-H, and GarmentMeasurement.
 - **Pose inversion.** SOMA-X's multi-stage solver — inverse-LBS Procrustes refit,
-  Lie-algebra Gauss–Newton, optional autograd FK refinement.
+  Lie-algebra Gauss–Newton, optional autograd FK refinement — and its native-MHR
+  inverter, plus RTS pose smoothing and the SOMA Hand / MANO layers.
 
 ## Installation
 
 ```bash
+git lfs install                     # SOMA-X's assets are git-lfs objects
 git clone --recurse-submodules https://github.com/bozcomlekci/SOMA-JAX.git
 cd SOMA-JAX
 pip install -e ".[vis]"
-python tools/download_assets.py
 ```
+
+The model assets come with the `third_party/SOMA-X` submodule;
+`python tools/download_assets.py --check` reports anything missing.
 
 For NVIDIA GPUs install a CUDA build of JAX (`pip install -U "jax[cuda12]"`;
 Blackwell cards need CUDA ≥ 12.8). Full setup — GPU, model assets, headless
@@ -52,7 +59,7 @@ import equinox as eqx
 from soma_jax import SOMALayer, SOMAParams
 
 # Builds upstream's rig from the two NVIDIA source files — no PyTorch involved.
-layer = SOMALayer.from_upstream_assets()            # 122-joint procedural rig
+layer = SOMALayer.from_upstream_assets()            # 110-joint procedural rig
 B, J = 4, len(layer.public_joint_names)             # J == 78
 
 out = eqx.filter_jit(layer)(SOMAParams(
@@ -82,31 +89,36 @@ driven by the same SOMA skeleton and the same motion, and only the body changes:
 ![SOMA identity models sharing one skeleton](assets/media/identity_models.png)
 
 ```python
-from soma_jax import create_identity_model, SOMALayer
+from soma_jax import SOMALayer
 
-model = create_identity_model("mhr", soma_data, mhr_model_data)   # or smpl, smplx,
-layer = SOMALayer(soma_data, identity_model=model)                # anny, garment…
+layer = SOMALayer.from_upstream_assets(identity_model_type="mhr")   # or "anny",
+# "garment", "soma"; SMPL-family backends also take the licensed model file:
+layer = SOMALayer.from_upstream_assets(
+    identity_model_type="smplx", identity_model_kwargs={"model_path": "SMPLX_NEUTRAL.npz"})
 ```
 
 ## Performance
 
-Against SOMA-X (PyTorch + Warp) on an RTX 5080, full forward at batch 2048,
-matched float32:
+Against SOMA-X (PyTorch + Warp) on an RTX 5080: the full forward (identity
+blend → skeleton fit → FK + LBS) on the same rig, matched float32.
 
-| Pipeline | vs SOMA-X | Needs |
-|---|---|---|
-| **Hybrid** (JAX + one Warp `svd3` kernel) | **1.68× faster** | optional `warp-lang`; approximates upstream's rotation solve |
-| **Pure JAX** (the faithful path) | 0.61× — 1.65× slower | nothing beyond JAX |
+| Pipeline | B=1 | B=128 | B=2048 | Needs |
+|---|---:|---:|---:|---|
+| **Pure JAX** (the faithful path) | 5.6× faster | 3.6× | **2.0×** | nothing beyond JAX |
+| **Hybrid** (JAX + one Warp `svd3` kernel) | 24× | 6.0× | **2.65×** | optional `warp-lang`; approximates upstream's rotation solve |
 
-The pure-JAX path wins below B≈256 and loses above it; the gap is
-`jnp.linalg.svd` over many tiny 3×3 matrices. On peak GPU memory SOMA-JAX grows
-**5.1× more slowly** with batch and is 3.0× lighter at B=4096, where SOMA-X OOMs
-by B=8192.
+The pure-JAX path reproduces SOMA-X's posed meshes to 0.0027 mm; the hybrid's
+plain-Kabsch rotation step departs from upstream's on ill-conditioned joints
+(0.69 mm max). On peak GPU memory SOMA-JAX starts slightly heavier (1.08 vs
+1.01 GiB at B=1), crosses SOMA-X between B=32 and B=64, and grows 3.5× more
+slowly with batch: at B=4096 it needs 3.58 GiB to SOMA-X's 9.88, and SOMA-X
+runs out of the 16 GB card at B=8192.
 
 ![float32 → TF32](assets/media/soma_jax_tf32_teaser.gif)
 
-<sub>Switching the hybrid pipeline to TF32 mid-motion reaches ~2.8× — a JAX-only
-deployment mode at ~sub-mm error. float32 stays the like-for-like comparison.</sub>
+<sub>Switching the hybrid to TF32 mid-motion takes it from 2.6× to 2.8× — a
+JAX-only mode at sub-millimetre error (mean 0.015 mm). float32 stays the
+like-for-like comparison.</sub>
 
 Method, fairness checks and the full precision discussion:
 [`benchmarks/README.md`](benchmarks/README.md).
