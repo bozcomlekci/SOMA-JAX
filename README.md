@@ -11,10 +11,7 @@ hardware-portable graph.
 
 ![SOMA-JAX vs SOMA-X](assets/media/soma_x_vs_soma_jax.gif)
 
-<sub>SOMA-X's own example animation on the identical rig, at equal wall-clock: the
-frame counters show what each pipeline gets through in that time. The SOMA-JAX
-column is the JAX + Warp hybrid (2.6× at batch 2048); the faithful pure-JAX path
-is 2.0×.</sub>
+<sub>SOMA-X's own example animation on the identical rig, at equal wall-clock: the frame counters show what each pipeline gets through in that time. The SOMA-JAX column is the JAX + Warp hybrid (2.6× at batch 2048); the faithful pure-JAX path is 2.0×.</sub>
 
 ## Overview
 
@@ -102,10 +99,10 @@ layer = SOMALayer.from_upstream_assets(
 Against SOMA-X (PyTorch + Warp) on an RTX 5080: the full forward (identity
 blend → skeleton fit → FK + LBS) on the same rig, matched float32.
 
-| Pipeline | B=1 | B=128 | B=2048 | Needs |
-|---|---:|---:|---:|---|
-| **Pure JAX** (the faithful path) | 5.6× faster | 3.6× | **2.0×** | nothing beyond JAX |
-| **Hybrid** (JAX + one Warp `svd3` kernel) | 24× | 6.0× | **2.65×** | optional `warp-lang`; approximates upstream's rotation solve |
+| Pipeline                                  |         B=1 | B=128 |    B=2048 | Needs                                                        |
+| ----------------------------------------- | ----------: | ----: | --------: | ------------------------------------------------------------ |
+| **Pure JAX** (the faithful path)          | 5.6× faster |  3.6× |  **2.0×** | nothing beyond JAX                                           |
+| **Hybrid** (JAX + one Warp `svd3` kernel) |         24× |  6.0× | **2.65×** | optional `warp-lang`; approximates upstream's rotation solve |
 
 The pure-JAX path reproduces SOMA-X's posed meshes to 0.0027 mm; the hybrid's
 plain-Kabsch rotation step departs from upstream's on ill-conditioned joints
@@ -116,21 +113,19 @@ runs out of the 16 GB card at B=8192.
 
 ![float32 → TF32](assets/media/soma_jax_tf32_teaser.gif)
 
-<sub>Switching the hybrid to TF32 mid-motion takes it from 2.6× to 2.8× — a
-JAX-only mode at sub-millimetre error (mean 0.015 mm). float32 stays the
-like-for-like comparison.</sub>
+<sub>Switching the hybrid to TF32 mid-motion takes it from 2.6× to 2.8× — a JAX-only mode at sub-millimetre error (mean 0.015 mm). float32 stays the like-for-like comparison.</sub>
 
 Method, fairness checks and the full precision discussion:
 [`benchmarks/README.md`](benchmarks/README.md).
 
 ## Documentation
 
-| | |
-|---|---|
-| [`docs/DESCRIPTION.md`](docs/DESCRIPTION.md) | what is implemented, the API surface, tooling and conversion scripts |
-| [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) | module-by-module parity audit against SOMA-X |
-| [`docs/INSTALL.md`](docs/INSTALL.md) | GPU setup, model assets, headless rendering |
-| [`benchmarks/README.md`](benchmarks/README.md) | runtime and memory study vs SOMA-X |
+|                                                 |                                                                      |
+| ----------------------------------------------- | -------------------------------------------------------------------- |
+| [`docs/DESCRIPTION.md`](docs/DESCRIPTION.md)   | what is implemented, the API surface, tooling and conversion scripts |
+| [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) | module-by-module parity audit against SOMA-X                         |
+| [`docs/INSTALL.md`](docs/INSTALL.md)           | GPU setup, model assets, headless rendering                          |
+| [`benchmarks/README.md`](benchmarks/README.md) | runtime and memory study vs SOMA-X                                   |
 
 ## License
 
@@ -144,7 +139,18 @@ research-only. See [`NOTICE`](NOTICE) for the list and links.
 
 ## Citation
 
-If you use SOMA-JAX, please cite the original SOMA-X paper:
+If you use SOMA-JAX in your research, please cite this repository:
+
+```bibtex
+@misc{somajax,
+  title  = {SOMA-JAX: A Differentiable JAX Port of NVIDIA SOMA-X},
+  author = {Batuhan Ozcomlekci},
+  year   = {2026},
+  howpublished = {\url{https://github.com/bozcomlekci/SOMA-JAX}},
+}
+```
+
+Please also cite the original SOMA-X paper:
 
 ```bibtex
 @article{soma2026,
