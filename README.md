@@ -96,9 +96,13 @@ layer = SOMALayer.from_upstream_assets(
 
 The MHR, Anny and GarmentMeasurement packs come from
 `python tools/pipeline/build_identity_packs.py` (MHR needs PyTorch); the
-SMPL family takes the registration-only SMPL / SMPL-X model files. To move a
-body between models, `tools/convert/shape_convert.py` fits one model's
-coefficients to another's body.
+SMPL family takes the registration-only SMPL / SMPL-X model files. For MHR,
+`layer.identity_model.attach_native_archive()` switches from a linear stand-in
+to the full MHR forward, which matches upstream (`scale_params` included);
+reading `mhr_model_lod1.pt` needs PyTorch once, and `MHRNativeModel.to_npz`
+saves a copy that `attach_native_archive(path, from_npz=True)` loads without
+it. To move a body between models, `tools/convert/shape_convert.py` fits one
+model's coefficients to another's body.
 
 ## Performance
 

@@ -1189,6 +1189,10 @@ def main():
                         # apply the rotations to a 1m-translated origin and stretch/
                         # shrink the body geometry.
                         rest_override = soma_extras["soma_rest_verts"]
+                        if n_lod is not None:
+                            # The mid mesh is ordered coarse-first: low LOD is
+                            # its first n_lod vertices (as build_lowlod slices).
+                            rest_override = rest_override[:n_lod]
                     transl_seq = (soma_extras.get("root_translation")
                                   if soma_extras is not None else None)
                     verts_seq, model_faces, joints_seq, soma_parents = pose_soma_identity_sequence(
