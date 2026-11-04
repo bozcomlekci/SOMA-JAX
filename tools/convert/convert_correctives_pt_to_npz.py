@@ -27,23 +27,30 @@ at inference time. The two transformations this converter applies are:
 Usage::
 
   python tools/convert/convert_correctives_pt_to_npz.py \\
-      assets/third_party/hf/correctives_model_v021.pt \\
-      assets/correctives_model_v021.npz
+      assets/third_party/correctives_model.pt assets/correctives_model.npz
+
+then ``SOMALayer.from_upstream_assets(correctives_path="assets/correctives_model.npz")``.
+Reading the checkpoint needs PyTorch (``pip install torch``); the layer does not.
 """
 from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
 import numpy as np
-import torch
 
 
 def main():
     """CLI entry point: parse args, load the PT, write the NPZ."""
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Convert SOMA-X's correctives_model.pt to an .npz SOMA-JAX loads "
+                    "(needs PyTorch to read the checkpoint).")
     p.add_argument("src", type=Path, help="input .pt checkpoint")
     p.add_argument("dst", type=Path, help="output .npz")
     args = p.parse_args()
+    try:
+        import torch
+    except ModuleNotFoundError:
+        sys.exit("Reading a .pt checkpoint needs PyTorch: pip install torch")
 
     # weights_only=False is required because SOMA-X stores a meta dict alongside
     # the tensors (epoch, mask paths, etc.); torch 2.4+ blocks those by default.

@@ -155,6 +155,13 @@ result.root_translation   # (B, 3)
 result.per_vertex_error   # (B, V)
 ```
 
+The autograd stage is an Adam refinement started from the Lie-GN result, as
+upstream's is, and it behaves the same way: its first steps *raise* the error
+before it drops below the starting point. On random poses (σ = 0.2 rad) the
+mean vertex error goes from 2.37 mm without it to 16.2 / 6.3 / 2.4 mm after
+5 / 20 / 60 steps (upstream: 16.3 / 6.6 / 2.1 mm), so give it on the order of
+60+ steps or leave it off.
+
 Weight extremities and add a pose prior when contact accuracy matters:
 
 ```python

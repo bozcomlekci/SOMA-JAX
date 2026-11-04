@@ -75,6 +75,26 @@ def test_77_posable_joints_and_joint_count_errors(request, rig):
         layer(p._replace(poses=p.poses[:, :50]))
 
 
+def test_rebind_keeps_the_skeleton_fit_consistent(layer_plain):
+    """Rebinding to the current bind shape changes nothing; a new shape takes
+    its own joints and leaves the original layer alone."""
+    p = _params(layer_plain)
+    ref = np.asarray(layer_plain(p).vertices)
+    bind_shape = layer_plain.skeleton_transfer.bind_shape
+    same = layer_plain.rebind(bind_shape)
+    np.testing.assert_allclose(np.asarray(same(p).vertices), ref, atol=1e-5)
+    # A different template takes the joints the skeleton fit gives it: the
+    # identity whose rest shape it is (here the zero identity, whose rest is
+    # v_template) poses exactly as before — keeping the old joints moved it
+    # by ~10 cm — and other identities shift a little.
+    moved = layer_plain.rebind(layer_plain.v_template)
+    zero = p._replace(identity_coeffs=jnp.zeros_like(p.identity_coeffs))
+    np.testing.assert_allclose(np.asarray(moved(zero).vertices),
+                               np.asarray(layer_plain(zero).vertices), atol=1e-5)
+    assert float(np.abs(np.asarray(moved(p).vertices) - ref).max()) > 1e-3
+    np.testing.assert_array_equal(np.asarray(layer_plain(p).vertices), ref)
+
+
 def test_gradients_flow_end_to_end(layer_plain):
     p = _params(layer_plain, B=1)
 

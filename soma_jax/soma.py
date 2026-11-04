@@ -1595,11 +1595,19 @@ class SOMALayer(eqx.Module):
         is called on is left untouched (equinox modules are immutable, but the
         transfer is a plain object shared by reference).
 
+        The skeleton fit is keyed on the rig's bind-pose shape
+        (``skeleton_transfer.bind_shape``), which is not ``v_template`` (the
+        identity model's T-pose mean, several cm away): rebinding re-keys the
+        fit on ``new_v_template`` and the joints that go with it.
+
         Args:
-            new_v_template: (V, 3) new rest-pose template vertices.
+            new_v_template: (V, 3) new template vertices to key the skeleton
+                fit on.
             new_bind_world: optional (J, 4, 4) bind transforms matching the new
-                template. Defaults to the existing ones, which is right when
-                only the shape changed.
+                template. Defaults to the joints the current skeleton fit
+                predicts for it, so rebinding to the current bind shape changes
+                nothing. (Keeping the old joints for a new shape would bias
+                every later fit.)
 
         Returns:
             New SOMALayer with the template and dependent state updated.
@@ -1607,10 +1615,11 @@ class SOMALayer(eqx.Module):
         layer = eqx.tree_at(lambda m: m.v_template, self, new_v_template)
 
         if self.skeleton_transfer is not None:
+            if new_bind_world is None:
+                new_bind_world = self.skeleton_transfer.fit(
+                    jnp.asarray(new_v_template, jnp.float32)[None])[0]
             transfer = copy.copy(self.skeleton_transfer)
-            bind_world = (self.skeleton_transfer.bind_world_transforms
-                          if new_bind_world is None else np.asarray(new_bind_world))
-            transfer.update_bind(bind_world, np.asarray(new_v_template))
+            transfer.update_bind(np.asarray(new_bind_world), np.asarray(new_v_template))
             # `skeleton_transfer` is a *static* field, so it is not a pytree
             # leaf and `tree_at` cannot target it. `layer` is already a fresh
             # object from the tree_at above, so setting it here leaves `self`
