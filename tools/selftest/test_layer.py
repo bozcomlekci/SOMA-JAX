@@ -230,7 +230,9 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
     v = np.asarray(out.vertices)
     assert v.shape == (1, 18056, 3) and np.isfinite(v).all()
     assert 0.9 < float(v[0, :, 1].max() - v[0, :, 1].min()) < 2.3
-    np.testing.assert_allclose(np.asarray(layer.prepare_identity(ids)[0]), jitted, atol=1e-4)
+    # (float32 jit vs eager: XLA 0.4.26 differs by up to 0.15 mm where the
+    # tetrahedral weights of off-surface vertices cancel.)
+    np.testing.assert_allclose(np.asarray(layer.prepare_identity(ids)[0]), jitted, atol=5e-4)
     # Every SOMA wrap vertex is embedded in the backend's own mesh, so the
     # zero-coefficient body must reproduce that backend's SOMA_wrap.obj: the
     # tetrahedral embedding recovers points off the source surface, and the
