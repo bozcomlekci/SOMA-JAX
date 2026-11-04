@@ -1435,17 +1435,19 @@ class SOMALayer(eqx.Module):
         # does this inside `pose()`; here it sits in front of the shared machinery
         # so `pose()` stays a plain "rotations for every rig joint" entry point.
         n_public = len(self.public_joint_names)
-        if self._procedural is not None and rotmats.shape[-3] != len(self.joint_names):
-            if rotmats.shape[-3] == n_public - 1:
-                # Upstream's public contract is the 77 *posable* joints — Root is
-                # in the rig but never posed, so prepend identity for it.
-                eye = jnp.broadcast_to(
-                    jnp.eye(3, dtype=rotmats.dtype), rotmats.shape[:-3] + (1, 3, 3))
-                rotmats = jnp.concatenate([eye, rotmats], axis=-3)
-            if rotmats.shape[-3] != n_public:
+        n_rig = len(self.joint_names)
+        if rotmats.shape[-3] == n_public - 1 != n_rig:
+            # Upstream's public contract is the 77 *posable* joints — Root is
+            # in the rig but never posed, so prepend identity for it.
+            eye = jnp.broadcast_to(
+                jnp.eye(3, dtype=rotmats.dtype), rotmats.shape[:-3] + (1, 3, 3))
+            rotmats = jnp.concatenate([eye, rotmats], axis=-3)
+        if rotmats.shape[-3] != n_rig:
+            if self._procedural is None or rotmats.shape[-3] != n_public:
+                full = f", or all {n_rig} rig joints" if n_rig != n_public else ""
                 raise ValueError(
                     f"Expected {n_public} public joints (or {n_public - 1} posable, "
-                    f"excluding Root) for the procedural rig, got {rotmats.shape[-3]}."
+                    f"excluding Root{full}), got {rotmats.shape[-3]}."
                 )
             rotmats, _ = self._procedural.extend_to_template_rig(
                 rotmats, list(self.joint_names))

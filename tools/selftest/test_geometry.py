@@ -279,3 +279,19 @@ def test_pose_inversion_hierarchical_improves_on_its_init(synthetic_rig):
     hier = inv.fit_hierarchical(posed, num_refine_iters=60, lr=5e-3)
     assert hier.shape == (len(parents), 3, 3)
     assert err(hier) < 0.5 * init, (err(hier), init)
+
+
+def test_pose_mirror_pairs_names_and_takes_numpy():
+    from soma_jax import PoseMirror
+    names = ["root", "left_leg", "right_leg", "LeftHand", "RightHand",
+             "l_hand", "r_hand", "arm_l", "arm_r", "spine"]
+    pm = PoseMirror(names)
+    pairs = {(names[i], names[j]) for i, j in enumerate(pm.mirror_indices) if i < j}
+    assert pairs == {("left_leg", "right_leg"), ("LeftHand", "RightHand"),
+                     ("l_hand", "r_hand"), ("arm_l", "arm_r")}
+    R = np.asarray(_random_rotmats(2 * len(names))).reshape(2, len(names), 3, 3)
+    m = pm.mirror_rotmats(R)                            # NumPy in, NumPy out
+    assert isinstance(m, np.ndarray) and m.shape == R.shape
+    np.testing.assert_allclose(pm.mirror_rotmats(m), R, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(pm.mirror_rotmats_jax(jnp.asarray(R))), m, atol=1e-6)
+    np.testing.assert_allclose(np.linalg.det(m), 1.0, atol=1e-5)   # still rotations

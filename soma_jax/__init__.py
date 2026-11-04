@@ -17,11 +17,11 @@ Example::
     import jax.numpy as jnp
     from soma_jax import SOMALayer, SOMAParams
 
-    layer = SOMALayer.load("assets/SOMA_neutral_fixed.npz")
+    layer = SOMALayer.from_upstream_assets()   # or SOMALayer.load(archive)
     params = SOMAParams(
         poses=jnp.zeros((1, 78, 3)),          # axis-angle; Root (index 0) must be zero
-        transl=jnp.zeros((1, 3)),
-        identity_coeffs=jnp.zeros((1, 10)),
+        transl=jnp.zeros((1, 3)),             # hips world position
+        identity_coeffs=jnp.zeros((1, 128)),  # SOMA PCA; other backends their own width
     )
     output = layer(params)
     # output.vertices: (1, V, 3)

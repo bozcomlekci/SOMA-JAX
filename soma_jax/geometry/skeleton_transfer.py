@@ -719,34 +719,44 @@ class PoseMirror:
         self._axis_idx = {"x": 0, "y": 1, "z": 2}[mirror_axis.lower()]
         self._build_mirror_map()
 
+    @staticmethod
+    def _right_name(name: str) -> Optional[str]:
+        """The right-side counterpart of a left-side joint name (lower case):
+        ``Left*`` / ``*left*``, or a ``_l`` suffix / ``l_`` prefix. Each rule
+        rewrites only its own token, so ``left_leg`` maps to ``right_leg``."""
+        low = name.lower()
+        if "left" in low:
+            return low.replace("left", "right")
+        if low.endswith("_l"):
+            return low[:-2] + "_r"
+        if low.startswith("l_"):
+            return "r_" + low[2:]
+        return None
+
     def _build_mirror_map(self) -> None:
         J = len(self.joint_names)
         self.mirror_indices = list(range(J))
-        name_to_idx = {n: i for i, n in enumerate(self.joint_names)}
+        name_to_idx = {n.lower(): i for i, n in enumerate(self.joint_names)}
         for i, name in enumerate(self.joint_names):
-            if "left" in name.lower() or name.lower().endswith("_l"):
-                mirror_name = (
-                    name.lower()
-                    .replace("left", "right")
-                    .replace("_l", "_r")
-                    .replace("l_", "r_")
-                )
-                for candidate, idx in name_to_idx.items():
-                    if candidate.lower() == mirror_name:
-                        self.mirror_indices[i] = idx
-                        self.mirror_indices[idx] = i
-                        break
+            idx = name_to_idx.get(self._right_name(name))
+            if idx is not None and idx != i:
+                self.mirror_indices[i] = idx
+                self.mirror_indices[idx] = i
 
     def mirror_rotmats(self, rotmats: np.ndarray) -> np.ndarray:
+        """Mirror (B, J, 3, 3) or (J, 3, 3) rotations; NumPy in, NumPy out
+        (a JAX array goes through :meth:`mirror_rotmats_jax`)."""
+        if isinstance(rotmats, jax.Array):
+            return self.mirror_rotmats_jax(rotmats)
+        rotmats = np.asarray(rotmats)
         was_unbatched = rotmats.ndim == 3
         if was_unbatched:
             rotmats = rotmats[None]
-        mirrored = rotmats[:, self.mirror_indices]
-        ax = self._axis_idx
-        negate_axes = [a for a in (0, 1, 2) if a != ax]
-        for a in negate_axes:
-            mirrored = mirrored.at[:, :, a, :].multiply(-1)
-            mirrored = mirrored.at[:, :, :, a].multiply(-1)
+        mirrored = rotmats[:, self.mirror_indices]          # fancy indexing copies
+        for a in (0, 1, 2):
+            if a != self._axis_idx:
+                mirrored[:, :, a, :] *= -1
+                mirrored[:, :, :, a] *= -1
         return mirrored[0] if was_unbatched else mirrored
 
     def mirror_rotmats_jax(self, rotmats: jnp.ndarray) -> jnp.ndarray:

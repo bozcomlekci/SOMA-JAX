@@ -62,6 +62,19 @@ def test_jit_matches_eager_and_batches_are_independent(layer_plain):
     np.testing.assert_allclose(np.asarray(layer_plain(one).vertices[0]), eager[1], atol=1e-5)
 
 
+@pytest.mark.parametrize("rig", ["layer_plain", "layer_procedural"])
+def test_77_posable_joints_and_joint_count_errors(request, rig):
+    """Upstream poses the 77 posable joints (Root never moves): every rig
+    takes that as well as the 78 public joints, and says so on a mismatch."""
+    layer = request.getfixturevalue(rig)
+    p = _params(layer, B=1)                  # Root (joint 0) is left at zero
+    full = np.asarray(layer(p).vertices)
+    posable = np.asarray(layer(p._replace(poses=p.poses[:, 1:])).vertices)
+    np.testing.assert_allclose(posable, full, atol=1e-6)
+    with pytest.raises(ValueError, match="public joints"):
+        layer(p._replace(poses=p.poses[:, :50]))
+
+
 def test_gradients_flow_end_to_end(layer_plain):
     p = _params(layer_plain, B=1)
 
