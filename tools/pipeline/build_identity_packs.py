@@ -40,13 +40,26 @@ def load_obj_soma_x_style(path: str | Path):
     return trimesh.load(str(path), process=False, maintain_order=True, force="mesh")
 
 
+def embed_wrap(V_src: np.ndarray, F_src: np.ndarray, V_wrap: np.ndarray):
+    """Upstream's correspondence for an identity backend: each SOMA wrap vertex
+    embedded in a tetrahedron over its nearest source face (the triangle plus a
+    point along its normal), so a vertex off the source surface keeps its offset
+    as the surface deforms (``BarycentricInterpolator.compute_correspondence``).
+
+    The wrap vertices are not all on the source surface: with plain triangle
+    coordinates (:func:`compute_bary`) ~1,000 of them moved by 2-24 mm.
+    """
+    from soma_jax.geometry.barycentric_interp import compute_barycentric_coords
+    return compute_barycentric_coords(V_wrap, V_src, F_src)        # (N,), (N, 4)
+
+
 def compute_bary(V_src: np.ndarray, F_src: np.ndarray, V_dst: np.ndarray):
     """Compute (face_ids, bary_coords) for each V_dst onto (V_src, F_src).
 
-    Uses trimesh closest-point queries (3D triangle barycentric — the 3-component
-    variant; SOMA-X uses a 4-component tetrahedral version for tiny off-surface
-    corrections, but the 3D version is correct for points on the source surface,
-    which is what the wrap obj provides by construction).
+    Plain triangle coordinates of the closest surface point (trimesh
+    closest-point query): each point is projected onto the source surface.
+    SOMA-X embeds points in tetrahedra instead (:func:`embed_wrap`), which keeps
+    off-surface offsets; the identity packs use that.
     """
     src_mesh = trimesh.Trimesh(vertices=V_src, faces=F_src, process=False)
     closest, _, face_ids = trimesh.proximity.closest_point(src_mesh, V_dst)
@@ -70,11 +83,12 @@ def build_mhr_pack(hf_dir: Path, out_path: Path):
     shape_vectors = sd["character_torch.blend_shape.shape_vectors"].numpy()      # (45, 18439, 3)
     shapedirs = shape_vectors.transpose(1, 2, 0).astype(np.float32)              # (V, 3, K)
 
-    face_ids, bary = compute_bary(V_src, F_src, V_wrap)
+    face_ids, bary = embed_wrap(V_src, F_src, V_wrap)
     print(f"  MHR: V_src={V_src.shape[0]} V_wrap={V_wrap.shape[0]} K={shapedirs.shape[-1]}")
     np.savez(out_path,
              v_template=V_src, shapedirs=shapedirs, faces=F_src,
-             bary_face_ids=face_ids, bary_coords=bary)
+             bary_face_ids=face_ids, bary_coords=bary,
+             soma_wrap_vertices=V_wrap)          # the Laplacian blend's reference
 
 
 def _invert_anny_coord_transform(v: np.ndarray) -> np.ndarray:
@@ -101,7 +115,7 @@ def build_anny_pack(hf_dir: Path, out_path: Path):
     shapedirs = np.zeros((V_src.shape[0], 3, 1), dtype=np.float32)
 
     # bary indices/weights are frame-independent; compute in the HF frame.
-    face_ids, bary = compute_bary(V_src, F_src, V_wrap)
+    face_ids, bary = embed_wrap(V_src, F_src, V_wrap)
     # Store v_template pre-inverted so the runtime coord transform restores Y-up.
     V_src_packed = _invert_anny_coord_transform(V_src)
     print(f"  Anny: V_src={V_src.shape[0]} V_wrap={V_wrap.shape[0]} (no PCA, coord pre-inverted)")
@@ -127,12 +141,13 @@ def build_garment_pack(hf_dir: Path, out_path: Path):
     pca_matrix = pd["pca_matrix"]      # (V*3, K)
     shapedirs = pca_matrix.reshape(V_count, 3, -1).astype(np.float32)  # (V, 3, K)
 
-    face_ids, bary = compute_bary(V_src, F_src, V_wrap)
+    face_ids, bary = embed_wrap(V_src, F_src, V_wrap)
     print(f"  Garment: V_src={V_src.shape[0]} V_wrap={V_wrap.shape[0]} K={shapedirs.shape[-1]}")
     np.savez(out_path,
              v_template=V_src, shapedirs=shapedirs, faces=F_src,
              eigenvalues=np.asarray(pd["eigenvalues"], dtype=np.float32),
-             bary_face_ids=face_ids, bary_coords=bary)
+             bary_face_ids=face_ids, bary_coords=bary,
+             soma_wrap_vertices=V_wrap)          # the Laplacian blend's reference
 
 
 def main():

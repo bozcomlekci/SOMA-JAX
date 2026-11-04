@@ -6,11 +6,13 @@ The GarmentMeasurement model is typically stored as separate matrices:
     - mean: (K,) mean shape coefficients (optional)
 
 This tool packages these into a single NPZ file ready for use with
-GarmentMeasurementIdentityModel.
+GarmentMeasurementIdentityModel. For NVIDIA's GarmentMeasurements assets use
+``tools/pipeline/build_identity_packs.py --backends garment`` instead, which
+also computes upstream's correspondence and stores the eigenvalues.
 
 Usage::
 
-    python tools/convert_gm_pca_to_npz.py \\
+    python tools/convert/convert_gm_pca_to_npz.py \\
         --v-template path/to/v_template.npy \\
         --shapedirs path/to/shapedirs.npy \\
         --faces path/to/faces.npy \\
@@ -28,7 +30,14 @@ def parse_args():
     p.add_argument("--faces", required=True, help="Triangle faces (.npy, F x 3)")
     p.add_argument("--mean", default=None, help="Mean coefficients (.npy, K)")
     p.add_argument("--bary-face-ids", default=None, help="Optional barycentric face IDs")
-    p.add_argument("--bary-coords", default=None, help="Optional barycentric coords")
+    p.add_argument("--bary-coords", default=None,
+                   help="Optional barycentric coords: (N, 4) tetrahedral, as upstream, or (N, 3)")
+    p.add_argument("--eigenvalues", default=None,
+                   help="PCA eigenvalues (.npy, K): coefficients are scaled by their square "
+                        "root, so 1.0 is one standard deviation (as upstream)")
+    p.add_argument("--soma-wrap", default=None,
+                   help="SOMA-topology wrap of this model's mesh (.npy, N x 3), the "
+                        "reference the inner-face Laplacian blend keeps")
     p.add_argument("--output", required=True, help="Output NPZ file path")
     return p.parse_args()
 
@@ -62,6 +71,10 @@ def main():
         arrays["bary_face_ids"] = np.load(args.bary_face_ids).astype(np.int32)
     if args.bary_coords is not None:
         arrays["bary_coords"] = np.load(args.bary_coords).astype(np.float32)
+    if args.eigenvalues is not None:
+        arrays["eigenvalues"] = np.load(args.eigenvalues).astype(np.float32)
+    if args.soma_wrap is not None:
+        arrays["soma_wrap_vertices"] = np.load(args.soma_wrap).astype(np.float32)
 
     np.savez_compressed(args.output, **arrays)
     print(f"Saved garment measurement model to: {args.output}")

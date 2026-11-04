@@ -231,6 +231,18 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
     assert v.shape == (1, 18056, 3) and np.isfinite(v).all()
     assert 0.9 < float(v[0, :, 1].max() - v[0, :, 1].min()) < 2.3
     np.testing.assert_allclose(np.asarray(layer.prepare_identity(ids)[0]), jitted, atol=1e-4)
+    # Every SOMA wrap vertex is embedded in the backend's own mesh, so the
+    # zero-coefficient body must reproduce that backend's SOMA_wrap.obj: the
+    # tetrahedral embedding recovers points off the source surface, and the
+    # Laplacian blend is referenced to the wrap. (Projecting onto the surface,
+    # or blending towards the SOMA template, missed it by up to 24 mm.)
+    import trimesh
+    wrap = trimesh.load(data_root() / {"anny": "Anny", "garment_measurement":
+                                       "GarmentMeasurements"}[backend] / "SOMA_wrap.obj",
+                        process=False, maintain_order=True, force="mesh").vertices
+    rest0 = np.asarray(layer.prepare_identity(jnp.zeros((1, 16)), repose_to_bind_pose=False)[0])
+    np.testing.assert_allclose(
+        rest0[0], np.asarray(wrap) * layer.identity_model.native_unit.meters_per_unit, atol=5e-4)
     if backend == "garment_measurement":
         # Upstream's body: pca_mean + (coeffs * sqrt(eigenvalues)) @ pca_matrix.T
         # (a pack without the eigenvalues was 36 mm off it on average).

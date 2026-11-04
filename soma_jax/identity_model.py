@@ -36,11 +36,51 @@ from .geometry.barycentric_interp import barycentric_interpolate, compute_baryce
 from .geometry.laplacian import LaplacianMesh, laplacian_solve
 
 
+#: Pack arrays with one row per SOMA vertex (sliced together onto a low-LOD rig).
+_PER_SOMA_VERTEX_KEYS = ("bary_face_ids", "bary_coords", "soma_wrap_vertices")
+
+
+def _model_data_at_rig_lod(model_data: dict, soma_data: dict) -> dict:
+    """Bring a pack built on the full-resolution SOMA mesh onto a low-LOD rig.
+
+    Upstream computes a low-LOD backend's correspondence on the low-LOD subset
+    of the SOMA wrap; every wrap vertex's embedding is independent, so indexing
+    the full-resolution one by ``lod_mid_to_low`` is the same thing.
+    """
+    n_rig = int(np.asarray(soma_data["v_template"]).shape[0])
+    lod_idx = soma_data.get("lod_mid_to_low")
+    n_mid = soma_data.get("lod_mid_num_verts")
+    out = dict(model_data)
+    for key in _PER_SOMA_VERTEX_KEYS:
+        if key not in out or np.asarray(out[key]).shape[0] == n_rig:
+            continue
+        n = np.asarray(out[key]).shape[0]
+        if lod_idx is None or n_mid is None or n != int(n_mid):
+            raise ValueError(
+                f"identity pack '{key}' covers {n} SOMA vertices but this rig has "
+                f"{n_rig}; rebuild the pack for this rig (tools/pipeline/build_identity_packs.py)")
+        out[key] = np.asarray(out[key])[np.asarray(lod_idx, dtype=np.int64)]
+    if out.get("laplacian_constrained_ids") is not None and n_mid is not None \
+            and lod_idx is not None and int(n_mid) != n_rig:
+        inv = np.full((int(n_mid),), -1, dtype=np.int64)
+        inv[np.asarray(lod_idx, dtype=np.int64)] = np.arange(n_rig)
+        ids = inv[np.asarray(out["laplacian_constrained_ids"]).astype(np.int64).ravel()]
+        out["laplacian_constrained_ids"] = ids[ids >= 0]
+    return out
+
+
 class BaseIdentityModel(ABC):
     """Abstract base class for SOMA identity models."""
 
     #: Native unit of the model (before conversion to meters)
     native_unit: Unit = Unit.METERS
+
+    #: Optional override of the Laplacian-solved vertex set (see
+    #: :meth:`_laplacian_free_ids`); backends without one keep ``None``.
+    _laplacian_constrained_ids = None
+    #: The backend's SOMA wrap (native units) that upstream builds the Laplacian
+    #: blend on; ``None`` falls back to the SOMA template.
+    _laplacian_reference = None
 
     def __init__(self, soma_data: dict, model_data: dict | None = None):
         """
@@ -66,7 +106,19 @@ class BaseIdentityModel(ABC):
         self._laplacian_mesh = None
 
         if model_data is not None:
+            model_data = _model_data_at_rig_lod(model_data, soma_data)
             self._load_model(model_data)
+            if model_data.get("soma_wrap_vertices") is not None:
+                self._laplacian_reference = np.asarray(
+                    model_data["soma_wrap_vertices"], dtype=np.float32)
+            bary = getattr(self, "_bary_coords", None)
+            if bary is not None and bary.shape[-1] == 3:
+                warnings.warn(
+                    f"{type(self).__name__}: the identity pack has triangle (3-weight) "
+                    "coordinates, which project the SOMA wrap onto the source surface; "
+                    "upstream embeds it in tetrahedra, and the two differ by up to ~2 cm. "
+                    "Rebuild the pack with tools/pipeline/build_identity_packs.py.",
+                    stacklevel=3)
 
     @abstractmethod
     def _load_model(self, model_data: dict) -> None:
@@ -146,9 +198,13 @@ class BaseIdentityModel(ABC):
 
         Barycentric transfer cannot produce eye-bag / mouth-bag vertices,
         because the source mesh has no geometry there. Upstream re-solves them
-        so they keep the SOMA template's Laplacian coordinates while joining
-        smoothly onto the surrounding transferred surface
-        (`soma/identity_model.py`: ``self._laplacian_mesh.solve(soma_verts)``).
+        so they keep the Laplacian coordinates of the backend's SOMA wrap (the
+        SOMA topology fitted to that backend's mesh) while joining smoothly onto
+        the surrounding transferred surface (`soma/identity_model.py`:
+        ``LaplacianMesh(V_soma, ...)`` then ``self._laplacian_mesh.solve``).
+        Packs carry that wrap as ``soma_wrap_vertices``; older packs fall back
+        to the SOMA template, a different body, which moved the solved
+        vertices by up to ~2 cm.
 
         The :class:`~soma_jax.geometry.laplacian.LaplacianMesh` is built on
         first use and cached — assembly and factorisation depend only on the
@@ -175,7 +231,15 @@ class BaseIdentityModel(ABC):
             # solved vertices toward the origin. Convert the template into the
             # same unit as the vertices being solved. (The cotangent weights
             # themselves are scale-invariant, so only btilde is affected.)
-            v_ref = np.asarray(self.soma_v_template) / self.native_unit.meters_per_unit
+            if self._laplacian_reference is not None:
+                v_ref = self._laplacian_reference
+            else:
+                warnings.warn(
+                    f"{type(self).__name__}: the identity pack has no 'soma_wrap_vertices', "
+                    "so the eye/mouth-bag blend is referenced to the SOMA template rather "
+                    "than this backend's wrap as upstream does (up to ~2 cm apart). Rebuild "
+                    "the pack with tools/pipeline/build_identity_packs.py.", stacklevel=4)
+                v_ref = np.asarray(self.soma_v_template) / self.native_unit.meters_per_unit
             # First use can happen under jit/grad/vmap. Build eagerly so the
             # cache holds concrete arrays: built inside the trace, it would
             # keep tracers and every later call would raise

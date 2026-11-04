@@ -80,8 +80,9 @@ def main():
             print(f"  [{name}] {src} missing — skipping")
             continue
         pk = dict(np.load(src, allow_pickle=False))
-        pk["bary_face_ids"] = pk["bary_face_ids"][:n_low]
-        pk["bary_coords"] = pk["bary_coords"][:n_low]
+        for key in ("bary_face_ids", "bary_coords", "soma_wrap_vertices"):
+            if key in pk:
+                pk[key] = pk[key][:n_low]
         np.savez(out / f"identity_{name}.npz", **pk)
         print(f"  wrote {out/f'identity_{name}.npz'}")
 
