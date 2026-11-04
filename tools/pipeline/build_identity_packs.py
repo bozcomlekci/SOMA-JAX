@@ -8,7 +8,9 @@ Output: one .npz per backend with the keys soma_jax's identity_model.py expects:
     shapedirs       (V_src, 3, K)
     faces           (F_src, 3)
     bary_face_ids   (V_canonical,)
-    bary_coords     (V_canonical, 3)
+    bary_coords     (V_canonical, 4)   tetrahedral, as upstream
+    soma_wrap_vertices (V_canonical, 3)   Laplacian-blend reference (MHR, garment)
+    eigenvalues     (K,)               garment: coefficient scaling
 
 The wrap .obj is loaded the same way SOMA-X loads it (`maintain_order=True,
 process=False`). Per investigation of NVlabs/SOMA-X (soma/identity_model.py:274-287,

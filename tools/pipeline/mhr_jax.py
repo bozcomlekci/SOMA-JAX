@@ -179,8 +179,11 @@ def mhr_soma_rest(rig: dict, identity_pack, identity_coeffs=None, scale_params=N
     faces = np.asarray(identity_pack["faces"])
     fid = np.asarray(identity_pack["bary_face_ids"])
     bary = np.asarray(identity_pack["bary_coords"])
-    tri = mhr_cm[faces[fid]]                          # (V_soma, 3, 3)
-    soma_cm = (bary[..., None] * tri).sum(axis=1)     # (V_soma, 3)
+    # (N, 4) tetrahedral coordinates (current packs, as upstream) or (N, 3).
+    from soma_jax.geometry.barycentric_interp import barycentric_interpolate
+    soma_cm = np.asarray(barycentric_interpolate(
+        jnp.asarray(mhr_cm, jnp.float32)[None], jnp.asarray(faces), jnp.asarray(fid),
+        jnp.asarray(bary, jnp.float32)))[0]           # (V_soma, 3)
     return (soma_cm * 0.01).astype(np.float32)        # cm -> m (MHR native_unit)
 
 

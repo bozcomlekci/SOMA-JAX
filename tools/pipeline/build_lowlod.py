@@ -64,11 +64,13 @@ def main():
     real = ~np.array(["End" in str(n) or "Eye" in str(n) for n in hf["joint_names"]])
     print(f"  low-LOD J_regressor fit (body joints): max {err[real].max():.3f} cm")
 
-    soma_low = dict(full)
-    soma_low["v_template"] = full["v_template"][:n_low].astype(np.float32)
-    soma_low["weights"] = full["weights"][:n_low].astype(np.float32)
-    soma_low["shapedirs"] = full["shapedirs"][:n_low].astype(np.float32)
-    soma_low["faces"] = faces_low
+    # Slice every per-vertex array and remap the vertex-index lists (eye/mouth
+    # bags, mirror map) the way SOMALayer(lod="low") does, so the archive
+    # loads as a consistent low-LOD layer; then swap in the refitted regressor.
+    from soma_jax.soma import _slice_rig_to_low_lod
+    full.setdefault("lod_mid_to_low", lod.astype(np.int32))
+    full.setdefault("triangles_low", faces_low)
+    soma_low = _slice_rig_to_low_lod(full)
     soma_low["J_regressor"] = Jreg_low.astype(np.float32)
     np.savez(out / "SOMA_neutral.npz", **soma_low)
     print(f"  wrote {out/'SOMA_neutral.npz'}")
