@@ -318,10 +318,15 @@ def rotation_from_covariance(
 
     # JAX's `jnp.where` evaluates BOTH branches; if either path computes SVD
     # on a degenerate matrix it produces NaN gradients even when masked out.
-    # Feed the SVD a safe identity placeholder on the degenerate path so the
-    # JVP stays finite.
+    # A placeholder for such a branch must have *distinct* singular values —
+    # the identity is exactly the case SVD's backward pass divides by zero on.
     if method == "kabsch":
-        return _kabsch_svd(H)
+        # An all-zero H (no support) rotates to the identity — what the SVD
+        # returns for it — but its SVD backward pass is NaN; route it around.
+        zero = jnp.all(H == 0, axis=(-2, -1))[..., None, None]
+        distinct = jnp.broadcast_to(jnp.diag(jnp.array([3.0, 2.0, 1.0], dtype=H.dtype)), H.shape)
+        R = _kabsch_svd(jnp.where(zero, distinct, H))
+        return jnp.where(zero, jnp.broadcast_to(jnp.eye(3, dtype=H.dtype), H.shape), R)
 
     if method == "auto":
         H = regularize_covariance_with_reference(
@@ -330,15 +335,22 @@ def rotation_from_covariance(
     elif method != "newton-schulz":
         raise ValueError(f"Unknown method: {method}. Use 'auto', 'kabsch', or 'newton-schulz'.")
 
-    # Guard the SVD fallback against an all-zero covariance: jnp.where evaluates
-    # both branches, and an SVD of a degenerate matrix poisons the JVP with NaN.
-    H_norm = jnp.linalg.norm(H, axis=(-2, -1), keepdims=True)
-    degenerate = H_norm < eps * 100
-    I3 = jnp.broadcast_to(jnp.eye(3, dtype=H.dtype), H.shape)
-    safe_H = jnp.where(degenerate, I3, H)
-
     R = newton_schulz(H, num_iter=NEWTON_SCHULZ_ITERS, eps=eps)
     valid = rotation_matrices_are_valid(R)
+
+    # The Kabsch fallback is evaluated for every element (jnp.where computes
+    # both branches), and SVD's backward pass divides by sigma_i^2 - sigma_j^2:
+    # an input with repeated singular values yields 0 * inf = NaN even where
+    # the branch is discarded. So wherever the fallback is not used — Newton-
+    # Schulz succeeded, or H is (near) zero — feed it a constant with distinct
+    # singular values. diag(3, 2, 1) also Kabsch-rotates to the identity, the
+    # degenerate case's answer, so the forward result is unchanged; only the
+    # gradient stops being NaN (upstream's gauge-regularized "auto" path lands
+    # in exactly these repeated-singular-value cases).
+    H_norm = jnp.linalg.norm(H, axis=(-2, -1), keepdims=True)
+    unused = (H_norm < eps * 100) | valid[..., None, None]
+    distinct = jnp.broadcast_to(jnp.diag(jnp.array([3.0, 2.0, 1.0], dtype=H.dtype)), H.shape)
+    safe_H = jnp.where(unused, distinct, H)
     return jnp.where(valid[..., None, None], R, _kabsch_svd(safe_H))
 
 
@@ -581,8 +593,20 @@ def regularize_covariance_with_reference(
     ``rank_threshold``), pinning the otherwise-arbitrary rotation in the
     unconstrained subspace to ``reference_rotation`` (identity by default).
     """
-    prior_scale = jnp.maximum(jnp.max(jnp.sum(jnp.abs(H), axis=-1), axis=-1), eps)
-    volume_score = jnp.abs(jnp.linalg.det(H)) / prior_scale ** 3
+    row_max = jnp.max(jnp.sum(jnp.abs(H), axis=-1), axis=-1)
+    prior_scale = jnp.maximum(row_max, eps)
+    # Two float32 traps in the backward pass, both hit by the vectorized
+    # skeleton fit, which builds an all-zero H for joints without support
+    # (their rotation is overridden afterwards, but NaN survives jnp.where):
+    # det's gradient is NaN at the zero matrix, and below the floor the
+    # quotient rule for |det| / prior_scale**3 needs prior_scale**6 = 1e-48,
+    # which underflows to 0. The forward values are untouched: det of a zero
+    # matrix is 0, and a floored prior_scale is the constant eps anyway.
+    zero = jnp.all(H == 0, axis=(-2, -1))
+    eye = jnp.broadcast_to(jnp.eye(3, dtype=H.dtype), H.shape)
+    det = jnp.where(zero, 0.0, jnp.linalg.det(jnp.where(zero[..., None, None], eye, H)))
+    scale = jnp.where(row_max > eps, prior_scale, jax.lax.stop_gradient(prior_scale))
+    volume_score = jnp.abs(det) / scale ** 3
     rank_weight = jnp.clip((rank_threshold - volume_score) / rank_threshold, 0.0, 1.0)
     if reference_rotation is None:
         reference_rotation = jnp.broadcast_to(jnp.eye(3, dtype=H.dtype), H.shape)
