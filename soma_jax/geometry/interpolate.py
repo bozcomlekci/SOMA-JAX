@@ -68,6 +68,73 @@ _KERNELS = {
     "quintic": _quintic,
 }
 
+# NumPy twins of the kernels above, for the host-side setup path below.
+_NP_KERNELS = {
+    "thin_plate_spline": lambda r, eps=1e-10: (r * r) * np.log(r + eps),
+    "gaussian": lambda r, eps=0.1: np.exp(-((r / eps) ** 2)),
+    "multiquadric": lambda r, eps=0.1: np.sqrt(1.0 + (r / eps) ** 2),
+    "inverse_multiquadric": lambda r, eps=0.1: 1.0 / np.sqrt(1.0 + (r / eps) ** 2),
+    "inverse_quadratic": lambda r, eps=0.1: 1.0 / (1.0 + (r / eps) ** 2),
+    "linear": lambda r, eps=1e-10: r,
+    "cubic": lambda r, eps=1e-10: r ** 3,
+    "quintic": lambda r, eps=1e-10: r ** 5,
+}
+
+
+def rbf_basis_weights_np(
+    source_control_points: np.ndarray,
+    query_point: np.ndarray,
+    kernel: str = "linear",
+    kernel_params: Optional[Dict[str, Any]] = None,
+    include_polynomial: bool = True,
+) -> np.ndarray:
+    """Host-side ``RadialBasisFunction(...).get_basis_weights(query_point)``.
+
+    Same system, jitter and dtype as the JAX class (and as upstream, which
+    builds it once in float32 and LU-factors it with LAPACK ``getrf``), but
+    evaluated with NumPy/SciPy. This is setup work — run once per rig, never
+    traced or differentiated — and doing it as eager JAX ops recompiles every
+    op for every support-set size: ~1,100 XLA compilations, most of a minute,
+    to build one ``SkeletonTransfer``. On the host it also yields the same
+    weights on every machine, instead of cuSOLVER's on a GPU and LAPACK's on a
+    CPU.
+
+    Args:
+        source_control_points: ``(N, D)`` control points.
+        query_point: ``(D,)`` point to interpolate to.
+        kernel, kernel_params, include_polynomial: as for
+            :class:`RadialBasisFunction`.
+
+    Returns:
+        ``(N,)`` basis weights, in the dtype of ``source_control_points``.
+    """
+    import scipy.linalg
+
+    if kernel not in _NP_KERNELS:
+        raise ValueError(f"Unknown kernel '{kernel}'. Available: {list(_NP_KERNELS)}")
+    func = _NP_KERNELS[kernel]
+    params = kernel_params or {}
+    scp = np.asarray(source_control_points)
+    if scp.dtype not in (np.float32, np.float64):
+        scp = scp.astype(np.float32)
+    dtype = scp.dtype
+    q = np.asarray(query_point, dtype=dtype).reshape(-1)
+    N, D = scp.shape
+
+    diff = scp[:, None, :] - scp[None, :, :]
+    K = func(np.sqrt(np.sum(diff * diff, axis=-1)), **params).astype(dtype)
+    K += np.eye(N, dtype=dtype) * dtype.type(1e-8)       # conditioning jitter (SOMA-X)
+    if include_polynomial:
+        P = np.concatenate([np.ones((N, 1), dtype), scp], axis=1)          # (N, D+1)
+        A = np.block([[K, P], [P.T, np.zeros((D + 1, D + 1), dtype)]]).astype(dtype)
+    else:
+        A = K
+    lu_piv = scipy.linalg.lu_factor(A, check_finite=False)
+
+    dists = func(np.sqrt(np.sum((scp - q[None, :]) ** 2, axis=1)), **params).astype(dtype)
+    rhs = np.concatenate([dists, np.ones(1, dtype), q]) if include_polynomial else dists
+    return scipy.linalg.lu_solve(lu_piv, rhs.astype(dtype), check_finite=False)[:N]
+
 
 class RadialBasisFunction:
     """RBF interpolator with precomputed LU factorization.

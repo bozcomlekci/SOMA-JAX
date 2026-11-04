@@ -103,9 +103,42 @@ if _WARP_OK:
     _jax_kabsch = jax_kernel(_kabsch_kernel)
 
 
+def _jax_on_cuda() -> bool:
+    """True when JAX's default device is an NVIDIA GPU."""
+    try:
+        import jax
+        dev = jax.devices()[0]
+    except Exception:  # noqa: BLE001 — no usable backend at all
+        return False
+    if dev.platform != "gpu":
+        return False
+    version = str(getattr(dev.client, "platform_version", "") or "").lower()
+    return "rocm" not in version
+
+
 def is_available() -> bool:
-    """True when Warp imported and the hybrid kernel is usable."""
-    return _WARP_OK
+    """True when the hybrid kernel can actually run here.
+
+    That needs Warp importable **and** JAX on a CUDA GPU: Warp's XLA FFI
+    registers CUDA handlers only, so on the CPU backend the kernel fails at
+    run time ("No FFI handler registered ... on a platform Host").
+    """
+    return _WARP_OK and _jax_on_cuda()
+
+
+def unavailable_reason() -> str | None:
+    """Why :func:`is_available` is False (``None`` when it is True)."""
+    if not _WARP_OK:
+        return f"Warp could not be imported ({_IMPORT_ERROR!r}); pip install warp-lang"
+    if not _jax_on_cuda():
+        try:
+            import jax
+            backend = jax.default_backend()
+        except Exception:  # noqa: BLE001
+            backend = "unknown"
+        return (f"the Warp kernel runs only with JAX on a CUDA GPU (JAX backend here: "
+                f"{backend}); use rotation_backend='jax'")
+    return None
 
 
 def import_error() -> Exception | None:

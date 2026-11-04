@@ -28,7 +28,7 @@ from .transforms import (
     se3_from_rt,
 )
 from .rig_utils import get_joint_children_ids
-from .interpolate import RadialBasisFunction
+from .interpolate import RadialBasisFunction, rbf_basis_weights_np
 
 
 def _build_rbf_regressors(
@@ -179,15 +179,15 @@ class SkeletonTransfer:
                 "see soma_jax/geometry/warp_kabsch.py.")
         self._warp_kabsch = None
         if rotation_backend == "warp":
-            from .warp_kabsch import kabsch_rotation_warp, is_available
+            from .warp_kabsch import is_available, kabsch_rotation_warp, unavailable_reason
             if not is_available():
                 raise RuntimeError(
-                    "rotation_backend='warp' but Warp is unavailable; "
-                    "pip install warp-lang.")
+                    f"rotation_backend='warp' is unavailable: {unavailable_reason()}.")
             self._warp_kabsch = kabsch_rotation_warp
 
         self.regressor_mask: Optional[np.ndarray] = None
-        self.joint_pos_regressors: list[Optional[RadialBasisFunction]] = []
+        self._regressor_support: list[Optional[np.ndarray]] = []
+        self._joint_pos_regressors: Optional[list[Optional[RadialBasisFunction]]] = None
         self._sparse_rbf_matrix: Optional[jnp.ndarray] = None
         self._precompute_regressors()
         self._precompute_rotation_fit()
@@ -250,22 +250,14 @@ class SkeletonTransfer:
             regressor_mask[self.vertex_ids_to_exclude] = False
         self.regressor_mask = regressor_mask
 
-        # Build RBF per joint (skip Root — its position is read from bind).
-        bind_shape = self.bind_shape
-        regressors: list[Optional[RadialBasisFunction]] = [None]
-        for j in range(1, self.num_joints):
-            ids = np.where(regressor_mask[:, j])[0]
-            if len(ids) == 0:
-                regressors.append(None)
-                continue
-            regressors.append(
-                RadialBasisFunction(
-                    jnp.asarray(bind_shape[ids]),
-                    kernel=self.rbf_kernel,
-                    include_polynomial=True,
-                )
-            )
-        self.joint_pos_regressors = regressors
+        # One RBF regressor per joint over its support (Root has none — its
+        # position is read from bind). The per-joint `RadialBasisFunction`
+        # objects are only needed by the non-matrix fit path, so they are built
+        # on first use (`joint_pos_regressors`); each holds an LU factorisation
+        # of its support system, hundreds of MiB in total for the SOMA rig.
+        self._regressor_support = [None] + [
+            np.where(regressor_mask[:, j])[0] for j in range(1, self.num_joints)]
+        self._joint_pos_regressors = None
 
         if not self.use_sparse_rbf_matrix:
             self._sparse_rbf_matrix = None
@@ -274,18 +266,34 @@ class SkeletonTransfer:
         # Dense (J, V) basis-weight matrix so that
         # ``new_joints = sparse_rbf_matrix @ target_shape``  recovers all
         # joint positions in one matmul. The Root row stays zero; we splice
-        # in the bind Root position at call time.
+        # in the bind Root position at call time. Built on the host — see
+        # `rbf_basis_weights_np` for why this setup step is not JAX.
+        bind_shape = self.bind_shape
         J = self.num_joints
         V = bind_shape.shape[0]
         mat = np.zeros((J, V), dtype=np.float32)
-        for j, rbf in enumerate(regressors):
-            if rbf is None:
+        for j, ids in enumerate(self._regressor_support):
+            if ids is None or len(ids) == 0:
                 continue
             query = self.bind_world_transforms[j, :3, 3].astype(np.float32)
-            w = np.asarray(rbf.get_basis_weights(jnp.asarray(query)))
-            ids = np.where(regressor_mask[:, j])[0]
-            mat[j, ids] = w
+            mat[j, ids] = rbf_basis_weights_np(
+                bind_shape[ids], query, kernel=self.rbf_kernel, include_polynomial=True)
         self._sparse_rbf_matrix = jnp.asarray(mat)
+
+    @property
+    def joint_pos_regressors(self) -> list[Optional[RadialBasisFunction]]:
+        """Per-joint :class:`RadialBasisFunction` regressors (``None`` for Root
+        and for joints without support), built on first access."""
+        if self._joint_pos_regressors is None:
+            self._joint_pos_regressors = [
+                None if ids is None or len(ids) == 0 else RadialBasisFunction(
+                    jnp.asarray(self.bind_shape[ids]),
+                    kernel=self.rbf_kernel,
+                    include_polynomial=True,
+                )
+                for ids in self._regressor_support
+            ]
+        return self._joint_pos_regressors
 
     # ------------------------------------------------------------------
     # Position fitting
