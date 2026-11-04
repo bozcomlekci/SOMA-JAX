@@ -123,6 +123,7 @@ contain any model data. One command fetches whatever this checkout lacks:
 ```bash
 python tools/download_assets.py            # everything (~1.2 GB if no LFS data arrived)
 python tools/download_assets.py --minimal  # only what from_upstream_assets() needs (~370 MB)
+python tools/download_assets.py --only Anny/base_body.obj Anny/SOMA_wrap.obj   # just these
 python tools/download_assets.py --check    # report, download nothing
 ```
 

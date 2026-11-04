@@ -21,8 +21,10 @@ def need_assets(*names: str) -> None:
     from soma_jax.assets import resolve
     missing = [n for n in names if resolve(n, required=False) is None]
     if missing:
+        fetch = ("--minimal" if set(missing) <= set(UPSTREAM_ASSETS)
+                 else "--only " + " ".join(missing))
         pytest.skip(f"assets missing: {', '.join(missing)} "
-                    "(python tools/download_assets.py --minimal)")
+                    f"(python tools/download_assets.py {fetch})")
 
 
 def need_module(name: str):

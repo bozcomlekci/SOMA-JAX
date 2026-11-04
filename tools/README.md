@@ -59,7 +59,7 @@ apart — float32 is the fair comparison.
 | Script | Purpose |
 |---|---|
 | `audit_soma_features.py` | Audit feature parity of SOMA-JAX vs upstream SOMA-X. |
-| `download_assets.py` | Fetch what the checkout lacks into `assets/third_party/`: the full-schema rig from HuggingFace, plus any submodule asset that is missing or a Git LFS pointer stub (from the pinned upstream commit). Standard library only — runs before JAX is installed; every file sha256-verified. `--minimal` fetches only what `SOMALayer.from_upstream_assets()` needs; `--check` reports. |
+| `download_assets.py` | Fetch what the checkout lacks into `assets/third_party/`: the full-schema rig from HuggingFace, plus any submodule asset that is missing or a Git LFS pointer stub (from the pinned upstream commit). Standard library only — runs before JAX is installed; every file sha256-verified. `--minimal` fetches only what `SOMALayer.from_upstream_assets()` needs, `--only FILE...` just the named files; `--check` reports. |
 | `_common.py` | Helpers the scripts share (not a CLI): `ensure_headless_gl()` picks EGL/OSMesa for pyrender when there is no display; `load_layer()` builds a layer from no asset (resolved upstream files), NVIDIA's `SOMA_neutral.npz`, or a SOMA-JAX archive. |
 
 ## selftest/ — portable install check

@@ -40,6 +40,7 @@ Usage::
     python tools/download_assets.py              # -> assets/third_party/
     python tools/download_assets.py --minimal    # only what SOMALayer.from_upstream_assets() needs
     python tools/download_assets.py --check      # report what is missing, download nothing
+    python tools/download_assets.py --only Anny/base_body.obj Anny/SOMA_wrap.obj
     python tools/download_assets.py --force
 """
 from __future__ import annotations
@@ -118,6 +119,10 @@ def parse_args():
                         f"({', '.join(MINIMAL_FILES)})")
     p.add_argument("--no-lfs", action="store_true",
                    help="do not fetch submodule files that are missing or Git LFS stubs")
+    p.add_argument("--only", nargs="+", metavar="FILE", default=None,
+                   help="fetch (or --check) just these relative paths, e.g. "
+                        "Anny/base_body.obj — any required asset or any file of the "
+                        "pinned submodule, such as example_animation.npy")
     return p.parse_args()
 
 
@@ -338,7 +343,16 @@ def check(files) -> int:
 
 def main():
     args = parse_args()
-    files = MINIMAL_FILES if args.minimal else A.REQUIRED_FILES
+    if args.only:
+        known = (set(A.REQUIRED_FILES) | set(A.SOMA_X_ASSET_FILES)
+                 | {name for name, _, _, _ in HF_DOWNLOADS})
+        unknown = [f for f in args.only if f not in known]
+        if unknown:
+            sys.exit(f"unknown asset(s): {', '.join(unknown)}\n"
+                     f"choose from: {', '.join(sorted(known))}")
+        files = tuple(dict.fromkeys(args.only))
+    else:
+        files = MINIMAL_FILES if args.minimal else A.REQUIRED_FILES
     if args.check:
         sys.exit(check(files))
 
@@ -397,8 +411,10 @@ def main():
               f"export {A.ASSETS_ENV_VAR}={out_dir.resolve()}")
     if failures:
         sys.exit(f"FAILED: {', '.join(failures)}")
-    print("All requested assets are in place. SOMALayer.from_upstream_assets() "
-          "needs nothing else (docs/INSTALL.md §4.2 is optional).")
+    print("All requested assets are in place.")
+    if all(_status(rel)[0] == "ok" for rel in MINIMAL_FILES):
+        print("SOMALayer.from_upstream_assets() needs nothing else "
+              "(docs/INSTALL.md §4.2 is optional).")
 
 
 if __name__ == "__main__":

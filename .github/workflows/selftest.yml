@@ -69,9 +69,15 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: assets/third_party
-          key: soma-assets-minimal-${{ hashFiles('soma_jax/assets.py', 'tools/download_assets.py') }}
+          key: soma-assets-v2-${{ runner.os }}-${{ hashFiles('soma_jax/assets.py', 'tools/download_assets.py') }}
+      # What from_upstream_assets() needs plus the Anny / GarmentMeasurements
+      # packs the identity-backend tests use — not the 696 MB MHR model.
       - name: Fetch assets (stdlib only, before any install)
-        run: python tools/download_assets.py --minimal
+        run: >-
+          python tools/download_assets.py --only SOMA_neutral.npz SOMA_template_rig.usda
+          SOMA_procedural_transforms.json Anny/base_body.obj Anny/SOMA_wrap.obj
+          GarmentMeasurements/mean.obj GarmentMeasurements/SOMA_wrap.obj
+          GarmentMeasurements/point.npz
       - name: Headless OpenGL (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libegl1 libegl-mesa0
@@ -94,9 +100,13 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: assets/third_party
-          key: soma-assets-minimal-${{ hashFiles('soma_jax/assets.py', 'tools/download_assets.py') }}
+          key: soma-assets-v2-${{ runner.os }}-${{ hashFiles('soma_jax/assets.py', 'tools/download_assets.py') }}
       - name: Fetch assets
-        run: python tools/download_assets.py --minimal
+        run: >-
+          python tools/download_assets.py --only SOMA_neutral.npz SOMA_template_rig.usda
+          SOMA_procedural_transforms.json Anny/base_body.obj Anny/SOMA_wrap.obj
+          GarmentMeasurements/mean.obj GarmentMeasurements/SOMA_wrap.obj
+          GarmentMeasurements/point.npz
       - name: Install the dependency floors
         run: |
           python -m pip install uv
