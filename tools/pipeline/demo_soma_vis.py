@@ -989,7 +989,7 @@ def main():
                 # all SOMA-family identities, exactly like SOMA-X.
                 bvh_correctives = None
                 cpath = Path(args.hf_dir) / "correctives_model.pt"
-                if cpath.exists():
+                if cpath.exists() and correctives is not None:   # loaded above, torch present
                     import correctives_jax as cj
                     bvh_correctives = cj.load_correctives(str(cpath), soma_x_rig["parents"])
                     print(f"  Loaded unified pose correctives ({bvh_correctives['n_vertices']} verts)")
