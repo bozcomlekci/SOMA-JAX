@@ -338,7 +338,7 @@ def data_root(materialise: bool = True) -> Path:
             # Drop a link left from an earlier run (it may point at an LFS
             # stub or a file that has since gone); upstream must not load it.
             if dst.is_symlink():
-                dst.unlink()
+                dst.unlink(missing_ok=True)
             continue
         if dst.is_symlink() or dst.exists():
             try:
@@ -350,13 +350,17 @@ def data_root(materialise: bool = True) -> Path:
                     continue                       # an up-to-date copy
             except OSError:
                 pass
-            dst.unlink()
+            dst.unlink(missing_ok=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             dst.symlink_to(src)
+        except FileExistsError:    # another process (e.g. pytest -n) got there first
+            pass
         except OSError:            # e.g. Windows without symlink privilege
             try:
                 os.link(src, dst)  # same volume: no privilege needed, no bytes copied
+            except FileExistsError:
+                pass
             except OSError:
                 import shutil
                 shutil.copy2(src, dst)

@@ -213,10 +213,13 @@ def test_barycentric_transfer_reproduces_surface_points():
     mesh = trimesh.creation.icosphere(subdivisions=2)
     verts, faces = np.asarray(mesh.vertices, np.float32), np.asarray(mesh.faces)
     query = verts[::5] * 0.999
-    try:
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         face_ids, coords = compute_barycentric_coords(query, verts, faces)
-    except ModuleNotFoundError as e:       # trimesh < 5 needs rtree for proximity
-        pytest.fail(f"{e} — install the 'vis' extra (it carries rtree)")
+    fallback = [w for w in caught if "closest-face search unavailable" in str(w.message)]
+    if fallback:   # trimesh is here but its proximity query is not (no rtree)
+        pytest.fail(f"{fallback[0].message} — the 'vis' extra installs rtree")
     got = np.asarray(barycentric_interpolate(jnp.asarray(verts), jnp.asarray(faces),
                                              jnp.asarray(face_ids), jnp.asarray(coords)))
     np.testing.assert_allclose(got, query, atol=2e-2)
