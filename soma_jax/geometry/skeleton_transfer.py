@@ -295,6 +295,11 @@ class SkeletonTransfer:
             ]
         return self._joint_pos_regressors
 
+    @joint_pos_regressors.setter
+    def joint_pos_regressors(self, regressors) -> None:
+        # Kept assignable: this used to be a plain attribute.
+        self._joint_pos_regressors = regressors
+
     # ------------------------------------------------------------------
     # Position fitting
     # ------------------------------------------------------------------
