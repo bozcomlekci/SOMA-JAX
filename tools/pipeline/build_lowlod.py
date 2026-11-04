@@ -10,10 +10,11 @@ Outputs (default assets/lowlod/):
     identity_{mhr,anny,garment}.npz   identity packs with bary sliced to low-LOD SOMA verts
 
 Usage::
-    python tools/build_lowlod.py
+    python tools/pipeline/build_lowlod.py
 """
 from __future__ import annotations
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 
@@ -27,10 +28,18 @@ def main():
     # how they were obtained, and resolve() knows both.
     from soma_jax.assets import resolve
     p.add_argument("--hf", default=str(resolve("SOMA_neutral.npz", required=False) or ""))
-    p.add_argument("--soma", default="SOMA_neutral.npz")
+    p.add_argument("--soma", default="assets/SOMA_neutral_fixed.npz",
+                   help="SOMA-JAX archive to slice (docs/INSTALL.md section 4.2 bakes it)")
     p.add_argument("--identity-dir", default="assets/identity")
     p.add_argument("--out-dir", default="assets/lowlod")
     args = p.parse_args()
+    if not Path(args.soma).exists():
+        sys.exit(f"{args.soma} not found: --soma takes a SOMA-JAX archive such as "
+                 "assets/SOMA_neutral_fixed.npz, which docs/INSTALL.md section 4.2 bakes. "
+                 "(SOMALayer.from_upstream_assets(lod='low') needs no archive.)")
+    if not args.hf:
+        sys.exit("NVIDIA's SOMA_neutral.npz was not found; fetch it with "
+                 "python tools/download_assets.py, or pass --hf.")
 
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     hf = dict(np.load(args.hf, allow_pickle=True))

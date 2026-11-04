@@ -17,13 +17,13 @@ two retargeting directions soma_jax already supports end-to-end:
 
 Usage::
 
-    python tools/pose_converter.py smplx-to-soma \\
+    python tools/pipeline/pose_converter.py smplx-to-soma \\
         --smplx-motion path/to/motion.npz \\
         --smplx-model  data/smplx/SMPLX_NEUTRAL.npz \\
         --soma-model   assets/SOMA_neutral_fixed.npz \\
         --output       out_soma.npz
 
-    python tools/pose_converter.py soma-to-smplx \\
+    python tools/pipeline/pose_converter.py soma-to-smplx \\
         --soma-motion  out_soma.npz \\
         --smplx-model  data/smplx/SMPLX_NEUTRAL.npz \\
         --soma-model   assets/SOMA_neutral_fixed.npz \\
@@ -38,9 +38,13 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tools"))          # _common
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.pop("LD_LIBRARY_PATH", None)
 
+
+_SOMA_MODEL_HELP = ("SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
+                    "(default: build from the resolved upstream assets)")
 
 def _cmd_smplx_to_soma(args):
     """Retarget an SMPL-X motion clip onto the SOMA 78-joint skeleton via
@@ -57,8 +61,8 @@ def _cmd_smplx_to_soma(args):
          root translation, joint names, and per-vertex fit error.
     """
     import motion_pipeline as mp
-    from soma_jax import SOMALayer
-    layer = SOMALayer.load(args.soma_model, identity_model_type="soma")
+    from _common import load_layer
+    layer = load_layer(args.soma_model, identity_model_type="soma")
     smplx = mp.load_smplx_jax(args.smplx_model)
     motion = mp.load_smplx_motion(args.smplx_motion, num_frames=args.num_frames)
     poses, extras = mp.smplx_motion_to_soma_poses(
@@ -93,14 +97,14 @@ def _cmd_soma_to_smplx(args):
     """
     import motion_pipeline as mp
     from soma_to_smplx import smplx_poses_from_soma_world
-    from soma_jax import SOMALayer
+    from _common import load_layer
     import jax, jax.numpy as jnp
 
     soma_motion = dict(np.load(args.soma_motion, allow_pickle=False))
     poses_aa = soma_motion["poses"]                    # (T, 78, 3) axis-angle
     transl   = soma_motion["root_translation"]         # (T, 3)
     soma_names = list(soma_motion["joint_names"])
-    layer = SOMALayer.load(args.soma_model, identity_model_type="soma")
+    layer = load_layer(args.soma_model, identity_model_type="soma")
     smplx = mp.load_smplx_jax(args.smplx_model)
 
     # Build SOMA per-frame world rotations via FK; we need them to feed the
@@ -177,8 +181,10 @@ def main():
     s1 = sub.add_parser("smplx-to-soma", help="SMPL-X motion -> SOMA poses")
     s1.add_argument("--smplx-motion", required=True)
     s1.add_argument("--smplx-model", required=True)
-    s1.add_argument("--soma-model", required=True)
-    s1.add_argument("--hf-dir", default=str(REPO / "assets" / "hf"))
+    s1.add_argument("--soma-model", default=None, help=_SOMA_MODEL_HELP)
+    s1.add_argument("--hf-dir", default=None,
+                    help="asset root holding SMPLX/SOMA_wrap.obj (default: resolved via "
+                         "soma_jax.assets)")
     s1.add_argument("--refine-iters", type=int, default=0)
     s1.add_argument("--num-frames", type=int, default=None)
     s1.add_argument("--output", required=True)
@@ -187,7 +193,7 @@ def main():
     s2 = sub.add_parser("soma-to-smplx", help="SOMA poses -> SMPL-X poses")
     s2.add_argument("--soma-motion", required=True)
     s2.add_argument("--smplx-model", required=True)
-    s2.add_argument("--soma-model", required=True)
+    s2.add_argument("--soma-model", default=None, help=_SOMA_MODEL_HELP)
     s2.add_argument("--output", required=True)
     s2.set_defaults(func=_cmd_soma_to_smplx)
 

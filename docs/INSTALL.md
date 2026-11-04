@@ -81,16 +81,18 @@ python tools/download_assets.py --output-dir "$SOMA_JAX_ASSETS"
 ### SMPL-JAX (optional)
 
 `tools/pipeline/` and two test modules (`test_body_model_io.py`'s cross-check,
-`test_motion_retarget.py`) import **`smpl_jax`**. It is not on PyPI under that
+`test_motion_retarget.py`) use **`smpl_jax`**. It is not on PyPI under that
 name here — install the submodule:
 
 ```bash
 pip install -e third_party/SMPL-JAX
 ```
 
-Without it those tools raise `ImportError` and the two test modules skip
-(`pytest.importorskip`), which is part of the gap between the minimal and full
-test runs in §5.
+Without it the `tools/pipeline/` scripts fall back to `soma_jax.body_models`,
+which gives bit-identical SMPL / SMPL-X vertices and joints, so they work on a
+plain install; the two test modules skip (`pytest.importorskip`), which is part
+of the gap between the minimal and full test runs in §5. Either way the SMPL
+family's model files are registration-only and are not fetched for you.
 
 By default `pip` installs the **CPU** build of JAX. For NVIDIA GPUs install a
 CUDA build instead (see the [JAX install guide](https://docs.jax.dev/en/latest/installation.html)

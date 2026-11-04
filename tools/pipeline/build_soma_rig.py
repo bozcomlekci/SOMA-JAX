@@ -37,13 +37,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--hf", default=None,
                    help="full-schema SOMA_neutral.npz (default: resolved via soma_jax.assets)")
-    p.add_argument("--local", default="SOMA_neutral.npz")
+    p.add_argument("--local", default="SOMA_neutral.npz",
+                   help="existing SOMA-JAX archive whose J_regressor is replaced (to bake "
+                        "one from NVIDIA's assets, follow docs/INSTALL.md section 4.2)")
     p.add_argument("--out", default="assets/SOMA_neutral_fixed.npz")
     args = p.parse_args()
     if args.hf is None:
         from soma_jax.assets import resolve
         args.hf = str(resolve("SOMA_neutral.npz"))
 
+    if not _Path(args.local).exists():
+        _sys.exit(f"{args.local} not found: --local takes an existing SOMA-JAX archive to "
+                 "patch. To bake one from NVIDIA's assets, follow docs/INSTALL.md section 4.2.")
     hf = dict(np.load(args.hf, allow_pickle=True))
     local = dict(np.load(args.local, allow_pickle=True))
 

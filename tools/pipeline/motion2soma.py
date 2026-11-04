@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # _common
 
 
 def main():
@@ -36,7 +37,9 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", required=True, help="Source SMPL-X motion (.npz)")
     p.add_argument("--output-npz", required=True, help="Output SOMA-format .npz")
-    p.add_argument("--soma-model", default="SOMA_neutral.npz")
+    p.add_argument("--soma-model", default=None,
+                   help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
+                        "(default: build from the resolved upstream assets)")
     p.add_argument("--smplx-model", default="data/smplx/SMPLX_NEUTRAL.npz")
     p.add_argument("--hf-dir", default=None,
                    help="asset root (default: resolved via soma_jax.assets)")
@@ -47,7 +50,7 @@ def main():
     args = p.parse_args()
 
     import motion_pipeline as mp
-    from soma_jax import SOMALayer
+    from _common import load_layer
 
     # Use all frames unless subsampling requested.
     if args.num_frames > 0:
@@ -58,7 +61,7 @@ def main():
     print(f"Loaded {args.input}: {motion['n_frames']} frames")
 
     smplx = mp.load_smplx_jax(args.smplx_model)
-    soma = SOMALayer.load(args.soma_model, identity_model_type="soma")
+    soma = load_layer(args.soma_model, identity_model_type="soma")
 
     mode = f"analytical+{args.autograd_iters} autograd FK" if args.autograd_iters else "analytical"
     print(f"Retargeting → SOMA skeleton (inverse-LBS, {mode})...")

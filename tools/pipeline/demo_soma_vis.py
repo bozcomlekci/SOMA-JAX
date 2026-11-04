@@ -98,7 +98,7 @@ def parse_args():
                    help="Use low-LOD SOMA assets (SOMA-X low_lod) from --lowlod-dir "
                         "for the SOMA-family columns")
     p.add_argument("--lowlod-dir", default="assets/lowlod",
-                   help="Directory of low-LOD assets (from tools/build_lowlod.py)")
+                   help="Directory of low-LOD assets (from tools/pipeline/build_lowlod.py)")
     p.add_argument("--target-fps", type=float, default=None,
                    help="When driving from a BVH, pick num_frames so the GIF plays at this rate "
                         "(default: auto-cap source FPS to 30). Overrides --num-frames.")
@@ -141,7 +141,7 @@ def _pose_smpl(model, poses_seq, transl_seq):
     """SMPL: 1 root + 23 body joints; body_pose flat (T, 69)."""
     import jax.numpy as jnp
     T = poses_seq.shape[0]
-    from smpl_jax import SMPLParams
+    from _smpl import SMPLParams
     return SMPLParams(
         betas=jnp.zeros((T, model.num_betas), dtype=jnp.float32),
         body_pose=jnp.asarray(poses_seq[:, 1:24].reshape(T, -1)),
@@ -169,7 +169,7 @@ def _pose_smplx(model, poses_seq, transl_seq):
     """SMPL-X: 1 root + 21 body + 3 face + 15+15 hand joints."""
     import jax.numpy as jnp
     T = poses_seq.shape[0]
-    from smpl_jax import SMPLXParams
+    from _smpl import SMPLXParams
     return SMPLXParams(
         betas=jnp.zeros((T, model.num_betas), dtype=jnp.float32),
         body_pose=jnp.asarray(poses_seq[:, 1:22].reshape(T, -1)),
@@ -733,7 +733,7 @@ def main():
             try:
                 import jax.numpy as _jnp
                 import motion_pipeline as mp
-                from smpl_jax import SMPLParams
+                from _smpl import SMPLParams
                 smpl = mp.load_smpl_jax(args.smpl_model)
                 out = smpl(SMPLParams(betas=_jnp.zeros((1, smpl.num_betas)), body_pose=_jnp.zeros((1, 69)),
                                       global_orient=_jnp.zeros((1, 3)), transl=_jnp.zeros((1, 3))))
@@ -749,7 +749,7 @@ def main():
             try:
                 import jax.numpy as _jnp
                 import motion_pipeline as mp
-                from smpl_jax import SMPLXParams
+                from _smpl import SMPLXParams
                 smplx = mp.load_smplx_jax(args.smplx_model)
                 out = smplx(SMPLXParams(
                     betas=_jnp.zeros((1, smplx.num_betas)), body_pose=_jnp.zeros((1, 63)),
@@ -906,7 +906,7 @@ def main():
                             id_paths[t] = str(lod_dir / fn)
                     print(f"  Low-LOD mode: {n_lod} verts (assets from {lod_dir})")
                 else:
-                    print(f"  [low-lod] {lod_dir} missing — run tools/build_lowlod.py; using full-res")
+                    print(f"  [low-lod] {lod_dir} missing — run tools/pipeline/build_lowlod.py; using full-res")
 
             # Unified Pose Correctives (Beta): load the SOMA-X corrective MLP once
             # and share it across all SOMA-family identities to fix LBS artifacts.
@@ -914,8 +914,13 @@ def main():
             cpath = Path(args.hf_dir) / "correctives_model.pt"
             if cpath.exists():
                 import correctives_jax as cj
-                correctives = cj.load_correctives(str(cpath), np.asarray(layer._parents_np), n_lod=n_lod)
-                print(f"  Loaded unified pose correctives ({correctives['n_vertices']} verts)")
+                try:
+                    correctives = cj.load_correctives(
+                        str(cpath), np.asarray(layer._parents_np), n_lod=n_lod)
+                    print(f"  Loaded unified pose correctives ({correctives['n_vertices']} verts)")
+                except ModuleNotFoundError as e:     # reading the .pt needs torch
+                    print(f"  [correctives] reading {cpath.name} needs PyTorch ({e.name} is "
+                          "not installed) — meshes will show raw LBS artifacts")
             else:
                 print(f"  [correctives] {cpath} not found — meshes will show raw LBS artifacts")
 
@@ -1076,7 +1081,7 @@ def main():
                     try:
                         import motion_pipeline as mp
                         from soma_to_smplx import smplx_poses_from_soma_world
-                        from smpl_jax import SMPLXParams, SMPLParams
+                        from _smpl import SMPLXParams, SMPLParams
                         smplx_model = mp.load_smplx_jax(args.smplx_model)
                         print("  Retargeting SOMA→SMPL-X via direct name-based world-rotation transfer...")
                         # SOMA bind world orientation per joint (= t_pose_world[:, :3, :3]).
@@ -1296,7 +1301,7 @@ def main():
                 try:
                     if name == "SMPL":
                         m_ = mp.load_smpl_jax(args.smpl_model)
-                        from smpl_jax import SMPLParams
+                        from _smpl import SMPLParams
                         rest = m_(SMPLParams(
                             global_orient=_jnp.zeros((1, 3)),
                             body_pose=_jnp.zeros((1, 69)),
@@ -1305,7 +1310,7 @@ def main():
                         ))
                     else:  # SMPL-X
                         m_ = mp.load_smplx_jax(args.smplx_model)
-                        from smpl_jax import SMPLXParams
+                        from _smpl import SMPLXParams
                         rest = m_(SMPLXParams(
                             betas=_jnp.zeros((1, m_.num_betas)),
                             body_pose=_jnp.zeros((1, 63)),

@@ -75,7 +75,7 @@ def _normalize_arrays(d: dict):
 
 def load_smpl_jax(path: str, num_betas: int = 10):
     """Load a plain SMPL model as a SMPL-JAX SMPLModel."""
-    from smpl_jax import SMPLModel
+    from _smpl import SMPLModel
     v_template, shapedirs, posedirs, J_regressor, parents, weights, faces = _normalize_arrays(_read_model_dict(path))
     return SMPLModel(
         v_template=v_template, shapedirs=shapedirs, posedirs=posedirs,
@@ -86,7 +86,7 @@ def load_smpl_jax(path: str, num_betas: int = 10):
 
 def load_smplx_jax(path: str, num_betas: int = 10, num_expression_coeffs: int = 10):
     """Load an SMPL-X model as a SMPL-JAX SMPLXModel, splitting the packed basis."""
-    from smpl_jax import SMPLXModel
+    from _smpl import SMPLXModel
     d = _read_model_dict(path)
     v_template, shapedirs, posedirs, J_regressor, parents, weights, faces = _normalize_arrays(d)
     expr = d.get("exprdirs", d.get("expr_dirs"))
@@ -134,7 +134,7 @@ def load_smplx_motion(path: str, num_frames: int = 48) -> dict:
 # Native SMPL-family drivers (shared kinematic tree)
 # ----------------------------------------------------------------------------
 def smplx_params(model, m, use_betas=True):
-    from smpl_jax import SMPLXParams
+    from _smpl import SMPLXParams
     N = m["n_frames"]
     nb = model.num_betas
     betas = np.tile(m["betas"][:nb], (N, 1)).astype(np.float32) if use_betas else np.zeros((N, nb), np.float32)
@@ -166,7 +166,7 @@ def smplh_params(model, m):
 
 
 def smpl_params(model, m):
-    from smpl_jax import SMPLParams
+    from _smpl import SMPLParams
     N = m["n_frames"]
     # SMPL body_pose = 23 joints. Joints 1..21 match SMPL-X body; the two SMPL
     # hand joints (22, 23) get the relaxed pose (zeros).
@@ -211,7 +211,7 @@ def smplx_motion_to_soma_poses(smplx_model, soma_layer, motion, hf_dir=None,
         hf_dir = data_root()
 
     from soma_jax import PoseInversion
-    from smpl_jax import SMPLXParams
+    from _smpl import SMPLXParams
     from soma_jax.geometry.transforms import rotmat_to_axis_angle
     if refine_iters > 0:
         pose_mode = "combined"
