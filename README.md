@@ -34,7 +34,7 @@ hardware-portable graph.
 ```bash
 git clone --recurse-submodules https://github.com/bozcomlekci/SOMA-JAX.git
 cd SOMA-JAX
-pip install -e ".[vis,usd]"
+pip install -e ".[dev,vis,usd]"                    # dev = pytest, for the self-test below
 python tools/download_assets.py                    # or --minimal: just what the quickstart needs
 python -m pytest tools/selftest -q -m "not slow"   # optional: check this machine (~1 min)
 ```
@@ -86,11 +86,19 @@ driven by the same SOMA skeleton and the same motion, and only the body changes:
 ![SOMA identity models sharing one skeleton](assets/media/identity_models.png)
 
 ```python
-from soma_jax import create_identity_model, SOMALayer
+from soma_jax import SOMALayer
 
-model = create_identity_model("mhr", soma_data, mhr_model_data)   # or smpl, smplx,
-layer = SOMALayer(soma_data, identity_model=model)                # anny, garment…
+layer = SOMALayer.from_upstream_assets(
+    identity_model_type="garment_measurement",   # or mhr, anny, smpl, smplx, smplh
+    identity_model_path="assets/identity/identity_garment.npz",
+)
 ```
+
+The MHR, Anny and GarmentMeasurement packs come from
+`python tools/pipeline/build_identity_packs.py` (MHR needs PyTorch); the
+SMPL family takes the registration-only SMPL / SMPL-X model files. To move a
+body between models, `tools/convert/shape_convert.py` fits one model's
+coefficients to another's body.
 
 ## Performance
 

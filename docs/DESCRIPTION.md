@@ -142,11 +142,11 @@ is the faithful SOMA-X solver:
 ```python
 from soma_jax import SOMALayer, SOMAPoseInversion
 
-layer = SOMALayer.load("assets/SOMA_neutral_fixed.npz")
+layer = SOMALayer.from_upstream_assets()
 inv = SOMAPoseInversion(layer)
-inv.prepare_identity(identity_coeffs)
+inv.prepare_identity(identity_coeffs)                 # (1, 128): one subject
 
-result = inv.fit(posed_vertices)                      # analytical + Lie-GN
+result = inv.fit(posed_vertices)                      # (B, V, 3) frames; analytical + Lie-GN
 result = inv.fit(posed_vertices, lie_iters=0)         # analytical only
 result = inv.fit(posed_vertices, autograd_iters=10)   # + autograd FK refinement
 
@@ -166,37 +166,56 @@ result = inv.fit(
 ```
 
 `PoseInversion` is a lighter-weight alternative (single Kabsch init + one
-autograd refine) with explicit 1-DOF hinge constraints:
+autograd refine) with explicit 1-DOF hinge constraints. It solves rotations
+only, so the posed mesh must keep the rest mesh's root placement — SOMA's
+`transl` is the hips' world position, so pose with `transl=joints[:, 1]`. A
+hinge constrains a joint relative to its parent, with the axis in the rest
+pose's frame; SOMA's rest pose is an A-pose with bent elbows, so derive elbow
+axes from the rest skeleton:
 
 ```python
 from soma_jax import PoseInversion
 
+rest, joints = layer.prepare_identity(identity_coeffs)       # (1, V, 3), (1, J, 3)
+names, J = list(layer.joint_names), joints[0]
+
+def hinge(a, b, c):                   # normal of the rest bone pair a -> b -> c
+    n = jnp.cross(J[names.index(b)] - J[names.index(a)],
+                  J[names.index(c)] - J[names.index(b)])
+    return n / jnp.linalg.norm(n)
+
 inverter = PoseInversion(
-    rest_verts=rest_verts, weights=weights,
-    rest_joints=rest_joints, parents=parents,
+    rest_verts=rest[0], weights=layer.weights,
+    rest_joints=J, parents=layer.parents,
     dof_constraints={
-        4: jnp.array([1.0, 0.0, 0.0]),   # left knee — hinge around X
-        5: jnp.array([1.0, 0.0, 0.0]),   # right knee
-        18: jnp.array([0.0, 1.0, 0.0]),  # left elbow — hinge around Y
-        19: jnp.array([0.0, 1.0, 0.0]),  # right elbow
+        names.index("LeftShin"): jnp.array([1.0, 0.0, 0.0]),    # knees — hinge around X
+        names.index("RightShin"): jnp.array([1.0, 0.0, 0.0]),
+        names.index("LeftForeArm"): hinge("LeftArm", "LeftForeArm", "LeftHand"),
+        names.index("RightForeArm"): hinge("RightArm", "RightForeArm", "RightHand"),
     },
 )
-rotmats = inverter.fit(posed_verts, mode="combined", num_refine_iters=50)
+world_R = inverter.fit(posed_vertices, mode="combined", num_refine_iters=50)
+# (B, J, 3, 3) world rotations; parent-relative: world_R[:, p].mT @ world_R[:, j]
 ```
+
+`inverter.fit_hierarchical(posed_vertices)` refines joint by joint from the
+root down instead — slower, and usually a little more accurate.
 
 ### Bone Scales
 
 `scale_params` stretch individual limb and finger bones. The 56 active controls
-are listed by `scale_param_names`, each naming a `(parent, child)` edge:
+are listed by `scale_param_names`: each names the joint whose offset from its
+parent it stretches (`scale_param_segments` gives the `(parent, child)` edge,
+so `"LeftForeArm"` lengthens the upper arm):
 
 ```python
-rest, joints, binds = layer.prepare_identity(coeffs, return_bind_transforms=True)
+rest, joints, binds = layer.prepare_identity(coeffs, return_bind_transforms=True)  # (B, 128)
 
-scales = jnp.ones((1, layer.num_bone_scale_params))
-scales = scales.at[0, layer.scale_param_names.index("LeftForeArm")].set(1.5)
+scales = jnp.ones((rest.shape[0], layer.num_bone_scale_params))
+scales = scales.at[:, layer.scale_param_names.index("LeftForeArm")].set(1.5)
 
-out = layer.pose(rotmats, transl, rest[None], joints[None],
-                 bind_transforms=binds[None], bone_scales=scales)
+out = layer.pose(rotmats, transl, rest, joints,      # (B, J, 3, 3) local, (B, 3)
+                 bind_transforms=binds, bone_scales=scales)
 out.transforms   # (B, J, 4, 4) world joint transforms
 ```
 

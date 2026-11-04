@@ -19,8 +19,8 @@ SOMA_neutral.npz which assume that same row order.
 
 Usage::
 
-    python tools/build_identity_packs.py \\
-        --hf-dir assets/third_party --output-dir assets/identity
+    python tools/pipeline/build_identity_packs.py              # all three, into assets/identity
+    python tools/pipeline/build_identity_packs.py --backends anny garment   # no torch needed
 """
 from __future__ import annotations
 import argparse
