@@ -53,6 +53,11 @@ jobs:
 
   assets:
     name: assets · ${{ matrix.os }} · py3.12
+    # After the install matrix, so the macOS job does not queue behind the
+    # three macOS install jobs for a hosted runner (it went unassigned twice);
+    # !cancelled() keeps it running when an install job fails.
+    needs: install
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
