@@ -155,8 +155,12 @@ def test_skeleton_transfer_matrix_and_per_joint_paths_agree(synthetic_rig):
                             use_sparse_rbf_matrix=False)
     assert fast._joint_pos_regressors is None          # built lazily, never needed here
     a = np.asarray(fast.fit_joint_positions(jnp.asarray(target)))
+    # The lazy regressors are first built under jit here; they must come out
+    # concrete, or the eager call after it raises UnexpectedTracerError.
+    b_jit = np.asarray(jax.jit(slow.fit_joint_positions)(jnp.asarray(target)))
     b = np.asarray(slow.fit_joint_positions(jnp.asarray(target)))
     np.testing.assert_allclose(a, b, atol=5e-4)
+    np.testing.assert_allclose(b_jit, b, atol=1e-5)
     assert slow._joint_pos_regressors is not None
 
 

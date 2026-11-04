@@ -91,3 +91,18 @@ def test_demo_renders(tmp_path):
          "--gif", tmp_path / "demo.gif")
     for name in ("01_rest.png", "02_custom_shape.png", "03_posed.png", "demo.gif"):
         assert (tmp_path / name).stat().st_size > 1000, name
+
+
+def test_shape_convert_round_trip(tmp_path):
+    """SOMA -> SOMA through the fitting converter recovers the coefficients."""
+    need_module("pxr")
+    need_assets(*UPSTREAM_ASSETS)
+    rng = np.random.default_rng(3)
+    src = (rng.standard_normal((2, 128)) * 0.8).astype(np.float32)
+    np.save(tmp_path / "src.npy", src)
+    out = _run(REPO / "tools" / "convert" / "shape_convert.py",
+               "--src-model", "soma", "--src-coeffs", tmp_path / "src.npy",
+               "--tgt-model", "soma", "--output", tmp_path / "out.npy")
+    got = np.load(tmp_path / "out.npy")
+    assert got.shape == src.shape, out
+    np.testing.assert_allclose(got, src, atol=2e-2)

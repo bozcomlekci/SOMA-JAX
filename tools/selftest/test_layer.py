@@ -187,8 +187,14 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
         pytest.fail(f"{e} — the 'vis' extra installs rtree")
     layer = SOMALayer.from_upstream_assets(procedural=False, identity_model_type=backend,
                                            identity_model_path=str(pack))
+    # First use under jit: the identity model builds lazy caches (the
+    # Laplacian blend) on first call, and a cache built inside a trace would
+    # hold tracers and break every later call with UnexpectedTracerError.
+    ids = jnp.asarray(np.random.default_rng(0).standard_normal((1, 16)) * 0.5, jnp.float32)
+    jitted = np.asarray(jax.jit(lambda c: layer.prepare_identity(c)[0])(ids))
     out = layer(SOMAParams(poses=jnp.zeros((1, 78, 3)), transl=jnp.zeros((1, 3)),
-                           identity_coeffs=jnp.zeros((1, 16))))
+                           identity_coeffs=ids))
     v = np.asarray(out.vertices)
     assert v.shape == (1, 18056, 3) and np.isfinite(v).all()
     assert 0.9 < float(v[0, :, 1].max() - v[0, :, 1].min()) < 2.3
+    np.testing.assert_allclose(np.asarray(layer.prepare_identity(ids)[0]), jitted, atol=1e-4)

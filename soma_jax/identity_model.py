@@ -27,6 +27,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from .units import Unit
@@ -174,9 +175,14 @@ class BaseIdentityModel(ABC):
             # same unit as the vertices being solved. (The cotangent weights
             # themselves are scale-invariant, so only btilde is affected.)
             v_ref = np.asarray(self.soma_v_template) / self.native_unit.meters_per_unit
-            self._laplacian_mesh = LaplacianMesh(
-                v_ref, self.soma_faces, mask_anchors,
-            )
+            # First use can happen under jit/grad/vmap. Build eagerly so the
+            # cache holds concrete arrays: built inside the trace, it would
+            # keep tracers and every later call would raise
+            # UnexpectedTracerError.
+            with jax.ensure_compile_time_eval():
+                self._laplacian_mesh = LaplacianMesh(
+                    v_ref, self.soma_faces, mask_anchors,
+                )
         return self._laplacian_mesh.solve(soma_verts)
 
 

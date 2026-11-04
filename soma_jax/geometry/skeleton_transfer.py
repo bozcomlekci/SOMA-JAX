@@ -285,14 +285,17 @@ class SkeletonTransfer:
         """Per-joint :class:`RadialBasisFunction` regressors (``None`` for Root
         and for joints without support), built on first access."""
         if self._joint_pos_regressors is None:
-            self._joint_pos_regressors = [
-                None if ids is None or len(ids) == 0 else RadialBasisFunction(
-                    jnp.asarray(self.bind_shape[ids]),
-                    kernel=self.rbf_kernel,
-                    include_polynomial=True,
-                )
-                for ids in self._regressor_support
-            ]
+            # First access can happen under jit (fit_joint_positions); build
+            # eagerly so the cache holds concrete arrays, not tracers.
+            with jax.ensure_compile_time_eval():
+                self._joint_pos_regressors = [
+                    None if ids is None or len(ids) == 0 else RadialBasisFunction(
+                        jnp.asarray(self.bind_shape[ids]),
+                        kernel=self.rbf_kernel,
+                        include_polynomial=True,
+                    )
+                    for ids in self._regressor_support
+                ]
         return self._joint_pos_regressors
 
     @joint_pos_regressors.setter

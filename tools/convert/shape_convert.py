@@ -1,106 +1,157 @@
-"""Convert identity coefficients between different shape representations.
+"""Convert identity coefficients between identity models.
 
-Supports conversion between:
-    - SMPL betas → SOMA PCA coefficients (via vertex regression)
-    - SMPL betas → MHR identity coefficients
-    - SOMA → SMPL betas
-    - Generic shape conversion via Procrustes alignment of shape spaces
+Fits the *target* model's identity coefficients so that its body reproduces
+the *source* body. Both bodies are compared the way SOMA compares identities:
+in SOMA topology, after the per-identity skeleton fit and the repose to SOMA's
+shared bind pose (``SOMALayer.prepare_identity(repose_to_bind_pose=True)``),
+so the models' different rest poses — MHR's, SMPL's T-pose, SOMA's own — do not
+leak into the fitted shape. The fit is damped Gauss–Newton through the target
+layer's differentiable ``prepare_identity``; for a PCA backend it converges in
+a few steps. A source that the target's shape space cannot represent leaves a
+residual (reported per sample); ``--prior`` regularises such fits.
+
+Supported backends: ``soma`` (128-coefficient PCA), ``smpl`` / ``smplx`` /
+``smplh`` (betas; need the registration-only model files), ``mhr`` and
+``garment_measurement`` (identity packs from
+``tools/pipeline/build_identity_packs.py``), ``anny``.
 
 Usage::
 
-    python tools/shape_convert.py \\
-        --src-coeffs path/to/source_betas.npy \\
-        --src-model smpl \\
-        --tgt-model soma \\
-        --soma-asset path/to/SOMA_neutral.npz \\
-        --output path/to/converted_coeffs.npy
+    # GarmentMeasurement coefficients -> SOMA PCA coefficients
+    python tools/convert/shape_convert.py \\
+        --src-model garment_measurement --src-asset assets/identity/identity_garment.npz \\
+        --src-coeffs garment.npy --tgt-model soma --output soma.npy
+
+    # SOMA -> MHR
+    python tools/convert/shape_convert.py \\
+        --src-model soma --src-coeffs soma.npy \\
+        --tgt-model mhr --tgt-asset assets/identity/identity_mhr.npz --output mhr.npy
+
+``--soma-asset`` is optional: without it the rig is built from the resolved
+upstream assets (NVIDIA's ``SOMA_neutral.npz`` or a SOMA-JAX archive also work).
 """
 from __future__ import annotations
+
 import argparse
-import numpy as np
-import sys
 import os
+import sys
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+BACKENDS = ["soma", "smpl", "smplx", "smplh", "mhr", "anny", "garment_measurement"]
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Convert identity coefficients between models")
-    p.add_argument("--src-coeffs", required=True, help="Source identity coefficients (.npy)")
-    p.add_argument("--src-model", required=True, choices=["smpl", "smplx", "mhr", "soma", "anny"])
-    p.add_argument("--tgt-model", required=True, choices=["smpl", "smplx", "mhr", "soma", "anny"])
-    p.add_argument("--soma-asset", required=True, help="SOMA_neutral.npz")
-    p.add_argument("--src-asset", default=None, help="Source model NPZ (with shapedirs)")
-    p.add_argument("--tgt-asset", default=None, help="Target model NPZ (with shapedirs)")
-    p.add_argument("--output", required=True, help="Output (.npy) for converted coefficients")
+    p.add_argument("--src-coeffs", required=True, help="source coefficients (.npy), (K,) or (B, K)")
+    p.add_argument("--src-model", required=True, choices=BACKENDS)
+    p.add_argument("--tgt-model", required=True, choices=BACKENDS)
+    p.add_argument("--soma-asset", default=None,
+                   help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
+                        "(default: build from the resolved upstream assets)")
+    p.add_argument("--src-asset", default=None, help="identity data for the source backend")
+    p.add_argument("--tgt-asset", default=None, help="identity data for the target backend")
+    p.add_argument("--num-coeffs", type=int, default=None,
+                   help="target coefficients to fit (default: all the target model has)")
+    p.add_argument("--iters", type=int, default=8, help="max Gauss-Newton iterations")
+    p.add_argument("--prior", type=float, default=0.0,
+                   help="optional Tikhonov weight pulling coefficients toward zero, relative "
+                        "to the mean curvature of the fit. Plain least squares by default "
+                        "(as upstream's converter); a target shape space that cannot "
+                        "represent the source well can drift to large coefficients — the "
+                        "printed max |coeff| shows it — and a small prior (1e-3) curbs that")
+    p.add_argument("--no-repose", action="store_true",
+                   help="compare raw rest shapes instead of bind-pose ones")
+    p.add_argument("--output", required=True, help="output (.npy) for the converted coefficients")
     return p.parse_args()
 
 
-def _least_squares_shape_fit(
-    src_verts: np.ndarray,
-    tgt_template: np.ndarray,
-    tgt_shapedirs: np.ndarray,
-) -> np.ndarray:
-    """Solve for target coefficients that match source vertices.
-
-    Minimizes ||tgt_template + shapedirs @ coeffs - src_verts||^2
+def fit_coefficients(body_fn, target, num_coeffs: int, iters: int = 8, prior: float = 0.0):
+    """Damped Gauss-Newton: ``argmin_c ||body_fn(c) - target||^2 + mu ||c||^2``.
 
     Args:
-        src_verts: (V, 3) source-model vertices in target topology.
-        tgt_template: (V, 3) target model rest template.
-        tgt_shapedirs: (V, 3, K) target model shape basis.
+        body_fn: ``(K,) -> (V, 3)`` differentiable body of the target model.
+        target: ``(V, 3)`` body to reproduce.
+        num_coeffs: ``K``.
+        iters: maximum iterations.
+        prior: ``mu`` relative to the mean diagonal of ``J^T J`` at the start.
 
     Returns:
-        (K,) optimal target coefficients.
+        ``(coeffs (K,), rms_error)`` with the RMS vertex error of the fit.
     """
-    V, _, K = tgt_shapedirs.shape
-    A = tgt_shapedirs.reshape(V * 3, K)
-    b = (src_verts - tgt_template).reshape(V * 3)
-    coeffs, *_ = np.linalg.lstsq(A, b, rcond=None)
-    return coeffs.astype(np.float32)
+    import jax
+    import jax.numpy as jnp
+
+    target = jnp.asarray(target)
+    residual = jax.jit(lambda c: (body_fn(c) - target).reshape(-1))
+    jacobian = jax.jit(jax.jacfwd(lambda c: body_fn(c).reshape(-1)))
+
+    c = jnp.zeros((num_coeffs,), jnp.float32)
+    eye = jnp.eye(num_coeffs, dtype=jnp.float32)
+    mu = None
+    r = residual(c)
+    cost = float(r @ r)
+    lam = 1e-6
+    for _ in range(iters):
+        J = jacobian(c)
+        JtJ = J.T @ J
+        scale = float(jnp.trace(JtJ)) / num_coeffs + 1e-12
+        if mu is None:
+            mu = prior * scale
+        g = J.T @ r + mu * c
+        step = jnp.linalg.solve(JtJ + (mu + lam * scale) * eye, -g)
+        r_new = residual(c + step)
+        cost_new = float(r_new @ r_new)
+        total, total_new = cost + mu * float(c @ c), cost_new + mu * float((c + step) @ (c + step))
+        if total_new < total:
+            converged = total - total_new < 1e-10 * max(total, 1e-30)
+            c, r, cost = c + step, r_new, cost_new
+            lam = max(lam / 10.0, 1e-9)
+            if converged:
+                break
+        else:
+            lam *= 10.0
+    return np.asarray(c), float(np.sqrt(cost / target.shape[0]))
 
 
 def main():
     args = parse_args()
-    src_coeffs = np.load(args.src_coeffs)
+    import jax.numpy as jnp
+    from _common import load_layer
+
+    src_coeffs = np.load(args.src_coeffs).astype(np.float32)
     if src_coeffs.ndim == 1:
         src_coeffs = src_coeffs[None]
 
-    from soma_jax.identity_model import create_identity_model
-    from soma_jax.io import load_soma_npz
-    import jax.numpy as jnp
-    import numpy as np
+    src = load_layer(args.soma_asset, identity_model_type=args.src_model,
+                     identity_model_path=args.src_asset)
+    tgt = load_layer(args.soma_asset, identity_model_type=args.tgt_model,
+                     identity_model_path=args.tgt_asset)
+    K = int(tgt.identity_model.n_betas if args.num_coeffs is None else args.num_coeffs)
+    if K <= 0:
+        sys.exit(f"target model {args.tgt_model!r} has no identity coefficients to fit")
+    repose = not args.no_repose
 
-    soma_data = load_soma_npz(args.soma_asset)
-    src_data = load_soma_npz(args.src_asset) if args.src_asset else None
-    tgt_data = load_soma_npz(args.tgt_asset) if args.tgt_asset else None
+    def body(layer, coeffs):
+        return layer.prepare_identity(coeffs, repose_to_bind_pose=repose)[0]
 
-    src_model = create_identity_model(args.src_model, soma_data, src_data)
-    src_verts_jax, _ = src_model.forward(jnp.asarray(src_coeffs))
-    src_verts = np.asarray(src_verts_jax)  # (B, V, 3) in SOMA topology
+    sources = np.asarray(body(src, jnp.asarray(src_coeffs)))          # (B, V, 3)
+    out = np.zeros((src_coeffs.shape[0], K), np.float32)
+    for i, target in enumerate(sources):
+        out[i], rms = fit_coefficients(lambda c: body(tgt, c[None])[0], target, K,
+                                       args.iters, args.prior)
+        start = float(np.sqrt(np.mean(np.sum(
+            (np.asarray(body(tgt, jnp.zeros((1, K))))[0] - target) ** 2, axis=-1))))
+        print(f"  [{i}] RMS vertex distance to the source body: "
+              f"{start * 1e3:.2f} mm (target at zero) -> {rms * 1e3:.2f} mm (fitted), "
+              f"max |coeff| {np.abs(out[i]).max():.2f}")
 
-    if args.tgt_model == "soma":
-        tgt_template = np.asarray(soma_data["v_template"])
-        tgt_shapedirs = np.asarray(src_data["shapedirs"]) if src_data and args.src_model == "soma" else None
-        if tgt_shapedirs is None:
-            print("WARNING: target=soma but no SOMA shapedirs available; using identity fit.")
-            np.save(args.output, src_coeffs)
-            return
-    elif tgt_data is not None and "shapedirs" in tgt_data:
-        tgt_template = np.asarray(tgt_data["v_template"])
-        tgt_shapedirs = np.asarray(tgt_data["shapedirs"])
-    else:
-        raise ValueError(f"Need --tgt-asset with shapedirs for tgt-model={args.tgt_model}")
-
-    B = src_verts.shape[0]
-    out_coeffs = np.zeros((B, tgt_shapedirs.shape[-1]), dtype=np.float32)
-    for i in range(B):
-        out_coeffs[i] = _least_squares_shape_fit(src_verts[i], tgt_template, tgt_shapedirs)
-
-    np.save(args.output, out_coeffs)
+    np.save(args.output, out)
     print(f"Saved converted coefficients to: {args.output}")
     print(f"  Source: {args.src_model} {src_coeffs.shape}")
-    print(f"  Target: {args.tgt_model} {out_coeffs.shape}")
+    print(f"  Target: {args.tgt_model} {out.shape}")
 
 
 if __name__ == "__main__":

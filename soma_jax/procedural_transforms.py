@@ -79,7 +79,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 import numpy as np
 import jax
 import jax.numpy as jnp
