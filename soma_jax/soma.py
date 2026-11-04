@@ -811,6 +811,12 @@ class SOMALayer(eqx.Module):
         if lod not in BODY_LODS:
             raise ValueError(f"lod must be one of {BODY_LODS}, got {lod!r}")
         soma_data = dict(np.load(path, allow_pickle=True))
+        if "v_template" not in soma_data and "mean" in soma_data:
+            raise ValueError(
+                f"{path} is NVIDIA's upstream SOMA_neutral.npz, not a SOMA-JAX "
+                "archive (different key schema). Build the layer from it with "
+                "SOMALayer.from_upstream_assets(npz_path=...), or bake an archive "
+                "for load() as in docs/INSTALL.md §4.2.")
 
         # Flatten any object arrays
         for k in list(soma_data.keys()):
@@ -851,97 +857,83 @@ class SOMALayer(eqx.Module):
 
         Args:
             npz_path: full-schema ``SOMA_neutral.npz``; resolved when omitted.
+                A prebuilt ``SOMA_neutral_fixed.npz`` (``docs/INSTALL.md`` §4.2)
+                is also accepted and supplies the public rig as-is.
             usd_path: ``SOMA_template_rig.usda``; resolved when omitted.
             identity_model_type, identity_model_path, correctives_path, sparse_k,
                 lod: as for :meth:`load`.
             procedural: keep the expanded 122-joint twist skeleton, which is
                 upstream's default (``enable_procedural_transforms=True``).
                 ``False`` requests the pruned 78-joint legacy rig.
-            fit_joint_regressor: fit the ``skeleton_fit="linear"`` regressor.
-                The faithful path uses ``SkeletonTransfer`` and does not need it.
+            fit_joint_regressor: kept for compatibility. The layer and the
+                identity backends always need the ``skeleton_fit="linear"``
+                regressor, so the public rig is fitted regardless (it takes
+                milliseconds); ``False`` used to raise ``KeyError``.
 
         Returns:
             An instantiated :class:`SOMALayer`.
+
+        Raises:
+            ImportError: ``usd-core`` is not installed (``pip install usd-core``).
         """
-        from .rig_build import build_soma_asset
+        from .assets import resolve as _resolve
+        from .procedural_transforms import ProceduralTransforms, load_definition
+        from .rig_build import (
+            _fit_joint_regressor, build_soma_asset, merge_template_rig, prune_procedural_joints)
 
         if lod not in BODY_LODS:
             raise ValueError(f"lod must be one of {BODY_LODS}, got {lod!r}")
-        if not procedural:
-            # Upstream's legacy rig is *derived* from the same template, not read
-            # from the npz: `derive_soma_rig_without_procedural_joints` prunes the
-            # procedural and auxiliary joints and aggregates each dropped joint's
-            # skin weights onto its nearest kept parent.
-            from .assets import resolve as _resolve
-            from .procedural_transforms import load_definition
-            from .rig_build import build_soma_asset as _build, prune_procedural_joints
-
-            definition = load_definition(_resolve("SOMA_procedural_transforms.json"))
-            pruned = prune_procedural_joints(
-                _build(npz_path, usd_path, lod, fit_joint_regressor=False),
-                definition.main_joint_names)
-            if fit_joint_regressor:
-                from .rig_build import _fit_joint_regressor
-                pruned["J_regressor"] = _fit_joint_regressor(
-                    pruned["bind_shape"], pruned["bind_pose_world"],
-                    pruned["weights"], pruned["parents"])
-            return cls._from_soma_data(
-                pruned, identity_model_type=identity_model_type,
-                identity_model_path=identity_model_path,
-                correctives_path=correctives_path, sparse_k=sparse_k,
-                lod="mid" if lod == "mid" else lod, already_lod_sliced=lod != "mid")
-        # The rig is read at the requested LOD directly rather than sliced after
-        # the fact, matching upstream's per-LOD template read.
-        if procedural:
-            # Two-rig construction, mirroring upstream: the public 78-joint rig
-            # carries the identity model, the skeleton fit and the bind data,
-            # while the expanded 122-joint template skeleton is used for FK/LBS
-            # only. The public half comes from the cached archive because the
-            # 78-joint rig is upstream's *pruned* template merge and that prune
-            # (`derive_soma_rig_without_procedural_joints`, which aggregates each
-            # dropped joint's weights onto its nearest kept parent) is not ported.
-            from .assets import resolve as _resolve
-            from .procedural_transforms import ProceduralTransforms, load_definition
-
-            public_asset = npz_path if npz_path is not None and str(npz_path).endswith(
-                "SOMA_neutral_fixed.npz") else _resolve("SOMA_neutral_fixed.npz")
-            layer = cls.load(
-                str(public_asset), identity_model_type=identity_model_type,
-                identity_model_path=identity_model_path,
-                correctives_path=correctives_path, sparse_k=sparse_k, lod=lod)
-
-            definition = load_definition(_resolve("SOMA_procedural_transforms.json"))
-            procedural_transforms = ProceduralTransforms(definition)
-            # `aligned_x_swing_twist` (what the shipped JSON asks for) measures
-            # twist in the bind-aligned frame, so it needs the public T-pose
-            # transforms. Without them the extractor silently falls back to a
-            # start-joint scalar that is not upstream-equivalent, and the twist
-            # contribution collapses — the posed result then reproduces the
-            # non-procedural rig to ~1 mm instead of upstream's procedural one.
-            if layer.t_pose_world is not None:
-                procedural_transforms.set_bind_data(layer.t_pose_world)
-            skin_data = build_soma_asset(
-                None, usd_path, lod, fit_joint_regressor=False)
-            skin_rig = cls.build_skinning_rig(
-                skin_data, layer.joint_names, procedural_transforms, sparse_k=sparse_k)
-            return layer.attach_procedural_rig(
-                procedural_transforms, layer.joint_names, skin_rig=skin_rig)
-
-        soma_data = build_soma_asset(
-            npz_path, usd_path, lod if lod != "mid" else "mid",
-            fit_joint_regressor=fit_joint_regressor)
-        layer = cls._from_soma_data(
-            soma_data, identity_model_type=identity_model_type,
-            identity_model_path=identity_model_path,
-            correctives_path=correctives_path, sparse_k=sparse_k,
-            lod="mid" if lod == "mid" else lod, already_lod_sliced=lod != "mid")
-
-        # Drive the expanded rig from the public contract, as upstream does.
-        from .assets import resolve as _resolve
-        from .procedural_transforms import ProceduralTransforms, load_definition
         definition = load_definition(_resolve("SOMA_procedural_transforms.json"))
+        build_kw = dict(identity_model_type=identity_model_type,
+                        identity_model_path=identity_model_path,
+                        correctives_path=correctives_path, sparse_k=sparse_k, lod=lod)
+
+        prebuilt = npz_path is not None and str(npz_path).endswith("SOMA_neutral_fixed.npz")
+        full_mid = None
+        if prebuilt:
+            layer = cls.load(str(npz_path), **build_kw)
+        else:
+            # The public 78-joint rig is upstream's *pruned* template merge:
+            # `derive_soma_rig_without_procedural_joints` (ported as
+            # `prune_procedural_joints`) drops the procedural and auxiliary
+            # joints and moves each dropped joint's skin weights onto its
+            # nearest kept parent. Built at mid LOD and sliced by
+            # `_from_soma_data`, exactly as `load(SOMA_neutral_fixed.npz,
+            # lod=...)` does: the npz's shape data is mid-resolution only, so
+            # reading the rig at low LOD here would mismatch the vertex counts.
+            # Matches the torch-built §4.2 archive to float32 round-off.
+            full_mid = build_soma_asset(npz_path, usd_path, "mid", fit_joint_regressor=False)
+            public = prune_procedural_joints(full_mid, definition.main_joint_names)
+            public["J_regressor"] = _fit_joint_regressor(
+                public["bind_shape"], public["bind_pose_world"],
+                public["weights"], public["parents"])
+            layer = cls._from_soma_data(public, **build_kw)
+
+        if not procedural:
+            return layer
+
+        # Two-rig construction, mirroring upstream: the public 78-joint rig
+        # carries the identity model, the skeleton fit and the bind data,
+        # while the expanded 122-joint template skeleton is used for FK/LBS
+        # only, read at the requested LOD as upstream reads its template.
+        procedural_transforms = ProceduralTransforms(definition)
+        # `aligned_x_swing_twist` (what the shipped JSON asks for) measures
+        # twist in the bind-aligned frame, so it needs the public T-pose
+        # transforms. Without them the extractor silently falls back to a
+        # start-joint scalar that is not upstream-equivalent, and the twist
+        # contribution collapses — the posed result then reproduces the
+        # non-procedural rig to ~1 mm instead of upstream's procedural one.
+        if layer.t_pose_world is not None:
+            procedural_transforms.set_bind_data(layer.t_pose_world)
+        if full_mid is not None and lod == "mid":
+            skin_data = full_mid
+        else:
+            # Only rig arrays are needed here, and those come from the USD alone.
+            skin_data = merge_template_rig(usd_path, lod)
+        skin_rig = cls.build_skinning_rig(
+            skin_data, layer.joint_names, procedural_transforms, sparse_k=sparse_k)
         return layer.attach_procedural_rig(
-            ProceduralTransforms(definition), definition.main_joint_names)
+            procedural_transforms, layer.joint_names, skin_rig=skin_rig)
 
     @classmethod
     def _from_soma_data(

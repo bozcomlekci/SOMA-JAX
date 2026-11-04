@@ -55,7 +55,8 @@ from typing import Any, Optional
 
 import numpy as np
 
-__all__ = ["build_soma_asset", "merge_template_rig", "prune_procedural_joints"]
+__all__ = ["build_regressor", "build_soma_asset", "merge_template_rig",
+           "prune_procedural_joints"]
 
 #: The npz keys copied through unchanged (no unit or layout change).
 _PASSTHROUGH = (
@@ -195,44 +196,80 @@ def build_soma_asset(
     return asset
 
 
-def _fit_joint_regressor(bind_shape, bind_world, weights, parents) -> np.ndarray:
-    """Fit the affine vertex->joint regressor used by ``skeleton_fit="linear"``.
+def _fit_affine_row(verts_support, target):
+    """Min-norm affine weights ``a`` with ``a @ verts == target`` and ``sum(a) == 1``."""
+    n = verts_support.shape[0]
+    A = np.vstack([verts_support.T, np.ones(n)])           # (4, n)
+    b = np.concatenate([target, [1.0]])                    # (4,)
+    return A.T @ np.linalg.solve(A @ A.T + 1e-9 * np.eye(4), b)
 
-    Delegates to ``tools/pipeline/build_soma_rig.build_regressor`` when that
-    repo-local script is importable (it is not packaged), and otherwise falls
-    back to a least-squares fit over each joint's own skinning support.
+
+def build_regressor(bind_shape, joints_t, W, parents, children, weight_thr=1e-4):
+    """Affine vertex->joint regressor restricted to each joint's skinning support.
+
+    Each row reproduces its joint's bind position from ``bind_shape`` exactly
+    (``Jreg @ bind_shape == joints_t``) using only vertices on the bone "tube"
+    between the joint and its parent, so it transfers sensibly to other
+    identities. Joints with no usable support (end markers, eyes) get a single
+    nearest-vertex row instead of collapsing to the origin.
+
+    This lives in the package — not only in ``tools/pipeline/build_soma_rig.py``,
+    which re-exports it — so a non-editable install fits the same regressor as a
+    source checkout.
+
+    Args:
+        bind_shape: ``(V, 3)`` canonical bind mesh.
+        joints_t: ``(J, 3)`` joint bind positions, same units as ``bind_shape``.
+        W: ``(V, J)`` dense skinning weights.
+        parents: ``(J,)`` parent indices with the root mapped to itself.
+        children: ``{joint: [child joints]}``.
+        weight_thr: minimum weight for a vertex to count as support.
+
+    Returns:
+        ``(J, V)`` float64 regressor.
     """
+    V, J = W.shape
+    Jreg = np.full((J, V), np.nan, np.float64)
+
+    def support(j):
+        m = W[:, j] > weight_thr
+        if parents[j] != j:
+            m = m & (W[:, parents[j]] > weight_thr)        # bone "tube" between j and parent
+        if m.sum() < 4:
+            m = W[:, j] > weight_thr                        # fall back to joint-only weight
+        if m.sum() < 4:                                     # union of children's weight (e.g. Root)
+            for c in children[j]:
+                m = m | (W[:, c] > weight_thr)
+        return np.where(m)[0]
+
+    for j in range(J):
+        ids = support(j)
+        if len(ids) >= 4:
+            Jreg[j, ids] = _fit_affine_row(bind_shape[ids], joints_t[j])
+
+    # Joints with no support keep a fully-NaN row (a normal joint's row only
+    # fills its support vertices, hence `.all()`): place them at their bind
+    # position through the single closest mesh vertex, so `Jreg @ rest_verts`
+    # keeps eyes / jaw / tips on the body for any identity.
+    empty_rows = np.array([bool(np.isnan(Jreg[j]).all()) for j in range(J)])
+    for j in np.where(empty_rows)[0]:
+        nearest = int(np.argmin(np.linalg.norm(bind_shape - joints_t[j][None], axis=1)))
+        Jreg[j] = 0.0
+        Jreg[j, nearest] = 1.0
+    return np.nan_to_num(Jreg, nan=0.0)
+
+
+def _fit_joint_regressor(bind_shape, bind_world, weights, parents) -> np.ndarray:
+    """Fit the affine vertex->joint regressor used by ``skeleton_fit="linear"``."""
     joints = np.asarray(bind_world, np.float64)[:, :3, 3]
     W = np.asarray(weights, np.float64)
     fit_parents = np.asarray(parents, np.int64).copy()
     fit_parents[fit_parents < 0] = 0
-
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "_bsr", Path(__file__).resolve().parent.parent
-            / "tools" / "pipeline" / "build_soma_rig.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        children = {j: [c for c in range(W.shape[1])
-                        if fit_parents[c] == j and c != j] for j in range(W.shape[1])}
-        return np.asarray(mod.build_regressor(
-            np.asarray(bind_shape, np.float64), joints, W, fit_parents, children),
-            np.float32)
-    except Exception:
-        pass
-
-    # Fallback: per-joint least squares over the vertices that joint skins.
-    V = np.asarray(bind_shape, np.float64)
-    reg = np.zeros((W.shape[1], V.shape[0]), np.float64)
-    for j in range(W.shape[1]):
-        support = np.nonzero(W[:, j] > 1e-4)[0]
-        if support.size == 0:
-            continue
-        # Weighted centroid of the support reproduces the joint to first order.
-        wj = W[support, j]
-        reg[j, support] = wj / wj.sum()
-    return reg.astype(np.float32)
+    children = {j: [c for c in range(W.shape[1])
+                    if fit_parents[c] == j and c != j] for j in range(W.shape[1])}
+    return build_regressor(
+        np.asarray(bind_shape, np.float64), joints, W, fit_parents, children,
+    ).astype(np.float32)
 
 
 def prune_procedural_joints(asset: dict, public_joint_names) -> dict:
