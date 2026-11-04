@@ -118,14 +118,20 @@ def build_garment_pack(hf_dir: Path, out_path: Path):
     V_wrap = np.asarray(wrap.vertices, dtype=np.float32)
 
     pd = np.load(hf_dir / "GarmentMeasurements" / "point.npz")
-    pca_matrix = pd["pca_matrix"]      # (V*3, K)
+    # Upstream's body is pca_mean + (coeffs * sqrt(eigenvalues)) @ pca_matrix.T,
+    # with the correspondence built on pca_mean (== mean.obj to float precision).
+    # The eigenvalues are what make a coefficient of 1.0 one standard deviation;
+    # without them the same coefficients give a different body.
     V_count = V_src.shape[0]
+    V_src = np.asarray(pd["pca_mean"], dtype=np.float32).reshape(V_count, 3)
+    pca_matrix = pd["pca_matrix"]      # (V*3, K)
     shapedirs = pca_matrix.reshape(V_count, 3, -1).astype(np.float32)  # (V, 3, K)
 
     face_ids, bary = compute_bary(V_src, F_src, V_wrap)
     print(f"  Garment: V_src={V_src.shape[0]} V_wrap={V_wrap.shape[0]} K={shapedirs.shape[-1]}")
     np.savez(out_path,
              v_template=V_src, shapedirs=shapedirs, faces=F_src,
+             eigenvalues=np.asarray(pd["eigenvalues"], dtype=np.float32),
              bary_face_ids=face_ids, bary_coords=bary)
 
 

@@ -24,6 +24,7 @@ Upstream: ``soma/identity_model.py``
     only MHR currently invokes it; upstream also blends SMPL and Garment.
 """
 from __future__ import annotations
+import warnings
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
@@ -536,6 +537,12 @@ class GarmentMeasurementIdentityModel(BaseIdentityModel):
             jnp.sqrt(jnp.asarray(model_data["eigenvalues"], dtype=jnp.float32))
             if "eigenvalues" in model_data else None
         )
+        if self.sqrt_eigenvalues is None:
+            warnings.warn(
+                "GarmentMeasurement pack has no 'eigenvalues': coefficients are applied "
+                "unscaled, so they do not mean what they mean upstream. Rebuild the pack "
+                "with tools/pipeline/build_identity_packs.py --backends garment.",
+                stacklevel=3)
 
         if "bary_face_ids" in model_data and "bary_coords" in model_data:
             self._face_ids = np.array(model_data["bary_face_ids"], dtype=np.int32)
@@ -587,6 +594,7 @@ _IDENTITY_MODEL_REGISTRY: dict[str, type[BaseIdentityModel]] = {
     "soma": SOMAIdentityModel,
     "soma_shape": SOMAIdentityModel,
     "garment_measurement": GarmentMeasurementIdentityModel,
+    "garment": GarmentMeasurementIdentityModel,        # upstream SOMA-X's name for it
 }
 
 
@@ -599,7 +607,7 @@ def create_identity_model(
 
     Args:
         model_type: one of 'smpl', 'smplx', 'smplh', 'mhr', 'anny', 'soma',
-                    'soma_shape', 'garment_measurement'.
+                    'soma_shape', 'garment_measurement' (or upstream's 'garment').
         soma_data: SOMA topology data dict.
         model_data: model-specific parameter dict.
 

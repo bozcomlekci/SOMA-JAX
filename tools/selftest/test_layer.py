@@ -231,3 +231,11 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
     assert v.shape == (1, 18056, 3) and np.isfinite(v).all()
     assert 0.9 < float(v[0, :, 1].max() - v[0, :, 1].min()) < 2.3
     np.testing.assert_allclose(np.asarray(layer.prepare_identity(ids)[0]), jitted, atol=1e-4)
+    if backend == "garment_measurement":
+        # Upstream's body: pca_mean + (coeffs * sqrt(eigenvalues)) @ pca_matrix.T
+        # (a pack without the eigenvalues was 36 mm off it on average).
+        d = np.load(data_root() / "GarmentMeasurements" / "point.npz")
+        c = np.asarray(ids[:, :15], np.float64)
+        want = (d["pca_mean"] + (c * np.sqrt(d["eigenvalues"])) @ d["pca_matrix"].T)
+        got = np.asarray(layer.identity_model.get_rest_shape(ids[:, :15]))
+        np.testing.assert_allclose(got.reshape(want.shape), want, atol=2e-5)
