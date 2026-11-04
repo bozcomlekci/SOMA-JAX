@@ -14,35 +14,60 @@ classifiers = [
     # No "License ::" classifier: PEP 639 supersedes it with the SPDX
     # expression above, and setuptools errors if both are present.
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# Floors are the oldest versions that work together, verified with
+# `uv pip install --resolution lowest-direct` (tools/selftest):
+# * jax/jaxlib 0.4.26 — 0.4.25 is built against NumPy 1.x only and fails to
+#   import under NumPy 2 (`_ARRAY_API not found`), and NumPy is not capped.
+# * optax 0.2.2 — older optax admits a chex that references the removed
+#   `jax.random.KeyArray`, so `import optax` fails on any jax >= 0.4.24.
+# * numpy 1.24.1 — what that chex needs.
 dependencies = [
-    "jax>=0.4.25",
-    "jaxlib>=0.4.25",
+    "jax>=0.4.26",
+    "jaxlib>=0.4.26",
     "equinox>=0.11.0",
-    "numpy>=1.23",
+    "numpy>=1.24.1",
     "scipy>=1.10",
-    "optax>=0.1.7",
+    "optax>=0.2.2",
 ]
 
 [project.optional-dependencies]
-# `tests/` is not distributed (see docs/DESCRIPTION.md#testing); this extra is
-# for running the suite from a local checkout.
+# For `python -m pytest tools/selftest` (shipped) and the local `tests/` suite
+# (not distributed, see docs/DESCRIPTION.md#testing).
 dev = [
     "pytest>=7.0",
-    "pytest-xdist",
+    "pytest-xdist>=3.0",
 ]
+# Mesh I/O, topology transfer and offscreen rendering. `rtree` backs trimesh's
+# closest-point queries (identity packs, the SMPL bridge); without it they fail
+# or fall back to an approximation.
 vis = [
     "trimesh>=4.0",
-    "pyrender",
+    "rtree>=1.1",          # first release with py3 wheels for every platform
+    "pyrender>=0.1.45",
 ]
+# SOMALayer.from_upstream_assets() reads SOMA_template_rig.usda through it.
 usd = [
-    "usd-core",
+    "usd-core>=24.3",
+]
+# benchmarks/plot_*.py
+plots = [
+    "matplotlib>=3.7",
+    "tueplots>=0.0.12",    # bundles.cvpr2024
 ]
 # Upstream's Anny backend imports this package rather than vendoring it, so the
 # faithful path needs it installed. See soma_jax.body_models.anny_native.
 anny = [
     "anny>=0.6",
+]
+all = [
+    "soma-jax[dev,vis,usd,plots]",
 ]
 
 [tool.setuptools.packages.find]
@@ -51,7 +76,9 @@ include = ["soma_jax*"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
 select = ["B", "E", "F", "I", "UP", "W"]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["soma_jax"]
