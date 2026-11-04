@@ -116,14 +116,15 @@ See the [README](../README.md#usage) for the canonical forward pass and pose
 inversion. Two notes that matter when you go past it:
 
 * `SOMALayer.from_upstream_assets()` builds upstream's rig straight from the two
-  NVIDIA source files and needs no PyTorch. `SOMALayer.load(...)` takes the
+  NVIDIA source files and needs no PyTorch (it does need `usd-core`, the `usd`
+  extra, to read the template USD). `SOMALayer.load(...)` takes the
   single-file archive that [`INSTALL.md`](INSTALL.md) §4.2 bakes, which is
-  optional. Passing NVIDIA's `SOMA_neutral.npz` to `load` fails — different key
-  schema.
+  optional. Passing NVIDIA's `SOMA_neutral.npz` to `load` raises a `ValueError`
+  pointing at `from_upstream_assets(npz_path=...)` — different key schema.
 * `identity_coeffs` is 128-wide for the SOMA PCA backend; other backends take
   their own width (`smpl`/`smplx` betas, MHR identity params, …).
 
-Install: `pip install -e ".[dev,vis]"` — see [`INSTALL.md`](INSTALL.md).
+Install: `pip install -e ".[dev,vis,usd]"` — see [`INSTALL.md`](INSTALL.md).
 Core dependencies are `jax`, `jaxlib`, `equinox`, `numpy`, `scipy`, `optax`.
 
 ---
@@ -214,30 +215,42 @@ export_soma_usd("anim.usda", layer, result.rotations, result.root_translation,
 
 ### Visualization
 
+`--soma-model` is optional in every visualization tool: without it the rig is
+built from the resolved upstream assets (as `SOMALayer.from_upstream_assets()`
+does); it accepts NVIDIA's `SOMA_neutral.npz` or a SOMA-JAX archive. Offscreen
+rendering picks EGL/OSMesa by itself on a machine without a display (see
+[`INSTALL.md`](INSTALL.md#offscreen--headless-rendering)).
+
 ```bash
 # Export rest mesh to OBJ
-python tools/vis/vis_mesh_export.py \
-    --soma-model SOMA_neutral.npz --output rest.obj
+python tools/vis/vis_mesh_export.py --output rest.obj
 
 # Export full animation as PLY frames
 python tools/vis/vis_mesh_export.py \
-    --soma-model SOMA_neutral.npz --animation anim.soma.npz \
+    --animation anim.soma.npz \
     --output-dir frames/ --format ply --all-frames
 
-# Static render with PyRender
+# Static render with PyRender (an explicit asset, e.g. the downloaded one)
 python tools/vis/vis_pyrender.py \
-    --soma-model SOMA_neutral.npz --output rest.png
+    --soma-model assets/third_party/SOMA_neutral.npz --output rest.png
 
-# Interactive viewer
-python tools/vis/vis_pyrender.py \
-    --soma-model SOMA_neutral.npz --animation anim.soma.npz --interactive
+# Interactive viewer (needs a display)
+python tools/vis/vis_pyrender.py --animation anim.soma.npz --interactive
 
-# Demo: comparison of rest / posed / multi-model meshes + animated GIF
+# Demo: rest / custom shape / posed stills + animated GIF
 python tools/pipeline/demo_soma_vis.py \
-    --soma-model SOMA_neutral.npz \
-    --smpl-model SMPL_NEUTRAL.pkl \
-    --smplx-model SMPLX_NEUTRAL.npz \
-    --output-dir demo_renders/ --gif demo.gif --num-frames 30
+    --output-dir demo_renders/ --gif demo_renders/demo.gif --num-frames 30
+
+# Demo: every identity model on one SOMA skeleton and motion, skeleton drawn
+# inside each body. MHR/Anny/Garment packs come from
+# tools/pipeline/build_identity_packs.py (MHR needs torch); SMPL-family columns
+# need the registration-only SMPL / SMPL-X model files.
+python tools/pipeline/demo_soma_vis.py --side-by-side --soma-skeleton-overlay \
+    --mhr-identity assets/identity/identity_mhr.npz \
+    --anny-identity assets/identity/identity_anny.npz \
+    --garment-identity assets/identity/identity_garment.npz \
+    --smpl-model SMPL_NEUTRAL.pkl --smplx-model SMPLX_NEUTRAL.npz \
+    --output-dir demo_renders/ --gif demo_renders/side_by_side.gif
 ```
 
 ### Conversion Tools
@@ -249,7 +262,7 @@ python tools/pipeline/demo_soma_vis.py \
 | `tools/pipeline/motion2soma.py` | SMPL-X motion → SOMA NPZ |
 | `tools/convert/shape_convert.py` | Cross-model identity coefficient conversion |
 | `tools/convert/convert_gm_pca_to_npz.py` | GarmentMeasurement PCA packager |
-| `tools/download_assets.py` | fetch the NVIDIA source rig from HuggingFace (INSTALL.md §4.1) |
+| `tools/download_assets.py` | fetch the full-schema rig from HuggingFace (INSTALL.md §4.1) and any submodule asset that is missing or a Git LFS stub; stdlib only, sha256-verified |
 | `tools/vis/vis_mesh_export.py` | OBJ / PLY mesh export |
 | `tools/vis/vis_pyrender.py` | 3D rendering (static / interactive) |
 | `tools/pipeline/demo_soma_vis.py` | Interactive demo script |
@@ -304,6 +317,12 @@ tree.
 ```bash
 python -m pytest tests/ -q      # local checkout only
 ```
+
+A separate, portable **self-test does ship**: `python -m pytest tools/selftest
+-q` checks an install on any machine — imports, asset resolution, the geometry
+kernels and gradients on a synthetic rig, the layer on the real assets, and the
+command-line tools (see [`INSTALL.md`](INSTALL.md#5-verify)). It skips what the
+machine lacks instead of failing.
 
 Counts depend on what is installed. With `.[dev,vis]` alone the run reports
 **240 passed, 29 skipped** — the upstream-parity and USD modules skip because

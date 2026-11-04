@@ -11,7 +11,7 @@ hardware-portable graph.
 
 ![SOMA-JAX vs SOMA-X](assets/media/soma_x_vs_soma_jax.gif)
 
-<sub>Identical rig and motion, equal wall-clock. The frame counters show what eachpipeline gets through in that time.</sub>
+<sub>Identical rig and motion, equal wall-clock. The frame counters show what each pipeline gets through in that time.</sub>
 
 ## Overview
 
@@ -34,11 +34,16 @@ hardware-portable graph.
 ```bash
 git clone --recurse-submodules https://github.com/bozcomlekci/SOMA-JAX.git
 cd SOMA-JAX
-pip install -e ".[vis]"
-python tools/download_assets.py
+pip install -e ".[vis,usd]"
+python tools/download_assets.py                    # or --minimal: just what the quickstart needs
+python -m pytest tools/selftest -q -m "not slow"   # optional: check this machine (~1 min)
 ```
 
-For NVIDIA GPUs install a CUDA build of JAX (`pip install -U "jax[cuda12]"`;
+Python 3.10–3.14. The download script needs nothing beyond the standard
+library: it fetches the full-schema rig from Hugging Face and, because
+upstream keeps its assets in Git LFS, also any submodule file that arrived as an
+LFS pointer stub (a clone made without git-lfs) — all sha256-verified. For
+NVIDIA GPUs install a CUDA build of JAX (`pip install -U "jax[cuda12]"`;
 Blackwell cards need CUDA ≥ 12.8). Full setup — GPU, model assets, headless
 rendering, and the optional PyTorch + Warp stack for parity checks — is in
 [`docs/INSTALL.md`](docs/INSTALL.md).
@@ -104,7 +109,7 @@ by B=8192.
 
 ![float32 → TF32](assets/media/soma_jax_tf32_teaser.gif)
 
-<sub>Switching the hybrid pipeline to TF32 mid-motion reaches ~2.8× — a JAX-onlydeployment mode at ~sub-mm error. float32 stays the like-for-like comparison.</sub>
+<sub>Switching the hybrid pipeline to TF32 mid-motion reaches ~2.8× — a JAX-only deployment mode at ~sub-mm error. float32 stays the like-for-like comparison.</sub>
 
 Method, fairness checks and the full precision discussion:
 [`benchmarks/README.md`](benchmarks/README.md).

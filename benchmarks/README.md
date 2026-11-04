@@ -30,7 +30,9 @@ initialized`, sometimes only for particular shapes. See
 an RTX 5080 with the 12.9 wheels: all four pipelines benchmark, and the memory
 figures below reproduce (`fair` at B=64 lands on 1.86 GiB exactly).
 
-Run:
+Run (`pip install -e ".[plots]"` provides `matplotlib` + `tueplots` for the
+`plot_*.py` scripts; the timed sides need torch + `warp-lang`, see
+[`docs/INSTALL.md`](../docs/INSTALL.md)):
 
 ```bash
 # runtime (torch and JAX go in separate subprocesses — different CUDA stacks)
@@ -424,8 +426,18 @@ never released.
 that is why `linear` saves only ~64 MiB over full fit. Freeing the per-joint
 regressors once the matrix exists, and constructing the transfer lazily, would
 cut the SOMA-JAX baseline by roughly a third and move the crossover with SOMA-X
-to a smaller batch. Neither is done here: this page measures the code as it
-stands.
+to a smaller batch.
+
+> **Since these measurements**, the first of those two has happened: the
+> per-joint `RadialBasisFunction` objects are built only on first access
+> (`SkeletonTransfer.joint_pos_regressors`, used solely by the
+> `use_sparse_rbf_matrix=False` path), and the `(J, V)` matrix is computed on
+> the host with NumPy/SciPy — same float32 system and LAPACK `getrf`, matching
+> upstream to 2.6e-14 in float64 — instead of as eager JAX ops that recompiled
+> per support size (about a minute of layer construction on CPU, now seconds).
+> The table above predates the change and has not been re-measured on the GPU;
+> expect the fixed baseline to drop and the crossover to move to a smaller
+> batch. The transfer is still built eagerly.
 
 
 ## Fairness verification

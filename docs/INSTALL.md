@@ -18,6 +18,19 @@ cd SOMA-JAX
 git submodule update --init --recursive
 ```
 
+**Git LFS.** Upstream SOMA-X stores every file under `assets/` in Git LFS. With
+git-lfs installed *and initialised* (`git lfs install`, once per machine) the
+clone fetches them; otherwise each one arrives as a ~130-byte pointer stub.
+SOMA-JAX detects stubs rather than handing them to a loader, and
+`python tools/download_assets.py` (§4) fetches the real files for the pinned
+submodule commit without git-lfs, verifying each against its sha256 — the same
+script also covers a GitHub "Download ZIP" checkout, which has no submodules at
+all. To use git-lfs instead:
+
+```bash
+git lfs install && git submodule foreach --recursive git lfs pull
+```
+
 ## 2. Create an environment
 
 Any Python 3.10+ environment works (conda/mamba, `venv`, `uv`, …):
@@ -30,18 +43,40 @@ conda create -n soma-jax python=3.10 -y && conda activate soma-jax
 ## 3. Install the package
 
 ```bash
-pip install -e ".[dev,vis]"
+pip install -e ".[dev,vis,usd]"      # or ".[all]", which adds the plotting extra
 ```
 
 This installs:
 
 - **core** — `jax`, `jaxlib`, `equinox`, `numpy`, `scipy`, `optax`
 - **`dev`** — `pytest`, `pytest-xdist`
-- **`vis`** — `trimesh`, `pyrender` (OBJ/PLY export, offscreen rendering, GIFs)
+- **`vis`** — `trimesh`, `rtree`, `pyrender` (OBJ/PLY export, topology transfer
+  for the non-SOMA identity backends, offscreen rendering, GIFs). `rtree` backs
+  trimesh's closest-point queries; without it they fail, or
+  `compute_barycentric_coords` falls back to a nearest-centroid approximation
+  and warns.
+- **`usd`** — `usd-core`. `SOMALayer.from_upstream_assets()` reads
+  `SOMA_template_rig.usda` through it, so the quickstart needs it; so does
+  USD import/export (`soma_jax.usd_io`). `SOMALayer.load()` of a prebuilt
+  archive (§4.2) does not.
+- **`plots`** — `matplotlib`, `tueplots`, for `benchmarks/plot_*.py`.
 
-USD import/export (`soma_jax.usd_io`) is optional; add it with
-`pip install -e ".[usd]"` (or `pip install usd-core`). Without it the rest of
-the package works normally and only USD calls raise.
+Every dependency ships binary wheels for Linux (x86-64, aarch64), macOS on
+Apple silicon and Windows (x86-64), on Python 3.10–3.14 (current jaxlib has no
+Intel-macOS wheels). The dependency floors are the oldest versions verified to work
+together (`jax` 0.4.26, `optax` 0.2.2, `numpy` 1.24.1; see the comment in
+`pyproject.toml`).
+
+A **non-editable** install (`pip install .`, or `pip install
+git+https://github.com/bozcomlekci/SOMA-JAX`) works too, but the package then
+lives in `site-packages` and cannot see the checkout's asset directories.
+Point it at them, or at any shared copy, with `SOMA_JAX_ASSETS`
+(`os.pathsep`-separated; searched first):
+
+```bash
+export SOMA_JAX_ASSETS=/data/soma/assets                  # e.g. a cluster-wide copy
+python tools/download_assets.py --output-dir "$SOMA_JAX_ASSETS"
+```
 
 ### SMPL-JAX (optional)
 
@@ -83,9 +118,20 @@ pip install -U nvidia-cublas-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 \
 ## 4. Obtain and prepare the SOMA model asset
 
 Model archives are deliberately excluded from Git, so a clone does **not**
-contain any model data. §4.1 downloads the one NVIDIA source file that must be
-fetched; from there `SOMALayer.from_upstream_assets()` builds the rig directly
-and nothing further is required.
+contain any model data. One command fetches whatever this checkout lacks:
+
+```bash
+python tools/download_assets.py            # everything (~1.2 GB if no LFS data arrived)
+python tools/download_assets.py --minimal  # only what from_upstream_assets() needs (~370 MB)
+python tools/download_assets.py --check    # report, download nothing
+```
+
+It needs only the Python standard library — not JAX, not `huggingface_hub`
+(used when installed; `HF_ENDPOINT` mirrors and `HF_TOKEN` are honoured either
+way) — so it also runs before the package is installed. §4.1 below is the
+manual equivalent for the one NVIDIA file that must come from Hugging Face; from
+there `SOMALayer.from_upstream_assets()` builds the rig directly and nothing
+further is required.
 
 §4.2 additionally bakes those inputs into a single self-contained archive:
 
@@ -97,8 +143,8 @@ That archive is what `SOMALayer.load(...)` takes, and it is **not**
 byte-compatible with NVIDIA's upstream `SOMA_neutral.npz`: SOMA-JAX uses
 `v_template`, dense `weights`, `parents`, and `J_regressor`, while the upstream
 archive uses `mean`, sparse skinning arrays, and `joint_parent_ids`. Passing the
-upstream file straight to `load(...)` therefore fails with a missing-key error —
-use `from_upstream_assets()` for that file, or build the archive per §4.2.
+upstream file straight to `load(...)` raises a `ValueError` that says so — use
+`from_upstream_assets(npz_path=...)` for that file, or build the archive per §4.2.
 
 ### 4.0 Where assets live
 
@@ -111,12 +157,15 @@ second copy of ~1 GB of identical files, so `git submodule update --init
 
 | Location | Contents | Tracked? |
 |---|---|---|
-| `third_party/SOMA-X/assets/` | vendored upstream assets, used in place | submodule |
-| `assets/third_party/` | downloads (`tools/download_assets.py`) | git-ignored |
+| `$SOMA_JAX_ASSETS` | optional extra directories (`os.pathsep`-separated), searched first | — |
+| `third_party/SOMA-X/assets/` | vendored upstream assets, used in place | submodule (Git LFS) |
+| `assets/third_party/` | downloads (`tools/download_assets.py`), incl. stand-ins for LFS stubs | git-ignored |
 | `assets/` | archives this repo *builds*, e.g. `SOMA_neutral_fixed.npz` | tracked (large binaries excluded by extension) |
 
 `soma_jax.assets.resolve()` searches those in order, so code and tests never
-hardcode a layout. Check what is present with:
+hardcode a layout. It skips Git LFS pointer stubs and the slim
+`SOMA_neutral.npz` wherever they are found, and names them in the error when
+nothing usable exists. Check what is present with:
 
 ```bash
 python tools/download_assets.py --check
@@ -129,9 +178,9 @@ Source repositories, if you need to fetch anything further:
 
 ### 4.1 Download the public NVIDIA source asset
 
-Install the Hugging Face client, then download the full-schema archive from an
-immutable revision of the official [`nvidia/SOMA-X`](https://huggingface.co/nvidia/SOMA-X)
-repository:
+`tools/download_assets.py` does this for you. By hand: install the Hugging Face
+client, then download the full-schema archive from an immutable revision of the
+official [`nvidia/SOMA-X`](https://huggingface.co/nvidia/SOMA-X) repository:
 
 ```bash
 pip install huggingface_hub
@@ -162,14 +211,24 @@ missing every rig array this conversion needs — `bind_pose_world`,
 `bind_pose_local`, `bind_shape`, `joint_names`, `joint_parent_ids`,
 `t_pose_world`, `t_pose_local` and the four `skinning_weights_*` entries.
 `soma_jax.assets.resolve()` refuses to return it for this reason. It is the
-*only* asset that must be downloaded; everything else comes from the submodule.
+*only* asset that must be downloaded when the submodule's LFS data is present;
+everything else comes from the submodule.
+
+Do not substitute a newer `nvidia/SOMA-X` revision for the submodule's files
+either: from v0.2.2 on, upstream ships a simplified `SOMA_template_rig.usda`
+("removes unused helper joints", 28 MB instead of 345 MB) and a revised
+procedural JSON, which are not the v0.2.1 rig this port is pinned and
+parity-tested against. `download_assets.py` verifies every file against the
+pinned commit's sha256 and rejects anything else.
 
 ### 4.2 Build the SOMA-JAX archive (optional)
 
-> **You probably do not need this.** Since the torch-free rig merge landed,
-> `SOMALayer.from_upstream_assets()` builds the rig directly from the two files
-> §4.1 downloaded — no PyTorch, no `third_party/SOMA-X`, and it is the only route
-> to upstream's *default* 122-joint procedural rig:
+> **You do not need this.** `SOMALayer.from_upstream_assets()` builds both of
+> upstream's rigs directly from `SOMA_neutral.npz` + `SOMA_template_rig.usda` —
+> no PyTorch, no upstream package — including upstream's *default* 122-joint
+> procedural rig, whose 78-joint public half it derives with the ported
+> `derive_soma_rig_without_procedural_joints` (it matches this archive to
+> float32 round-off):
 >
 > ```python
 > from soma_jax import SOMALayer
@@ -200,16 +259,19 @@ import torch
 
 sys.path.insert(0, "third_party/SOMA-X")
 from soma.soma import SOMALayer as TorchSOMA
+from soma_jax.assets import data_root, resolve
 
 spec = importlib.util.spec_from_file_location("bsr", "tools/pipeline/build_soma_rig.py")
 bsr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bsr)
 
 # The upstream layer is the authority on the merged rig (npz + template USD).
-tl = TorchSOMA(data_root="assets/third_party", identity_model_type="soma", device="cpu",
+# data_root() is one directory over the submodule and the downloads, which is
+# the layout upstream expects.
+tl = TorchSOMA(data_root=str(data_root()), identity_model_type="soma", device="cpu",
                mode="dense", enable_procedural_transforms=False,
-               load_correctives_model=False)
-src = dict(np.load("assets/third_party/SOMA_neutral.npz", allow_pickle=False))
+               correctives_model_path=None)
+src = dict(np.load(resolve("SOMA_neutral.npz"), allow_pickle=False))
 
 weights = tl.skeleton_transfer.skinning_weights.numpy().astype(np.float32)
 bind_world = tl.skeleton_transfer.bind_world_transforms.numpy().astype(np.float32)
@@ -306,6 +368,25 @@ print(f"SOMA rig OK: {layer.v_template.shape[0]} vertices, "
 # ...or, if you built the §4.2 archive:
 # layer = SOMALayer.load("assets/SOMA_neutral_fixed.npz")
 PY
+python -m pytest tools/selftest -q  # portable self-test, shipped with the repo
+```
+
+`tools/selftest` checks *this* machine end to end: every module imports, asset
+resolution (Git LFS stubs, the slim archive, `SOMA_JAX_ASSETS`), the geometry
+kernels and their gradients on a synthetic rig, the layer on the real assets
+(README quickstart, procedural rig, `jit`/`vmap`/`grad`, low LOD, bone scales,
+pose inversion, NPZ and USD round trips, two non-SOMA identity backends) and the
+command-line tools, including an offscreen render. With torch + `warp-lang`
+installed it also compares the forward — and the corrective checkpoint — against
+upstream SOMA-X from the submodule. Tests whose assets or
+optional packages are missing skip with the reason; `-m "not slow"` keeps the
+asset-free subset (about a minute). JAX runs on its default backend —
+`SOMA_JAX_TEST_PLATFORM=cpu|gpu` pins it.
+
+The developer suite in `tests/` is kept local (see
+[`DESCRIPTION.md`](DESCRIPTION.md#testing)); from a checkout that has it:
+
+```bash
 python -m pytest tests/ -q          # 240 passed / 29 skipped with .[dev,vis];
                                     # 457 collected with torch+SOMA-X+usd-core.
                                     # Runs on CPU; SOMA_JAX_TEST_PLATFORM=gpu to opt in
@@ -314,13 +395,26 @@ python -m pytest tests/ -q          # 240 passed / 29 skipped with .[dev,vis];
 
 ## Offscreen / headless rendering
 
-`pyrender` renders through OpenGL. On a headless machine use the EGL backend:
+`pyrender` renders through OpenGL. With no display, the render and demo
+scripts pick a headless backend themselves (`tools/_common.py`): **EGL** when
+`libEGL` is installed — Mesa's software EGL works without a GPU — then
+**OSMesa**. An explicit `PYOPENGL_PLATFORM` always wins.
 
 ```bash
-export PYOPENGL_PLATFORM=egl        # the render/demo scripts set this for you
+sudo apt install libegl1            # Debian/Ubuntu (Fedora: dnf install mesa-libEGL)
+export PYOPENGL_PLATFORM=egl        # optional — chosen automatically without a display
 ```
 
-If EGL is unavailable, install `osmesa` and set `PYOPENGL_PLATFORM=osmesa`.
+OSMesa (`apt install libosmesa6`, `PYOPENGL_PLATFORM=osmesa`) needs a newer
+PyOpenGL than the 3.1.0 that `pyrender` pins — 3.1.0 fails with `cannot import
+name 'OSMesaCreateContextAttribs'`:
+
+```bash
+pip install "PyOpenGL>=3.1.5"       # pip reports pyrender's pin as a conflict; it works
+```
+
+A virtual X display works with no extra libraries: `xvfb-run -a python
+tools/vis/vis_pyrender.py ...`.
 
 ## Optional: SOMA-X parity & benchmarks (PyTorch + Warp)
 
@@ -328,8 +422,16 @@ The parity tests (`tests/test_soma_x_parity.py`) and the `benchmarks/` scripts
 compare against the original SOMA-X, which runs on **PyTorch + NVIDIA Warp**:
 
 ```bash
-pip install torch nvidia-warp        # match your CUDA; see the PyTorch install matrix
+pip install torch warp-lang          # match your CUDA; see the PyTorch install matrix
+# CPU only:  pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
+
+(The Warp package on PyPI is `warp-lang`; there is no `nvidia-warp`.) The
+scripts import upstream from the pinned `third_party/SOMA-X` submodule unless a
+`soma` package is installed. Warp's JAX kernel — the "hybrid" pipeline — runs
+only with JAX on a CUDA GPU; elsewhere the benchmark skips that row and
+`tools/compare_render/pose_somajax.py` falls back to the pure-JAX SVD. The
+SOMA-X side runs on CPU as well (`pose_somax.py --device cpu`).
 
 Note the two backends ship **different CUDA runtimes** — JAX bundles CUDA 12,
 while a recent PyTorch build may need CUDA 13 NVRTC. Loading both into one
@@ -351,13 +453,30 @@ The BVH motion clips used by some render scripts are not included; point
 
 - **`jax` uses CPU on a GPU box** — you installed the CPU wheel; reinstall with
   `pip install -U "jax[cuda12]"`.
-- **`OpenGL`/`EGL` errors when rendering** — set `PYOPENGL_PLATFORM=egl` (or
-  `osmesa`); confirm a GPU/driver is visible.
+- **`OpenGL`/`EGL` errors when rendering** — install EGL (`apt install
+  libegl1`) or see [Offscreen / headless rendering](#offscreen--headless-rendering);
+  `NoSuchDisplayException: Cannot connect to "None"` means no display and no
+  headless backend was selected.
 - **Submodule dirs empty** — run `git submodule update --init --recursive`.
-- **Asset not found** — complete step 4 and check that
-  `assets/SOMA_neutral_fixed.npz` exists.
-- **`KeyError: 'v_template'`** — an upstream NVIDIA archive was passed directly
-  to SOMA-JAX; load `assets/SOMA_neutral_fixed.npz` instead.
+- **"Found only Git LFS pointer stub(s)"** — the clone was made without git-lfs
+  active; run `python tools/download_assets.py` (or `git lfs install && git
+  submodule foreach --recursive git lfs pull`).
+- **Asset not found** — complete step 4; `python tools/download_assets.py
+  --check` lists what is missing. With a non-editable install, set
+  `SOMA_JAX_ASSETS`.
+- **`ValueError: ... is NVIDIA's upstream SOMA_neutral.npz`** (formerly
+  `KeyError: 'v_template'`) — an upstream archive was passed to
+  `SOMALayer.load`; use `SOMALayer.from_upstream_assets(npz_path=...)`.
+- **`ImportError: USD I/O requires the 'usd-core' package`** —
+  `from_upstream_assets()` reads the template USD: `pip install -e ".[usd]"`.
+- **`No module named 'rtree'`** — trimesh's closest-point query needs it:
+  `pip install -e ".[vis]"` (or `pip install rtree`).
+- **`AttributeError: _ARRAY_API not found`** importing JAX — a jaxlib built for
+  NumPy 1.x (≤ 0.4.25) under NumPy 2; upgrade JAX (`pip install -U jax jaxlib`).
+- **`AttributeError: module 'jax.random' has no attribute 'KeyArray'`** — an
+  old chex/optax pair; `pip install -U optax chex`.
+- **`No FFI handler registered ... on a platform Host`** — Warp's JAX kernel
+  was used with JAX on CPU; it needs a CUDA GPU (use `rotation_backend="jax"`).
 - **`KeyError: 'bind_shape'` during conversion** — the slim v0.2.1 GitHub asset
   was downloaded. Repeat step 4.1 using the pinned full-schema Hugging Face
   revision.

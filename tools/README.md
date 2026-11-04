@@ -59,4 +59,23 @@ apart — float32 is the fair comparison.
 | Script | Purpose |
 |---|---|
 | `audit_soma_features.py` | Audit feature parity of SOMA-JAX vs upstream SOMA-X. |
-| `download_assets.py` | Fetch model weights / rigs from HuggingFace into `assets/`. |
+| `download_assets.py` | Fetch what the checkout lacks into `assets/third_party/`: the full-schema rig from HuggingFace, plus any submodule asset that is missing or a Git LFS pointer stub (from the pinned upstream commit). Standard library only — runs before JAX is installed; every file sha256-verified. `--minimal` fetches only what `SOMALayer.from_upstream_assets()` needs; `--check` reports. |
+| `_common.py` | Helpers the scripts share (not a CLI): `ensure_headless_gl()` picks EGL/OSMesa for pyrender when there is no display; `load_layer()` builds a layer from no asset (resolved upstream files), NVIDIA's `SOMA_neutral.npz`, or a SOMA-JAX archive. |
+
+## selftest/ — portable install check
+
+```bash
+python -m pytest tools/selftest -q                 # full (~6 min on 4 CPU cores)
+python -m pytest tools/selftest -q -m "not slow"   # asset-free subset (~1 min)
+```
+
+Verifies an install on the machine at hand: imports and metadata, asset
+resolution (Git LFS stubs, the slim archive, `SOMA_JAX_ASSETS`), geometry kernels
+and their gradients on a synthetic rig, the layer on the real assets (README
+quickstart, procedural rig, `jit`/`vmap`/`grad`, low LOD, bone scales, pose
+inversion, NPZ/USD round trips, identity backends) and these tools, including an
+offscreen render whose shading is checked. Where torch + `warp-lang` are
+installed, `test_upstream_parity.py` also checks the forward and the corrective
+checkpoint against upstream SOMA-X (5e-5 m / 1e-4 m guards). Missing assets or optional packages
+skip with the reason. Unlike the local developer suite in `tests/`, this one
+ships with the repository.

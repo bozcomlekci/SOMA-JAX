@@ -50,7 +50,15 @@ BLAS/driver versions.
 `apply_correctives=False`. Pose correctives are implemented and unit-tested on
 the JAX side (`tests/test_soma_layer.py`), but there is **no test comparing a
 real corrective checkpoint against upstream**, so correctives are outside the
-"verified exact" claim below. The chain this covers:
+"verified exact" claim below. (The shipped self-test now has one —
+`tools/selftest/test_upstream_parity.py`, which runs where torch and warp-lang
+are installed: the shipped checkpoint, converted with
+`tools/convert/convert_correctives_pt_to_npz.py`, on upstream's default
+procedural rig with `global_scale=1` matches upstream's `forward(...,
+apply_correctives=True)` to **0.014 mm max** at pose σ=0.45, where the
+correctives themselves move the surface by up to 72 mm. Upstream refuses
+correctives on its non-procedural rig; this layer applies them there.) The
+chain this covers:
 
 | Stage | SOMA-JAX | Upstream match |
 |---|---|---|
@@ -110,19 +118,19 @@ well as from here.
 | `usd_io.py` | `io.py` (USD half) | port, including the LOD-discovery chain (`find_lod_skin_mesh_name` / `load_lod_rig`, verified at 18056/4505/612 verts) and `load_template_rig` for the 122-joint skeleton. UV primvar filtering now checks type **and** interpolation, matching upstream |
 | `io.py` | `io.py` (NPZ half) | port — `keep_root=False` default that actually strips Root from `poses`/`joint_names`, `absolute_pose` inferred from `joint_orient`, pose-shape `ValueError`, `global_scale`/`hand_type`. Verified interchangeable in both directions against upstream |
 | `units.py` | `units.py` | port |
-| `assets.py` | `assets.py` | same role, **different mechanism.** Upstream downloads a HuggingFace snapshot; this resolves the same files from `assets/third_party/` and the vendored submodule, and materialises a `data_root` view over them. Deliberate — the assets already ship in `third_party/SOMA-X`, so re-downloading them would be the divergence. `tools/download_assets.py` covers the fetch case |
+| `assets.py` | `assets.py` | same role, **different mechanism.** Upstream downloads a HuggingFace snapshot; this resolves the same files from `assets/third_party/` and the vendored submodule, and materialises a `data_root` view over them. Deliberate — the assets already ship in `third_party/SOMA-X`, so re-downloading them would be the divergence. `tools/download_assets.py` covers the fetch case, including submodule files that are Git LFS pointer stubs (fetched for the pinned commit and sha256-verified against `SOMA_X_ASSET_FILES`); `resolve()` skips such stubs and the slim archive, and `$SOMA_JAX_ASSETS` adds search roots |
 | `smpl/__init__.py` | `smpl/__init__.py`, `smpl/transfer.py` | `SMPLFamilyPoseTransferResult`, `SMPLFamilyTopologyBridge` (two-stage source→SOMA-wrap→target) and `transfer_pose_between_layers` all ported. `BarycentricBridge` is a SOMA-JAX-only one-stage helper that stops at SOMA topology. Upstream's `SMPLLayer`/`SMPLXLayer` rigs not ported — this package drives `soma_jax.body_models` |
-| `geometry/transforms.py` | `geometry/transforms.py` | alignment core is a port — matches upstream `align_vectors` in float64 to 1e-15 (CPU) / 1e-13 (GPU) for all three methods (float32: ≤1.5e-6 `auto`/`newton-schulz`, ≤9e-6 `kabsch` — SVD round-off, not algorithm). `rotmat_to_axis_angle` ports the three-branch form including near-π, with one **deliberate** divergence: upstream's small-angle branch returns 2× the correct vector, so this returns the correct one. Euler/quaternion conversions ported |
+| `geometry/transforms.py` | `geometry/transforms.py` | alignment core is a port — matches upstream `align_vectors` in float64 to 1e-15 (CPU) / 1e-13 (GPU) for all three methods (float32: ≤1.5e-6 `auto`/`newton-schulz`, ≤9e-6 `kabsch` — SVD round-off, not algorithm). `rotmat_to_axis_angle` ports the three-branch form including near-π, with one **deliberate** divergence: upstream's small-angle branch returns 2× the correct vector, so this returns the correct one. Euler/quaternion conversions ported. JAX-only: `rotation_from_covariance` / `regularize_covariance_with_reference` keep their gradients finite on degenerate covariances (all-zero, repeated singular values in the discarded SVD branch) with forward values unchanged — upstream does not differentiate through them |
 | `geometry/lbs.py` | `geometry/lbs.py` | port |
 | `geometry/batched_skinning.py` | `geometry/batched_skinning.py` | port. Class defaults match upstream (`sparse_k=8`, `hips_idx=1`) and `align_translation` anchors X and Z on the translation joint as upstream does, leaving Y from FK |
 | `geometry/rig_utils.py` | `geometry/rig_utils.py` | port. World↔local conversion, upstream's `precompute_joint_orient`, and `PoseMirrorSOMA`/`PoseMirrorMHR` (bit-exact negate-parameter tables). The old heuristic is kept under its own name, `infer_joint_orient_from_rest` |
-| `geometry/skeleton_transfer.py` | `geometry/skeleton_transfer.py` | port (pure-PyTorch path) |
-| `geometry/barycentric_interp.py` | `geometry/barycentric_interp.py` | the 4-coord deformation path is a port, matching upstream to 1.2e-7 (`normal_scale="area"`) and 3.6e-7 (`"edge"`) in float32. The nearest-face search, singular-tetrahedron fallback, and the 3-coord compatibility mode are JAX-only; upstream's stateful `BarycentricInterpolator` correspondence API is not ported |
-| `geometry/interpolate.py` | `geometry/interpolate.py` | port — RBF basis weights match upstream to **2.3e-13 in float64** across all three kernels, i.e. the same algorithm. In float32 the linear solve's conditioning bounds it: 6.0e-6 (`linear`, the kernel `SkeletonTransfer` uses on both sides), 1.3e-6 (`gaussian`), 9.1e-5 (`thin_plate_spline`, the class default but unused by SOMA) |
+| `geometry/skeleton_transfer.py` | `geometry/skeleton_transfer.py` | port (pure-PyTorch path). The `(J, V)` RBF matrix is built on the host (see `interpolate.py`); the per-joint regressor objects only on first use (`joint_pos_regressors`) |
+| `geometry/barycentric_interp.py` | `geometry/barycentric_interp.py` | the 4-coord deformation path is a port, matching upstream to 1.2e-7 (`normal_scale="area"`) and 3.6e-7 (`"edge"`) in float32. The nearest-face search, singular-tetrahedron fallback, and the 3-coord compatibility mode are JAX-only (without trimesh + rtree the search degrades to nearest face centroid and warns); upstream's stateful `BarycentricInterpolator` correspondence API is not ported |
+| `geometry/interpolate.py` | `geometry/interpolate.py` | port — RBF basis weights match upstream to **2.3e-13 in float64** across all three kernels, i.e. the same algorithm. In float32 the linear solve's conditioning bounds it: 6.0e-6 (`linear`, the kernel `SkeletonTransfer` uses on both sides), 1.3e-6 (`gaussian`), 9.1e-5 (`thin_plate_spline`, the class default but unused by SOMA). `rbf_basis_weights_np` — the host-side twin `SkeletonTransfer` uses for its one-off setup — matches upstream to 2.6e-14 (`linear`), 1.9e-14 (`gaussian`) and 1.1e-11 (`thin_plate_spline`) in float64 on SOMA support sets; in float32 it lands in the same few-µm band as the JAX class on the full rig |
 | `geometry/laplacian.py` → `LaplacianMesh` | `geometry/laplacian.py` (`LaplacianMesh`) | port — 6.9e-6 m |
 | `geometry/laplacian.py` → `laplacian_solve` | — | **JAX-only, different formulation** (zero-energy membrane) |
 | `geometry/chamfer.py` | — | **JAX-only point-cloud loss.** Bidirectional mean-squared vertex-to-vertex; upstream's `ChamferLoss` is a one-way point-to-*triangle* query. Different loss, not a port |
-| `geometry/warp_kabsch.py` | `geometry/align_vectors_warp.py` | **diverges** — implements `"kabsch"`, not upstream's default `"auto"` |
+| `geometry/warp_kabsch.py` | `geometry/align_vectors_warp.py` | **diverges** — implements `"kabsch"`, not upstream's default `"auto"`. Runs only with JAX on a CUDA GPU (Warp's XLA FFI registers no host handler); `is_available()` reports that |
 | `body_models/model_io.py` | `_smpl_family_loader.py` | port |
 | `types.py` | — | JAX-only (`SOMAParams` / `SOMAOutput`) |
 | `pose_inversion.py` | — | JAX-only lightweight alternative inverter |
@@ -188,6 +196,14 @@ pose contract is 78 joints / 77 posable, and `pose()` returns those either way.
 | rest | **0.34 mm** | 0.009 mm |
 | σ=0.15 rad | **0.74 mm** | 0.024 mm |
 | σ=0.45 rad | **1.16 mm** | 0.062 mm |
+
+Measured live against the pinned submodule instead — both sides on CPU,
+upstream in `mode="dense"`, `identity_coeffs ~ N(0, 0.5²)`, LBS-only, the
+current code — the gap is far smaller: **0.0024 / 0.0033 / 0.0088 mm** max at
+rest / σ=0.15 / σ=0.45, and 0.039 mm at σ=1.2, against a procedural-vs-plain
+difference of 9–178 mm that both sides reproduce identically
+(`tools/selftest/test_upstream_parity.py` guards it at 5e-5 m). The table above
+is against the captured reference of `tests/test_procedural_parity.py`.
 
 Four things had to be right *together* — each was found by measurement, and any
 one alone leaves 16–52 mm:
