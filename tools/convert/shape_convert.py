@@ -41,6 +41,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 BACKENDS = ["soma", "smpl", "smplx", "smplh", "mhr", "anny", "garment_measurement"]
+JACOBIAN_CHUNK = 16     # tangent columns per compiled forward-mode pass
 
 
 def parse_args():
@@ -68,6 +69,28 @@ def parse_args():
     return p.parse_args()
 
 
+def forward_jacobian(fn, num_coeffs: int, chunk: int = JACOBIAN_CHUNK):
+    """``c -> d fn(c) / dc`` by forward mode, ``chunk`` tangent columns at a time.
+
+    One ``jax.jacfwd`` over the whole skeleton fit is a single very large
+    batched program; the XLA in the oldest supported JAX (0.4.26) segfaults
+    compiling it. Fixed-size chunks (the last one zero-padded) compile once and
+    cost the same arithmetic.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    jvps = jax.jit(lambda c, tangents: jax.vmap(lambda t: jax.jvp(fn, (c,), (t,))[1])(tangents))
+    n_chunks = -(-num_coeffs // chunk)
+    basis = jnp.zeros((n_chunks * chunk, num_coeffs), jnp.float32)
+    basis = basis.at[jnp.arange(num_coeffs), jnp.arange(num_coeffs)].set(1.0)
+
+    def jacobian(c):
+        cols = [jvps(c, basis[i * chunk:(i + 1) * chunk]) for i in range(n_chunks)]
+        return jnp.concatenate(cols, axis=0)[:num_coeffs].T          # (M, K)
+    return jacobian
+
+
 def fit_coefficients(body_fn, target, num_coeffs: int, iters: int = 8, prior: float = 0.0):
     """Damped Gauss-Newton: ``argmin_c ||body_fn(c) - target||^2 + mu ||c||^2``.
 
@@ -86,7 +109,7 @@ def fit_coefficients(body_fn, target, num_coeffs: int, iters: int = 8, prior: fl
 
     target = jnp.asarray(target)
     residual = jax.jit(lambda c: (body_fn(c) - target).reshape(-1))
-    jacobian = jax.jit(jax.jacfwd(lambda c: body_fn(c).reshape(-1)))
+    jacobian = forward_jacobian(lambda c: body_fn(c).reshape(-1), num_coeffs)
 
     c = jnp.zeros((num_coeffs,), jnp.float32)
     eye = jnp.eye(num_coeffs, dtype=jnp.float32)
