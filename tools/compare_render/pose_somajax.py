@@ -24,11 +24,16 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--motion", required=True)
-    p.add_argument("--hf", default=str(REPO / "assets" / "hf"))
+    p.add_argument("--hf", default=None,
+                   help="asset directory holding SOMA_neutral.npz "
+                        "(default: soma_jax.assets.data_root())")
     p.add_argument("--bench-batch", type=int, default=2048,
                    help="batch size for the reported large-batch throughput")
     p.add_argument("--out", required=True)
     args = p.parse_args()
+    if args.hf is None:
+        from soma_jax.assets import data_root
+        args.hf = str(data_root())
 
     import jax
     import jax.numpy as jnp
@@ -64,9 +69,14 @@ def main():
     absolute = bool(m["absolute"])
     T = rotmats.shape[0]
 
-    # JAX + Warp hybrid skeleton transfer (Warp svd3 Kabsch).
+    # JAX + Warp hybrid skeleton transfer (Warp svd3 Kabsch). Warp's XLA FFI
+    # only runs on a CUDA GPU; elsewhere fall back to the pure-JAX SVD path.
+    from soma_jax.geometry.warp_kabsch import is_available, unavailable_reason
+    backend = "warp" if is_available() else "jax"
+    if backend == "jax":
+        print(f"[soma_jax] Warp hybrid unavailable ({unavailable_reason()}); using JAX SVD")
     st = SkeletonTransfer(parents, bind_world, bind_shape, weights, rotation_method="auto",
-                          vertex_ids_to_exclude=facial.tolist(), rotation_backend="warp")
+                          vertex_ids_to_exclude=facial.tolist(), rotation_backend=backend)
     levels = compute_skeleton_levels(parents)
     w_idx_np, w_val_np = topk_skinning(weights, 8)
     w_idx, w_val = jnp.asarray(w_idx_np), jnp.asarray(w_val_np)
@@ -121,7 +131,7 @@ def main():
     np.savez(args.out, verts=verts, faces=faces, fps=fps, batch=B, bench_total_s=total,
              joints=joints, joint_names=np.asarray([str(n) for n in rig["joint_names"]]),
              parents=parents_out, duration_s=float(m["duration_s"]), play_fps=float(m["play_fps"]),
-             label="SOMA-JAX (JAX + Warp)")
+             label="SOMA-JAX (JAX + Warp)" if backend == "warp" else "SOMA-JAX (JAX)")
     print(f"[soma_jax] render T={T}  |  full-forward B={B}: {total*1e3:.2f} ms "
           f"=> {fps:.0f} meshes/s  wrote {args.out}")
 

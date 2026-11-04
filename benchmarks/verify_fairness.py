@@ -33,6 +33,9 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+# Upstream SOMA-X (the reference) comes from the pinned submodule unless a
+# `soma` package is installed; appended so it never shadows anything else.
+sys.path.append(str(REPO / "third_party" / "SOMA-X"))
 
 
 def _build_fair_pipeline(hf_dir: Path, rotation_backend: str):

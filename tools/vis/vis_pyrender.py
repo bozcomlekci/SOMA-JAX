@@ -5,22 +5,23 @@ Requires `pyrender` and `trimesh`: ``pip install pyrender trimesh``
 
 Usage::
 
-    # Static render of rest mesh
-    python tools/vis_pyrender.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
-        --output rest.png
+    # Static render of the rest mesh (rig built from the resolved upstream
+    # assets; pass --soma-model for NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive)
+    python tools/vis/vis_pyrender.py --output rest.png
 
     # Static render of a specific frame
-    python tools/vis_pyrender.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+    python tools/vis/vis_pyrender.py \\
         --animation path/to/anim.soma.npz \\
         --frame 0 --output frame0.png
 
-    # Interactive viewer
-    python tools/vis_pyrender.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+    # Interactive viewer (needs a display)
+    python tools/vis/vis_pyrender.py \\
         --animation path/to/anim.soma.npz \\
         --interactive
+
+Offscreen rendering picks a headless OpenGL backend by itself when there is no
+display (EGL, then OSMesa — see ``tools/_common.py``); set
+``PYOPENGL_PLATFORM`` to override.
 """
 from __future__ import annotations
 import argparse
@@ -34,7 +35,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def parse_args():
     p = argparse.ArgumentParser(description="PyRender visualization for SOMA-JAX")
-    p.add_argument("--soma-model", required=True, help="SOMA_neutral.npz")
+    p.add_argument("--soma-model", default=None,
+                   help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
+                        "(default: build from the resolved upstream assets)")
     p.add_argument("--animation", default=None, help="Optional animation NPZ")
     p.add_argument("--output", default=None, help="Output image path (PNG)")
     p.add_argument("--frame", type=int, default=0, help="Animation frame index")
@@ -55,13 +58,25 @@ def parse_args():
     return p.parse_args()
 
 
-def _check_deps():
+def _check_deps(interactive: bool):
+    if not interactive:
+        from _common import ensure_headless_gl
+        try:
+            ensure_headless_gl()
+        except RuntimeError as e:
+            sys.exit(f"ERROR: {e}")
     try:
         import trimesh   # noqa: F401
         import pyrender  # noqa: F401
-    except ImportError:
-        print("ERROR: pyrender and trimesh are required.")
-        print("  pip install pyrender trimesh")
+    except ImportError as e:
+        # Report the real cause: a missing EGL/OSMesa library also surfaces
+        # here as an ImportError, and "install pyrender" would mislead.
+        print(f"ERROR: could not import pyrender/trimesh: {e}")
+        if getattr(e, "name", None) in ("pyrender", "trimesh"):
+            print("  pip install pyrender trimesh")
+        else:
+            print(f"  PYOPENGL_PLATFORM={os.environ.get('PYOPENGL_PLATFORM')!r} — "
+                  "see docs/INSTALL.md (Offscreen / headless rendering)")
         sys.exit(1)
 
 
@@ -100,14 +115,15 @@ def _compute_mesh(args, jnp, layer, SOMAParams):
 
 def main():
     args = parse_args()
-    _check_deps()
+    _check_deps(args.interactive)
 
     import trimesh
     import pyrender
     import jax.numpy as jnp
-    from soma_jax import SOMALayer, SOMAParams
+    from soma_jax import SOMAParams
+    from _common import load_layer
 
-    layer = SOMALayer.load(args.soma_model, identity_model_type=args.identity_model)
+    layer = load_layer(args.soma_model, identity_model_type=args.identity_model)
     vertices, faces, joints = _compute_mesh(args, jnp, layer, SOMAParams)
 
     # Build trimesh
@@ -135,14 +151,24 @@ def main():
     cam_pose[:3, 3] = center + np.array([0.0, 0.2, args.camera_distance])
     scene.add(cam, pose=cam_pose)
 
-    # Two directional lights
-    light = pyrender.DirectionalLight(color=[1, 1, 1], intensity=3.0)
-    light_pose1 = np.eye(4)
-    light_pose1[:3, 3] = center + np.array([2.0, 2.0, 2.0])
-    light_pose2 = np.eye(4)
-    light_pose2[:3, 3] = center + np.array([-2.0, 1.0, 1.5])
-    scene.add(light, pose=light_pose1)
-    scene.add(light, pose=light_pose2)
+    # Key + fill directional lights aimed at the mesh. A directional light
+    # shines down its node's -Z axis and ignores position, so each pose must
+    # carry a rotation. Colours are floats: pyrender reads an *integer* colour
+    # vector as 0-255, so [1, 1, 1] would be a near-black light.
+    def _aimed_at(target, eye):
+        z = eye - target
+        z = z / np.linalg.norm(z)
+        x = np.cross([0.0, 1.0, 0.0], z)
+        x = x / np.linalg.norm(x)
+        pose = np.eye(4)
+        pose[:3, :3] = np.stack([x, np.cross(z, x), z], axis=1)
+        pose[:3, 3] = eye
+        return pose
+
+    scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=2.5),
+              pose=_aimed_at(center, center + np.array([2.0, 2.0, 2.0])))
+    scene.add(pyrender.DirectionalLight(color=[0.9, 0.9, 1.0], intensity=1.0),
+              pose=_aimed_at(center, center + np.array([-2.0, 1.0, 1.5])))
 
     if args.interactive:
         pyrender.Viewer(scene, use_raymond_lighting=True)

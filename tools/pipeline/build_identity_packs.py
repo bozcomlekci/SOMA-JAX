@@ -132,13 +132,18 @@ def build_garment_pack(hf_dir: Path, out_path: Path):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--hf-dir", default=None,
-                   help="Directory containing the HuggingFace assets (downloaded from nvidia/SOMA-X)")
+                   help="Directory containing the HuggingFace assets (downloaded from "
+                        "nvidia/SOMA-X). Default: soma_jax.assets.data_root(), a single "
+                        "view over the submodule and downloaded assets.")
     p.add_argument("--output-dir", default="assets/identity",
                    help="Directory to write the converted .npz files into")
     p.add_argument("--backends", nargs="+", default=["mhr", "anny", "garment"],
                    choices=["mhr", "anny", "garment"])
     args = p.parse_args()
 
+    if args.hf_dir is None:
+        from soma_jax.assets import data_root
+        args.hf_dir = str(data_root(materialise=True))
     hf_dir = Path(args.hf_dir)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,9 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+# Upstream SOMA-X (the reference) comes from the pinned submodule unless a
+# `soma` package is installed; appended so it never shadows anything else.
+sys.path.append(str(REPO / "third_party" / "SOMA-X"))
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +445,11 @@ def main():
             bench_soma_jax_st(args.soma_asset, args.batches, args.warmup, args.iters,
                               rotation_backend="jax", matmul_precision=args.matmul_precision)
         )
+    if not args.skip_soma_jax_hybrid:
+        from soma_jax.geometry.warp_kabsch import is_available, unavailable_reason
+        if not is_available():
+            print(f"\n[soma_jax_hybrid] skipped: {unavailable_reason()}")
+            args.skip_soma_jax_hybrid = True
     if not args.skip_soma_jax_hybrid:
         payload["results"].append(
             bench_soma_jax_st(args.soma_asset, args.batches, args.warmup, args.iters,

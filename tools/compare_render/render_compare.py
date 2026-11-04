@@ -189,6 +189,9 @@ def main():
     n_b = T if faster_is_b else max(2, int(round(T / ratio)))
     print(f"[equal-time] ratio {ratio:.3f}x from {src}"
           f"   [capture fps would give {capture_ratio:.3f}x]")
+    if bench is not None and (fps_b >= fps_a) != faster_is_b:
+        print("[equal-time] NOTE: this machine's capture fps rank the two the other way "
+              "round; the GIF follows benchmarks/results/runtime.json")
     print(f"[equal-time] frames rendered: SOMA-X {n_a}  SOMA-JAX {n_b}  "
           f"over {T} realtime slots")
 
@@ -218,7 +221,9 @@ def main():
         frames.append(np.concatenate([ia, ib], axis=1))
 
     # Final popup (held ~2 s): the relative speed increase.
-    who = "SOMA-JAX" if fps_b >= fps_a else "SOMA-X"
+    # Same decision that allocated the frames above — the popup must not
+    # contradict the animation when the capture fps disagree with runtime.json.
+    who = "SOMA-JAX" if faster_is_b else "SOMA-X"
     banner = _centered_banner(
         frames[-1].copy(), f"{who}  ~{ratio:.1f}x  faster",   # last frame: counters at finals
         sub=f"same wall-clock time  ·  {max(n_a, n_b)} vs {min(n_a, n_b)} frames rendered  "

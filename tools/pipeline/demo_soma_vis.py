@@ -10,19 +10,20 @@ Requires: pyrender, trimesh, pillow (for image output)
 
 Usage::
 
-    # Quick demo with default settings
-    python tools/demo_soma_vis.py --soma-model path/to/SOMA_neutral.npz
+    # Quick demo with default settings (rig built from the resolved upstream
+    # assets; --soma-model takes NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive)
+    python tools/pipeline/demo_soma_vis.py
 
     # Demo with multiple identity models
-    python tools/demo_soma_vis.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+    python tools/pipeline/demo_soma_vis.py \\
         --smpl-model path/to/SMPL_NEUTRAL.pkl \\
         --output-dir demo_renders/
 
     # Animated GIF from sample poses
-    python tools/demo_soma_vis.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
-        --gif demo.gif --num-frames 30
+    python tools/pipeline/demo_soma_vis.py --gif demo.gif --num-frames 30
+
+Rendering picks a headless OpenGL backend by itself when there is no display
+(see ``tools/_common.py``).
 """
 from __future__ import annotations
 import argparse
@@ -36,7 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def parse_args():
     p = argparse.ArgumentParser(description="SOMA-JAX visualization demo")
-    p.add_argument("--soma-model", required=True, help="SOMA_neutral.npz")
+    p.add_argument("--soma-model", default=None,
+                   help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
+                        "(default: build from the resolved upstream assets)")
     p.add_argument("--smpl-model", default=None, help="Optional SMPL .pkl file")
     p.add_argument("--smplx-model", default=None, help="Optional SMPL-X .pkl/.npz file")
     p.add_argument("--smplh-model", default=None, help="Optional SMPL-H .pkl/.npz file")
@@ -181,18 +184,22 @@ def _pose_smplx(model, poses_seq, transl_seq):
     )
 
 
-def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_seq, transl_seq, n_id_coeffs=10):
+def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_seq, transl_seq, n_id_coeffs=10,
+                               return_joints=False):
     """Pose a SOMALayer with the given identity model over a (T, J, 3) sequence.
 
     SOMA-X reuses the SOMA topology and skeleton for every identity variant
     (smpl / smplx / mhr / anny / soma / garment_measurement). The identity model
     only chooses the rest-pose vertices; the LBS and joints are shared.
-    Returns (T, V, 3) posed vertices and the SOMA faces.
+    Returns (T, V, 3) posed vertices and the SOMA faces; with
+    ``return_joints=True`` also the (T, J, 3) posed joints and (J,) parents,
+    for the skeleton overlay.
     """
     import jax.numpy as jnp
     import numpy as np
-    from soma_jax import SOMALayer, SOMAParams
-    layer = SOMALayer.load(
+    from soma_jax import SOMAParams
+    from _common import load_layer
+    layer = load_layer(
         soma_path,
         identity_model_type=identity_type,
         identity_model_path=identity_path,
@@ -205,7 +212,7 @@ def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_se
         # Pad with zeros if the unified sequence is shorter than the SOMA skeleton.
         pad = np.zeros((T, n_joints - seq.shape[1], 3), dtype=np.float32)
         seq = np.concatenate([seq, pad], axis=1)
-    verts = []
+    verts, joints = [], []
     for i in range(T):
         params = SOMAParams(
             poses=jnp.asarray(seq[i]),
@@ -214,6 +221,10 @@ def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_se
         )
         out = layer(params)
         verts.append(np.array(out.vertices))
+        joints.append(np.array(out.joints))
+    if return_joints:
+        return (np.stack(verts, axis=0), np.array(layer.faces),
+                np.stack(joints, axis=0), np.asarray(layer._parents_np))
     return np.stack(verts, axis=0), np.array(layer.faces)
 
 
@@ -242,9 +253,10 @@ def pose_soma_identity_sequence(soma_path, identity_type, identity_path, soma_po
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from soma_jax import SOMALayer, SOMAParams
+    from soma_jax import SOMAParams
+    from _common import load_layer
     from soma_jax.geometry.transforms import axis_angle_to_rotmat
-    layer = SOMALayer.load(soma_path, identity_model_type=identity_type,
+    layer = load_layer(soma_path, identity_model_type=identity_type,
                            identity_model_path=identity_path)
     T = soma_poses.shape[0]
     J = soma_poses.shape[1]
@@ -624,14 +636,19 @@ def render_mesh_png(vertices, faces, output_path, width=512, height=512, color=(
 
 def main():
     args = parse_args()
+    if not args.no_render:
+        # Must precede the first pyrender import (PyOpenGL reads it once).
+        from _common import ensure_headless_gl
+        ensure_headless_gl()
     import jax.numpy as jnp
-    from soma_jax import SOMALayer, SOMAParams
+    from soma_jax import SOMAParams
+    from _common import load_layer
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading SOMA model...")
-    layer = SOMALayer.load(args.soma_model, identity_model_type="soma")
+    layer = load_layer(args.soma_model, identity_model_type="soma")
     n_joints = len(layer.joint_names)
     faces = np.array(layer.faces)
     print(f"  Joints: {n_joints}, Vertices: {layer.v_template.shape[0]}, Faces: {faces.shape[0]}")
@@ -651,7 +668,7 @@ def main():
     # 3. Animation
     poses_seq = sample_pose_sequence(n_joints, args.num_frames)
     transl = np.zeros((args.num_frames, 3), dtype=np.float32)
-    posed_verts_seq = []
+    posed_verts_seq, posed_joints_seq = [], []
     for i in range(args.num_frames):
         params = SOMAParams(
             poses=jnp.asarray(poses_seq[i]),
@@ -660,6 +677,7 @@ def main():
         )
         out = layer(params)
         posed_verts_seq.append(np.array(out.vertices))
+        posed_joints_seq.append(np.array(out.joints))
     print(f"[3/3] Computed {args.num_frames}-frame pose sequence")
 
     if args.no_render:
@@ -997,7 +1015,7 @@ def main():
                         else:
                             # Get identity-transferred rest in SOMA topology (meters)
                             # via soma_jax's identity model (one-shot, neutral coeffs).
-                            tmp = SOMALayer.load(args.soma_model, identity_model_type=id_type,
+                            tmp = load_layer(args.soma_model, identity_model_type=id_type,
                                                  identity_model_path=id_path)
                             rv, _ = tmp.prepare_identity(jnp.zeros((1, 10)), repose_to_bind_pose=False, skeleton_fit="linear")
                             bs = np.asarray(rv[0]).astype(np.float32)
@@ -1206,7 +1224,12 @@ def main():
             transl_seq = transl
 
             import motion_pipeline as mp
-            columns.append(("SOMA", np.stack(posed_verts_seq, axis=0), faces, _MODEL_COLORS["SOMA"], None, None))
+            # The SOMA-family columns share the SOMA skeleton; carry it so
+            # --soma-skeleton-overlay has something to draw in this mode too.
+            overlay = args.soma_skeleton_overlay
+            columns.append(("SOMA", np.stack(posed_verts_seq, axis=0), faces, _MODEL_COLORS["SOMA"],
+                            np.stack(posed_joints_seq, axis=0) if overlay else None,
+                            np.asarray(layer._parents_np) if overlay else None))
             smpl_specs = [
                 ("SMPL",   args.smpl_model,   lambda p: mp.load_smpl_jax(p)),
                 ("SMPL-H", args.smplh_model,  lambda p: SMPLHModel.load(p)),
@@ -1236,10 +1259,12 @@ def main():
                     continue
                 try:
                     print(f"  [{name}] loading SOMA-identity '{id_type}' from {id_path}")
-                    verts_seq, model_faces = run_soma_identity_sequence(
+                    verts_seq, model_faces, jseq, jparents = run_soma_identity_sequence(
                         args.soma_model, id_type, id_path, unified, transl_seq,
+                        return_joints=True,
                     )
-                    columns.append((name, verts_seq, model_faces, _MODEL_COLORS[name], None, None))
+                    columns.append((name, verts_seq, model_faces, _MODEL_COLORS[name],
+                                    jseq if overlay else None, jparents if overlay else None))
                     print(f"    posed {T} frames → vertices {verts_seq.shape}")
                 except Exception as e:
                     print(f"  [{name}] failed: {e}")

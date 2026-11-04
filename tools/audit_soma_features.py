@@ -128,11 +128,14 @@ def main():
     smplx_npz = REPO / "data" / "smplx" / "SMPLX_NEUTRAL.npz"
     corr_npz = REPO / "assets" / "correctives_model_v021.npz"
 
-    layer = SOMALayer.load(
-        str(soma_npz),
-        identity_model_type="soma",
-        correctives_path=str(corr_npz) if corr_npz.exists() else None,
-    )
+    corr = str(corr_npz) if corr_npz.exists() else None
+    if Path(soma_npz).exists():
+        layer = SOMALayer.load(str(soma_npz), identity_model_type="soma", correctives_path=corr)
+    else:
+        # No baked archive (docs/INSTALL.md §4.2): build the same 78-joint rig
+        # straight from the upstream assets.
+        layer = SOMALayer.from_upstream_assets(
+            identity_model_type="soma", correctives_path=corr, procedural=False)
     J = len(layer.joint_names)
     V = layer.v_template.shape[0]
     faces = np.array(layer.faces)
@@ -255,8 +258,9 @@ def main():
 
     # Load the trained checkpoint shipped at assets/third_party/hf/correctives_model_v021.pt
     from soma_jax.assets import resolve as _resolve
-    pt_path = _resolve("correctives_model_v021.pt", required=False) or (
-        REPO / "assets" / "third_party" / "hf" / "correctives_model_v021.pt")
+    # The v0.2.1 checkpoint ships as `correctives_model.pt` in the asset set.
+    pt_path = (_resolve("correctives_model_v021.pt", required=False)
+               or _resolve("correctives_model.pt"))
     ck = torch.load(pt_path, map_location="cpu", weights_only=False)
     K_trained = int(ck["C_max"]) * J
     W1_trained_shape = tuple(ck["W1"].shape)
@@ -408,16 +412,19 @@ def main():
              "repose_to_bind_pose" in _prep),
             ("soma.smpl.transfer (BarycentricBridge) + tools/pipeline/pose_converter.py",
              _has_smpl_transfer and (REPO / "tools" / "pipeline" / "pose_converter.py").exists()),
-            ("SOMA_template_rig.usda (345 MB USD rig) parsing", False),
+            ("SOMA_template_rig.usda (345 MB USD rig) parsing",
+             _ilu.find_spec("pxr") is not None
+             and hasattr(__import__("soma_jax.usd_io", fromlist=["x"]), "load_lod_rig")),
             ("UV charts (uv_coord_st, st1, st2)",
-             "uv_coord_st" in np.load(soma_npz).files),
+             Path(soma_npz).exists() and "uv_coord_st" in np.load(soma_npz).files),
         ]
         f.write("[3] UPSTREAM-FEATURE COVERAGE (probed at runtime)\n")
         for label, present in coverage:
             f.write(f"  - {label:60s} : {'PRESENT' if present else 'MISSING'}\n")
         n_have = sum(p for _, p in coverage)
-        f.write(f"  ({n_have}/{len(coverage)} present; "
-                f"remaining gaps are the 345 MB USD rig + UV charts)\n")
+        gaps = [label for label, present in coverage if not present]
+        f.write(f"  ({n_have}/{len(coverage)} present"
+                + (f"; remaining gaps: {', '.join(gaps)})\n" if gaps else ")\n"))
     print(f"  wrote {report}")
     with open(report) as f:
         sys.stdout.write(f.read())

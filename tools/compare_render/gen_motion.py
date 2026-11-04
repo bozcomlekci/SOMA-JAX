@@ -60,7 +60,10 @@ def _synthetic(names, T):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--soma-npz", default=str(REPO / "assets" / "SOMA_neutral_fixed.npz"))
+    p.add_argument("--soma-npz", default=None,
+                   help="archive to read joint names from for the synthetic motion "
+                        "(default: SOMA_neutral_fixed.npz if built, else the downloaded "
+                        "SOMA_neutral.npz — both carry joint_names)")
     p.add_argument("--bvh", default=None, help="SOMA-skeleton BVH motion clip")
     p.add_argument("--seconds", type=float, default=6.0,
                    help="length of the clip window to extract (realtime playback duration)")
@@ -100,6 +103,11 @@ def main():
         print(f"loaded BVH {Path(args.bvh).name}: {N}f @ {src_fps:.0f} FPS "
               f"({bvh['source_duration_s']:.1f}s) -> {win:.1f}s window @ {play_fps:.0f} FPS = {T} frames")
     else:
+        if args.soma_npz is None:
+            sys.path.insert(0, str(REPO))
+            from soma_jax.assets import resolve
+            args.soma_npz = str(resolve("SOMA_neutral_fixed.npz", required=False)
+                                or resolve("SOMA_neutral.npz"))
         d = dict(np.load(args.soma_npz, allow_pickle=True))
         names = [str(n) for n in d["joint_names"]]
         T = max(2, int(round(args.seconds * play_fps)))

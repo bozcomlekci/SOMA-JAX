@@ -59,6 +59,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks"))
+# Upstream SOMA-X (the reference) comes from the pinned submodule unless a
+# `soma` package is installed; appended so it never shadows anything else.
+sys.path.append(str(REPO / "third_party" / "SOMA-X"))
 
 MIB = 1024.0 ** 2
 

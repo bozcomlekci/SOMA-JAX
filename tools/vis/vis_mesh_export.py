@@ -2,17 +2,20 @@
 
 Usage::
 
-    # Export a single rest mesh (no pose) from SOMA NPZ:
-    python tools/vis_mesh_export.py \\
+    # Export the rest mesh, building the rig from the resolved upstream assets:
+    python tools/vis/vis_mesh_export.py --output mesh.obj
+
+    # ...or from an explicit asset (NVIDIA's SOMA_neutral.npz or a SOMA-JAX
+    # archive such as SOMA_neutral_fixed.npz):
+    python tools/vis/vis_mesh_export.py \\
         --soma-model path/to/SOMA_neutral.npz \\
         --output mesh.obj
 
     # Export a posed mesh sequence:
-    python tools/vis_mesh_export.py \\
-        --soma-model path/to/SOMA_neutral.npz \\
+    python tools/vis/vis_mesh_export.py \\
         --animation path/to/anim.soma.npz \\
         --output-dir frames/ \\
-        --format ply
+        --format ply --all-frames
 """
 from __future__ import annotations
 import argparse
@@ -26,7 +29,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export meshes to OBJ/PLY")
-    p.add_argument("--soma-model", required=True, help="SOMA_neutral.npz")
+    p.add_argument("--soma-model", default=None,
+                   help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
+                        "(default: build from the resolved upstream assets)")
     p.add_argument("--animation", default=None, help="Optional animation NPZ to pose")
     p.add_argument("--output", default=None, help="Single mesh output path")
     p.add_argument("--output-dir", default=None, help="Directory for animation frames")
@@ -82,7 +87,8 @@ def write_mesh(path: str, vertices: np.ndarray, faces: np.ndarray, fmt: str) -> 
 def main():
     args = parse_args()
     import jax.numpy as jnp
-    from soma_jax import SOMALayer, SOMAParams, load_soma_npz
+    from soma_jax import SOMAParams, load_soma_npz
+    from _common import load_layer
 
     if args.identity_coeffs:
         identity_coeffs = np.load(args.identity_coeffs).astype(np.float32)
@@ -91,7 +97,7 @@ def main():
     else:
         identity_coeffs = np.zeros((1, 10), dtype=np.float32)
 
-    layer = SOMALayer.load(args.soma_model, identity_model_type=args.identity_model)
+    layer = load_layer(args.soma_model, identity_model_type=args.identity_model)
     faces = np.array(layer.faces)
 
     if args.animation is None:
