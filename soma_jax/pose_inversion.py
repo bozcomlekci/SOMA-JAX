@@ -48,7 +48,8 @@ def _weighted_kabsch_per_joint(
     """Estimate per-joint rotation via weighted Kabsch alignment.
 
     Each joint is aligned using vertices weighted by that joint's LBS weight,
-    giving a local rotation estimate.
+    giving an estimate of the joint's world (absolute) rotation relative to
+    the rest pose.
 
     Args:
         posed_verts: (V, 3) posed vertices.
@@ -117,6 +118,7 @@ def _autograd_refine(
     num_iters: int = 50,
     lr: float = 1e-3,
     vertex_weights: Optional[jnp.ndarray] = None,
+    dof_constraints: Optional[dict] = None,
 ) -> jnp.ndarray:
     """Refine rotation estimates via Adam in 6D rotation space.
 
@@ -133,9 +135,12 @@ def _autograd_refine(
         num_iters: Adam optimization steps.
         lr: Adam learning rate.
         vertex_weights: optional (V,) per-vertex importance weights.
+        dof_constraints: optional ``{joint: hinge_axis}``. The hinge holds on
+            the joint's parent-relative rotation throughout the optimisation,
+            so the rest of the chain compensates for what it removes.
 
     Returns:
-        (J, 3, 3) refined rotation matrices.
+        (J, 3, 3) refined world rotation matrices.
     """
     # ``R_init`` is WORLD (absolute) rotations from the analytical Kabsch init, but
     # ``fk_lbs_fn`` below reconstructs from LOCAL (parent-relative) rotations
@@ -154,9 +159,14 @@ def _autograd_refine(
     r6d_init = jax.vmap(rotmat_to_6d)(_world_to_local(R_init))  # (J, 6), LOCAL
     fk_lbs_fn = _build_fk_lbs_fn(rest_verts, weights, rest_joints, parents, skeleton_levels)
 
-    def loss_fn(r6d):
+    def to_local(r6d):
         rotmats = jax.vmap(rotation_6d_to_rotmat)(r6d)   # LOCAL
-        pred_verts = fk_lbs_fn(rotmats)
+        if dof_constraints:
+            rotmats = apply_dof_constraints(rotmats, dof_constraints)
+        return rotmats
+
+    def loss_fn(r6d):
+        pred_verts = fk_lbs_fn(to_local(r6d))
         diff = pred_verts - posed_verts
         if vertex_weights is not None:
             return jnp.sum(vertex_weights[:, None] * diff ** 2)
@@ -174,7 +184,7 @@ def _autograd_refine(
     (r6d_final, _), losses = jax.lax.scan(
         opt_step, (r6d_init, opt_state), None, length=num_iters
     )
-    R_local = jax.vmap(rotation_6d_to_rotmat)(r6d_final)
+    R_local = to_local(r6d_final)
     # local -> world (fk_levelorder's rotation block) to match R_init's convention.
     return fk_levelorder(R_local, rest_joints, parents, skeleton_levels)[:, :3, :3]
 
@@ -214,7 +224,9 @@ def apply_dof_constraints(
     """Apply 1-DOF hinge constraints to specified joints.
 
     Args:
-        rotmats: (J, 3, 3) joint rotations.
+        rotmats: (J, 3, 3) parent-relative (local) joint rotations — a hinge
+            constrains a joint relative to its parent, so world rotations go
+            through :func:`apply_dof_constraints_world` instead.
         constraints: dict {joint_index: axis_vector_3D}. Axes should be unit vectors.
 
     Returns:
@@ -223,6 +235,46 @@ def apply_dof_constraints(
     for joint_idx, axis in constraints.items():
         rotmats = rotmats.at[joint_idx].set(_project_to_1dof(rotmats[joint_idx], axis))
     return rotmats
+
+
+def apply_dof_constraints_world(
+    world_rotmats: jnp.ndarray,
+    constraints: dict[int, jnp.ndarray],
+    parents: np.ndarray,
+) -> jnp.ndarray:
+    """:func:`apply_dof_constraints` for world (absolute) rotations.
+
+    Each constrained joint's rotation relative to its parent is projected onto
+    its hinge; every other joint keeps its world rotation. Parents are handled
+    before children, so a hinge under another hinge is relative to the
+    parent's constrained rotation.
+
+    Args:
+        world_rotmats: (J, 3, 3) world rotations.
+        constraints: dict {joint_index: axis_vector_3D}, axes in the parent's
+            frame (for a world-aligned rest pose: world axes).
+        parents: (J,) parent indices; a root has a negative index or itself.
+
+    Returns:
+        (J, 3, 3) world rotations with the hinges enforced.
+    """
+    parents = np.asarray(parents)
+
+    def depth(j):
+        d = 0
+        while 0 <= parents[j] != j:
+            j, d = int(parents[j]), d + 1
+        return d
+
+    for j in sorted(constraints, key=depth):
+        axis, p = constraints[j], int(parents[j])
+        if p < 0 or p == j:
+            new = _project_to_1dof(world_rotmats[j], axis)
+        else:
+            local = jnp.swapaxes(world_rotmats[p], -1, -2) @ world_rotmats[j]
+            new = world_rotmats[p] @ _project_to_1dof(local, axis)
+        world_rotmats = world_rotmats.at[j].set(new)
+    return world_rotmats
 
 
 class PoseInversion:
@@ -239,7 +291,12 @@ class PoseInversion:
         rest_joints: (J, 3) rest joint positions.
         parents: (J,) parent indices.
         ns_iters: Newton-Schulz iterations.
-        dof_constraints: optional dict {joint_idx: hinge_axis} for 1-DOF joints.
+        dof_constraints: optional dict {joint_idx: hinge_axis} for 1-DOF joints
+            (knees, elbows). The hinge constrains the joint's rotation relative
+            to its parent; the axis is in the rest pose's (world-aligned) frame.
+
+    :meth:`fit` returns world (absolute) rotations: compose a joint's parent
+    out (``R[parent].T @ R[j]``) for parent-relative ones.
     """
 
     def __init__(
@@ -290,7 +347,7 @@ class PoseInversion:
             chunk_size: batch size per chunk.
 
         Returns:
-            (B, J, 3, 3) or (J, 3, 3) recovered rotation matrices.
+            (B, J, 3, 3) or (J, 3, 3) recovered world (absolute) rotation matrices.
         """
         unbatched = posed_verts.ndim == 2
         if unbatched:
@@ -320,16 +377,17 @@ class PoseInversion:
                 R = jnp.broadcast_to(jnp.eye(3, dtype=verts.dtype)[None], (self.weights.shape[1], 3, 3))
 
             if mode in ("autograd", "combined"):
+                # 1-DOF constraints (knee/elbow hinges) hold inside the
+                # refinement, so the rest of the chain compensates.
                 R = _autograd_refine(
                     R, verts, self.rest_verts, self.weights, self.rest_joints,
                     self.parents, self.skeleton_levels,
                     num_iters=num_refine_iters, lr=lr,
                     vertex_weights=v_weights,
+                    dof_constraints=self.dof_constraints,
                 )
-
-            # Apply 1-DOF constraints if specified (e.g., knee/elbow hinges)
-            if self.dof_constraints:
-                R = apply_dof_constraints(R, self.dof_constraints)
+            elif self.dof_constraints:
+                R = apply_dof_constraints_world(R, self.dof_constraints, self._parents_np)
             return R
 
         if vertex_weights is not None and vertex_weights.ndim == 2:
@@ -343,72 +401,73 @@ class PoseInversion:
         self,
         posed_verts: jnp.ndarray,
         num_refine_iters: int = 20,
-        lr: float = 5e-4,
+        lr: float = 5e-3,
     ) -> jnp.ndarray:
-        """Hierarchical pose inversion: refine level-by-level top-down.
+        """Hierarchical pose inversion: refine joint by joint, top-down.
 
-        Processes the skeleton from root to leaves, fixing parent rotations
-        before fitting children. More accurate for kinematic chains.
+        Starts from the analytical init and walks the skeleton from root to
+        leaves. Each joint's parent-relative rotation is refined against the
+        vertices it skins (weighted by its skinning weight) with its ancestors
+        already refined, so errors do not accumulate down kinematic chains.
+        ``dof_constraints`` hold throughout.
 
         Args:
             posed_verts: (B, V, 3) or (V, 3) posed mesh vertices.
-            num_refine_iters: refinement iters per level.
+            num_refine_iters: Adam steps per joint.
             lr: Adam learning rate.
 
         Returns:
-            (B, J, 3, 3) or (J, 3, 3) recovered rotation matrices.
+            (B, J, 3, 3) or (J, 3, 3) recovered world (absolute) rotation
+            matrices, as :meth:`fit` returns.
         """
         unbatched = posed_verts.ndim == 2
         if unbatched:
             posed_verts = posed_verts[None]
-        B, V, _ = posed_verts.shape
+
         J = self.weights.shape[1]
+        safe_par = jnp.maximum(self.parents, 0)
+        is_root = (self.parents < 0) | (self.parents == jnp.arange(J))
+        fk_lbs_fn = _build_fk_lbs_fn(self.rest_verts, self.weights, self.rest_joints,
+                                     self.parents, self.skeleton_levels)
+        constraints = self.dof_constraints
+        opt = optax.adam(lr)
 
-        # Start with analytical init
-        rotmats = jax.vmap(lambda v: _analytical_init(v, self.rest_verts, self.weights, self.ns_iters))(
-            posed_verts
-        )  # (B, J, 3, 3)
+        def constrain(R_local):
+            return apply_dof_constraints(R_local, constraints) if constraints else R_local
 
-        # Level-by-level refinement
+        def init_local(verts):
+            # The analytical init is world rotations; the refinement (like
+            # fk_levelorder) works on parent-relative ones.
+            Rw = _analytical_init(verts, self.rest_verts, self.weights, self.ns_iters)
+            Rl = jnp.einsum("jab,jbc->jac", jnp.swapaxes(Rw[safe_par], -1, -2), Rw)
+            return constrain(jnp.where(is_root[:, None, None], Rw, Rl))
+
+        def refine_joint(R_local, verts, j):
+            v_w = self.weights[:, j]
+
+            def loss_fn(r6):
+                R_all = constrain(R_local.at[j].set(rotation_6d_to_rotmat(r6)))
+                return jnp.sum(v_w[:, None] * (fk_lbs_fn(R_all) - verts) ** 2)
+
+            def step(carry, _):
+                r6, state = carry
+                updates, state = opt.update(jax.grad(loss_fn)(r6), state)
+                return (optax.apply_updates(r6, updates), state), None
+
+            r6 = rotmat_to_6d(R_local[j])
+            (r6, _), _ = jax.lax.scan(step, (r6, opt.init(r6)), None,
+                                      length=num_refine_iters)
+            return constrain(R_local.at[j].set(rotation_6d_to_rotmat(r6)))
+
+        # One compiled step serves every joint: the joint index is traced.
+        refine = jax.jit(jax.vmap(refine_joint, in_axes=(0, 0, None)))
+        R_local = jax.jit(jax.vmap(init_local))(posed_verts)
+        skinned = np.asarray(self.weights).sum(axis=0) > 0
         for level_joints in self.skeleton_levels:
-            level_idx = jnp.array(level_joints)
-
-            # For each joint in this level, refine using vertices in its subtree
-            # (simplified: use all vertices weighted by joint influence)
             for j in level_joints:
-                v_w = self.weights[:, j]  # (V,)
+                if skinned[j]:           # a joint that skins nothing has no signal
+                    R_local = refine(R_local, posed_verts, jnp.int32(j))
 
-                def refine_joint(b_idx, j=j):
-                    R_j = rotmats[b_idx, j]
-                    # Single-joint Adam refinement
-                    r6d = rotmat_to_6d(R_j)
-
-                    def loss_fn(r6d_single):
-                        R = rotation_6d_to_rotmat(r6d_single)
-                        R_all = rotmats[b_idx].at[j].set(R)
-                        G = fk_levelorder(R_all, self.rest_joints, self.parents, self.skeleton_levels)
-                        bone_T = lbs_transforms(G[None], self.rest_joints[None])
-                        pred = lbs(self.rest_verts[None], jnp.zeros_like(self.rest_verts[None]), bone_T, self.weights)[0]
-                        diff = pred - posed_verts[b_idx]
-                        return jnp.sum(v_w[:, None] * diff ** 2)
-
-                    opt = optax.adam(lr)
-                    state = opt.init(r6d)
-
-                    def step(carry, _):
-                        r6, s = carry
-                        loss, grads = jax.value_and_grad(loss_fn)(r6)
-                        updates, s = opt.update(grads, s)
-                        return (optax.apply_updates(r6, updates), s), loss
-
-                    (r6d_final, _), _ = jax.lax.scan(step, (r6d, state), None, length=num_refine_iters)
-                    return rotation_6d_to_rotmat(r6d_final)
-
-                # Update for all batch elements
-                for b in range(B):
-                    R_refined = refine_joint(b)
-                    rotmats = rotmats.at[b, j].set(R_refined)
-
-        if unbatched:
-            rotmats = rotmats[0]
-        return rotmats
+        rotmats = jax.vmap(lambda R: fk_levelorder(
+            R, self.rest_joints, self.parents, self.skeleton_levels)[:, :3, :3])(R_local)
+        return rotmats[0] if unbatched else rotmats

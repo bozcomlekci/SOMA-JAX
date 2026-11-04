@@ -32,7 +32,7 @@ Upstream: ``soma/soma.py :: SOMALayer``
 """
 from __future__ import annotations
 import copy
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from functools import partial
 import numpy as np
 import jax
@@ -57,6 +57,9 @@ from .geometry.rig_utils import (
 )
 from .correctives_model import CorrectivesMLP
 from .identity_model import BaseIdentityModel, create_identity_model
+
+if TYPE_CHECKING:
+    from .procedural_transforms import ProceduralTransforms
 
 
 BODY_LODS = ("mid", "low")
@@ -710,6 +713,12 @@ class SOMALayer(eqx.Module):
         skinning skeleton.
         """
         return tuple(self._public_names)
+
+    @property
+    def parents(self) -> np.ndarray:
+        """(J,) parent index of each joint in ``joint_names``; the root is its
+        own parent. A copy, so callers cannot alter the rig through it."""
+        return np.array(self._parents_np)
 
     def public_skinning_weights(self) -> jnp.ndarray:
         """Skinning weights folded onto the public SOMA hierarchy.

@@ -227,3 +227,55 @@ def test_barycentric_transfer_reproduces_surface_points():
     got = np.asarray(barycentric_interpolate(jnp.asarray(verts), jnp.asarray(faces),
                                              jnp.asarray(face_ids), jnp.asarray(coords)))
     np.testing.assert_allclose(got, query, atol=2e-2)
+
+
+# ------------------------------------------------------------- pose inversion
+def _pose_inversion_case(synthetic_rig, hinge=None):
+    from soma_jax import PoseInversion
+    from soma_jax.pose_inversion import _build_fk_lbs_fn
+    r = synthetic_rig
+    parents = r["parents"]
+    inv = PoseInversion(rest_verts=jnp.asarray(r["verts"]), weights=jnp.asarray(r["weights"]),
+                        rest_joints=jnp.asarray(r["joints"]), parents=parents,
+                        dof_constraints=hinge)
+    fk_lbs = _build_fk_lbs_fn(inv.rest_verts, inv.weights, inv.rest_joints, inv.parents,
+                              inv.skeleton_levels)
+    aa = np.zeros((len(parents), 3), np.float32)
+    aa[2] = [0.3, 0.2, 0.5]          # the hinge joint's parent is rotated off-axis
+    aa[3] = [-0.8, 0.0, 0.0]         # a pure X hinge relative to that parent
+    aa[6] = [0.1, -0.4, 0.2]
+    R_local = jax.vmap(axis_angle_to_rotmat)(jnp.asarray(aa))
+    return inv, fk_lbs, R_local, fk_lbs(R_local)
+
+
+def _world_to_local(Rw, parents):
+    return jnp.stack([Rw[j] if parents[j] < 0 else Rw[parents[j]].T @ Rw[j]
+                      for j in range(len(parents))])
+
+
+@pytest.mark.parametrize("mode", ["analytical", "combined"])
+def test_pose_inversion_hinge_is_parent_relative(synthetic_rig, mode):
+    """A 1-DOF hinge constrains the joint relative to its parent: on a pose
+    that satisfies it, enabling it must not pull the joint off the pose."""
+    X = jnp.array([1.0, 0.0, 0.0])
+    inv, _, R_gt, posed = _pose_inversion_case(synthetic_rig, hinge={3: X})
+    R = inv.fit(posed, mode=mode, num_refine_iters=300, lr=5e-3)
+    local = _world_to_local(R, synthetic_rig["parents"])
+    # The constrained joint is an exact X rotation relative to its parent ...
+    np.testing.assert_allclose(np.asarray(local[3] @ X), np.asarray(X), atol=1e-5)
+    if mode == "combined":
+        # ... and, refined, the right one (projecting the world rotation
+        # instead left it ~0.4 off here).
+        assert float(jnp.abs(local[3] - R_gt[3]).max()) < 0.1
+
+
+def test_pose_inversion_hierarchical_improves_on_its_init(synthetic_rig):
+    inv, fk_lbs, _, posed = _pose_inversion_case(synthetic_rig)
+    parents = synthetic_rig["parents"]
+
+    def err(Rw):
+        return float(jnp.linalg.norm(fk_lbs(_world_to_local(Rw, parents)) - posed, -1).mean())
+    init = err(inv.fit(posed, mode="analytical"))
+    hier = inv.fit_hierarchical(posed, num_refine_iters=60, lr=5e-3)
+    assert hier.shape == (len(parents), 3, 3)
+    assert err(hier) < 0.5 * init, (err(hier), init)
