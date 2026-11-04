@@ -136,11 +136,22 @@ def compute_barycentric_coords(
         import trimesh
         src_mesh = trimesh.Trimesh(vertices=src_vertices, faces=src_faces, process=False)
         _, _, face_ids = trimesh.proximity.closest_point(src_mesh, query_points)
-    except ImportError:
-        # Fallback: brute-force nearest triangle centroid
-        centroids = src_vertices[src_faces].mean(axis=1)  # (F, 3)
-        dists = np.sum((query_points[:, None] - centroids[None]) ** 2, axis=-1)
-        face_ids = np.argmin(dists, axis=-1)
+    except ImportError as err:
+        # trimesh is missing, or the `rtree` its proximity query needs (every
+        # trimesh 4.x, and 5.x for some queries). The nearest face *centroid*
+        # is only an approximation of the closest surface point, so say so
+        # rather than silently embedding differently. A KD-tree gives the same
+        # answer as a brute-force (N, F) distance table without its memory:
+        # ~15 GB for a SOMA-sized mesh pair.
+        import warnings
+        from scipy.spatial import cKDTree
+        warnings.warn(
+            f"exact closest-face search unavailable ({err}); falling back to the "
+            "nearest face centroid, which can pick a different face. Install "
+            "trimesh and rtree (pip install 'soma-jax[vis]') for the faithful embedding.",
+            RuntimeWarning, stacklevel=2)
+        centroids = np.asarray(src_vertices)[np.asarray(src_faces)].mean(axis=1)  # (F, 3)
+        _, face_ids = cKDTree(centroids).query(np.asarray(query_points))
 
     tet_verts, _, _ = _build_tetrahedra(src_vertices, src_faces)
 

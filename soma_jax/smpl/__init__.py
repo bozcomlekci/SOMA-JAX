@@ -189,7 +189,7 @@ class SMPLFamilyTopologyBridge:
 
     Faithful port of ``soma.smpl.transfer.SMPLFamilyTopologyBridge``. Upstream
     routes ``source -> canonical -> target`` through two
-    ``BarycentricInterpolator``\ s, where *canonical* is the **SOMA topology**:
+    ``BarycentricInterpolator`` instances, where *canonical* is the **SOMA topology**:
 
     ==============================  =========================================
     upstream                        embedding (``BarycentricInterpolator``)
