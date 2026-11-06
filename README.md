@@ -78,6 +78,13 @@ inv.prepare_identity(identity_coeffs)
 result = inv.fit(posed_vertices)    # .rotations, .root_translation, .per_vertex_error
 ```
 
+Render a real walk — a CMU motion-capture trial retargeted onto the SOMA
+skeleton and posed with SOMA-JAX (the clip downloads on first use):
+
+```bash
+python tools/pipeline/demo_walk.py    # -> demo_renders/walk/walk.gif, walk_strip.png
+```
+
 ## Identity models
 
 Swap the identity source without touching the pose data — every model below is

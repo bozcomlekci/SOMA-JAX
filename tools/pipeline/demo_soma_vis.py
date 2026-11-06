@@ -549,7 +549,7 @@ def _make_ground_and_shadow(vertices, faces, ground_y=0.0, ground_extent=20.0,
 
 def render_mesh_png(vertices, faces, output_path, width=512, height=512, color=(0.7, 0.7, 0.85),
                     wireframe=False, joints=None, parents=None, body_alpha=1.0,
-                    camera_pose=None, ground=False):
+                    camera_pose=None, ground=False, extra_meshes=()):
     """Render a mesh to PNG using pyrender; returns numpy image array.
 
     If `joints` and `parents` are provided, the skeleton (bone cylinders + joint
@@ -561,6 +561,8 @@ def render_mesh_png(vertices, faces, output_path, width=512, height=512, color=(
         side-by-side columns to get a consistent floor line.
     `ground`: when True, add a ground-plane quad at y=0 plus a projection-shadow
         copy of the body to ground the character visually.
+    `extra_meshes`: further ``pyrender.Mesh`` objects to add to the scene (a
+        custom floor, props).
     """
     import trimesh
     import pyrender
@@ -580,6 +582,8 @@ def render_mesh_png(vertices, faces, output_path, width=512, height=512, color=(
         ground_mesh, shadow_mesh = _make_ground_and_shadow(vertices, faces)
         scene.add(ground_mesh)
         scene.add(shadow_mesh)
+    for extra in extra_meshes:
+        scene.add(extra)
 
     # Add skeleton first (opaque) so the translucent body blends over it.
     if show_skeleton:

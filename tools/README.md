@@ -10,6 +10,7 @@ standalone.
 | Script | Purpose |
 |---|---|
 | `demo_soma_vis.py` | Interactive multi-model demo: rest / posed / animation, incl. BVH-driven side-by-side renders and skeleton overlay. |
+| `demo_walk.py` | A real walk: downloads a CMU motion-capture trial (ASF/AMC), retargets it onto the SOMA skeleton and renders a GIF + pose strip; also saves the motion as a SOMA NPZ. |
 | `build_soma_rig.py` | Build the SOMA rig / per-joint affine regressor from the bind data. |
 | `build_identity_packs.py` | Assemble per-identity coefficient packs for the identity backends. |
 | `build_lowlod.py` | Downsample the mid-LOD mesh to the low-LOD set. |

@@ -267,6 +267,11 @@ python tools/vis/vis_pyrender.py --animation anim.soma.npz --interactive
 python tools/pipeline/demo_soma_vis.py \
     --output-dir demo_renders/ --gif demo_renders/demo.gif --num-frames 30
 
+# Demo: a real walk — a CMU motion-capture trial retargeted onto the SOMA skeleton
+# (downloaded on first use), rendered with a tracking camera plus a strip of
+# poses; --camera fixed holds the whole walk in one shot
+python tools/pipeline/demo_walk.py --output-dir demo_renders/walk
+
 # Demo: every identity model on one SOMA skeleton and motion, skeleton drawn
 # inside each body. MHR/Anny/Garment packs come from
 # tools/pipeline/build_identity_packs.py (MHR needs torch); SMPL-family columns
@@ -292,6 +297,7 @@ python tools/pipeline/demo_soma_vis.py --side-by-side --soma-skeleton-overlay \
 | `tools/vis/vis_mesh_export.py` | OBJ / PLY mesh export |
 | `tools/vis/vis_pyrender.py` | 3D rendering (static / interactive) |
 | `tools/pipeline/demo_soma_vis.py` | Interactive demo script |
+| `tools/pipeline/demo_walk.py` | Real walking motion (CMU mocap) retargeted onto SOMA and rendered |
 
 ### Architecture
 

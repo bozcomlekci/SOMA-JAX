@@ -37,6 +37,12 @@ model's licence before use:
   Anny                      https://github.com/naver/anny
   GarmentMeasurements       https://github.com/mbotsch/GarmentMeasurements
 
+tools/pipeline/demo_walk.py downloads motion capture from the CMU Graphics Lab
+Motion Capture Database (http://mocap.cs.cmu.edu), free to use, including in
+commercial products, but not to resell: "The data used in this project was
+obtained from mocap.cs.cmu.edu. The database was created with funding from NSF
+EIA-0196217."
+
 --------------------------------------------------------------------------------
 Third-party sources referenced
 --------------------------------------------------------------------------------
