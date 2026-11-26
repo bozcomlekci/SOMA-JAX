@@ -367,7 +367,9 @@ API computes.
   translation as an additive shift when no fitted binds are given;
   `prepare_identity_arrays()` / `pose_arrays()` are the array-level forms of
   `prepare_identity()` / `pose()` that the tools use, and `__call__(SOMAParams)`
-  is SOMA-JAX's one-call form (78 joints in and out).
+  is SOMA-JAX's one-call form (78 joints in and out), whose
+  `apply_correctives=None` applies the correctives when a checkpoint is loaded;
+  `pose()` / `forward()` default to `True` and need one, as upstream's do.
 * `SkeletonTransfer(rotation_backend=…)` selects the optional Warp kernel;
   `SkeletonTransfer.fit_joint_rotations(vectorized=False)` runs the per-joint
   loop the vectorized path is checked against; upstream's `fit_rotations_warp`

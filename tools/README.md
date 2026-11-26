@@ -72,7 +72,8 @@ Side-by-side comparison GIF (`gen_motion.py` → `pose_somax.py` / `pose_somajax
 → `render_compare.py`, orchestrated by `run.sh`). Imports the `pipeline/` renderer.
 The motion is a SOMA-skeleton BVH clip when one is reachable (`BVH=` or
 `BVH_ROOT=`), otherwise the clip SOMA-X ships for its own demo
-(`third_party/SOMA-X/assets/example_animation.npy`). Both columns skin the same
+(`example_animation.usd`, read with `soma_jax.load_soma_animation`;
+`gen_motion.py --npy` still reads the NPY clip of releases before v0.3.4). Both columns skin the same
 public rig; the SOMA-JAX column is the JAX + Warp `svd3` hybrid. The speed ratio
 drawn is the benchmark's (`benchmarks/results/runtime.json`, batch 2048), not the
 capture's own timing.

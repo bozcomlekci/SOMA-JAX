@@ -62,9 +62,12 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
+# This directory first: its demo_soma_vis (the renderer used here) must win
+# over tools/demo_soma_vis.py, upstream's demo of the same name.
 for _p in (REPO, REPO / "tools", Path(__file__).resolve().parent):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+    if str(_p) in sys.path:
+        sys.path.remove(str(_p))
+    sys.path.insert(0, str(_p))
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 CMU_URL = "http://mocap.cs.cmu.edu/subjects/{subject}/{name}"
@@ -613,8 +616,9 @@ def run_motion(layer, coeffs, tpose, name: str, caption: str, asf_path, amc_path
     print(f"  posed {m['verts'].shape[1]} vertices x {T} frames; posed bones turn with the "
           f"captured ones to {m['err']:.2g} deg")
     save_soma_npz(str(out_dir / f"{name}.soma.npz"), np.asarray(rotmat_to_axis_angle(
-        jnp.asarray(m["local"], jnp.float32))), hips, list(layer.public_joint_names),
-        args.identity_model, np.asarray(coeffs)[None], absolute_pose=False,
+        jnp.asarray(m["local"], jnp.float32))), hips,
+        joint_names=list(layer.public_joint_names), identity_model_type=args.identity_model,
+        identity_coeffs=np.asarray(coeffs)[None], absolute_pose=False,
         extra_arrays={"fps": np.asarray(fps), "source": np.asarray(source)})
 
     ensure_headless_gl()                 # before the first pyrender import

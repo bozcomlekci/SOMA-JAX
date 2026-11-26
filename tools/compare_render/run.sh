@@ -14,13 +14,14 @@ mkdir -p "$OUT"
 
 # Motion: a SOMA-skeleton BVH clip when one is reachable (BVH=... or
 # BVH_ROOT=...), else the clip SOMA-X itself ships for its demo
-# (third_party/SOMA-X/assets/example_animation.npy).
+# (example_animation.usd, resolved like every other asset).
 BVH_ROOT=${BVH_ROOT:-/path/to/bvh/clips}
 BVH=${BVH:-$BVH_ROOT/walk/clip_001.bvh}
 if [ -f "$BVH" ]; then
     MOTION_SRC=(--bvh "$BVH")
 else
-    MOTION_SRC=(--npy "$REPO/third_party/SOMA-X/assets/example_animation.npy")
+    MOTION_SRC=(--usd "$(env -u LD_LIBRARY_PATH "$PY" -c \
+        'from soma_jax.assets import resolve; print(resolve("example_animation.usd"))')")
 fi
 
 echo "==> generate shared motion (${MOTION_SRC[1]##*/})"
