@@ -1,4 +1,4 @@
-"""Asset resolution: search path, Git LFS stubs, the slim archive, the manifest."""
+"""Asset resolution: search path, Git LFS stubs, stale downloads, the manifest."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from soma_jax import assets
@@ -67,19 +66,38 @@ def test_resolve_names_the_stub_when_nothing_usable(monkeypatch, tmp_path):
     assert "download_assets.py" in str(err.value)
 
 
-def _npz(path: Path, keys) -> Path:
+def _sized(path: Path, size: int) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, **{k: np.zeros(2) for k in keys})
+    with open(path, "wb") as f:
+        f.truncate(size)                      # sparse: no bytes written
     return path
 
 
-def test_slim_soma_archive_is_skipped(monkeypatch, tmp_path):
-    _npz(tmp_path / "slim" / "SOMA_neutral.npz", ["mean", "shapedirs", "triangles"])
-    full = _npz(tmp_path / "full" / "SOMA_neutral.npz",
-                ["mean", "shapedirs", "bind_shape", "bind_pose_world", "joint_names"])
+def test_stale_download_is_skipped(monkeypatch, tmp_path):
+    """A copy whose size differs from the submodule's LFS pointer was fetched
+    for another release: skipped in favour of one that matches the pin."""
+    name = "selftest_probe/asset.bin"
+    monkeypatch.setattr(assets, "SUBMODULE_ASSETS", tmp_path / "submodule")
+    _pointer(tmp_path / "submodule" / name, size=4096)
+    _sized(tmp_path / "old" / name, 1000)
+    good = _sized(tmp_path / "new" / name, 4096)
     monkeypatch.setenv(assets.ASSETS_ENV_VAR,
-                       os.pathsep.join([str(tmp_path / "slim"), str(tmp_path / "full")]))
-    assert assets.resolve("SOMA_neutral.npz") == full
+                       os.pathsep.join([str(tmp_path / "old"), str(tmp_path / "new")]))
+    assert assets.resolve(name) == good
+    monkeypatch.setenv(assets.ASSETS_ENV_VAR, str(tmp_path / "old"))
+    with pytest.raises(FileNotFoundError, match="another release"):
+        assets.resolve(name)
+
+
+def test_stale_download_is_skipped_without_submodule(monkeypatch, tmp_path):
+    """With no submodule checkout (a "Download ZIP"), the manifest is the pin."""
+    name, (_sha, size, _lfs) = next(iter(assets.SOMA_X_ASSET_FILES.items()))
+    monkeypatch.setattr(assets, "SUBMODULE_ASSETS", tmp_path / "no_submodule")
+    _sized(tmp_path / "old" / name, size + 1)
+    good = _sized(tmp_path / "new" / name, size)
+    monkeypatch.setenv(assets.ASSETS_ENV_VAR,
+                       os.pathsep.join([str(tmp_path / "old"), str(tmp_path / "new")]))
+    assert assets.resolve(name) == good
 
 
 def test_env_root_takes_precedence(monkeypatch, tmp_path):

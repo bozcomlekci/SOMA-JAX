@@ -27,15 +27,16 @@ def main():
     # assets live in assets/third_party/ or the vendored submodule depending on
     # how they were obtained, and resolve() knows both.
     from soma_jax.assets import resolve
-    p.add_argument("--hf", default=str(resolve("SOMA_neutral.npz", required=False) or ""))
+    p.add_argument("--hf", default=str(resolve("SOMA_neutral.npz", required=False) or ""),
+                   help="upstream SOMA_neutral.npz (lod_mid_to_low, triangles_low)")
     p.add_argument("--soma", default="assets/SOMA_neutral_fixed.npz",
-                   help="SOMA-JAX archive to slice (docs/INSTALL.md section 4.2 bakes it)")
+                   help="SOMA-JAX runtime archive (tools/pipeline/build_soma_rig.py)")
     p.add_argument("--identity-dir", default="assets/identity")
     p.add_argument("--out-dir", default="assets/lowlod")
     args = p.parse_args()
     if not Path(args.soma).exists():
         sys.exit(f"{args.soma} not found: --soma takes a SOMA-JAX archive such as "
-                 "assets/SOMA_neutral_fixed.npz, which docs/INSTALL.md section 4.2 bakes. "
+                 "assets/SOMA_neutral_fixed.npz, which tools/pipeline/build_soma_rig.py builds (docs/INSTALL.md §4.3). "
                  "(SOMALayer.from_upstream_assets(lod='low') needs no archive.)")
     if not args.hf:
         sys.exit("NVIDIA's SOMA_neutral.npz was not found; fetch it with "
@@ -43,32 +44,34 @@ def main():
 
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     hf = dict(np.load(args.hf, allow_pickle=True))
-    n_low = int(hf["triangles_low"].max()) + 1          # 4505
-    lod = np.arange(n_low)                               # lod_mid_to_low == arange
+    lod = np.asarray(hf["lod_mid_to_low"], np.int64)     # == arange(4505) on the shipped mesh
+    n_low = int(lod.shape[0])
     faces_low = hf["triangles_low"].astype(np.int32)
     print(f"Low-LOD: {n_low} verts, {faces_low.shape[0]} faces")
 
     # ---- low-LOD SOMA rig ----
+    # The rig comes from the runtime archive (itself derived from
+    # SOMA_template_rig.usda): since SOMA-X v0.3 SOMA_neutral.npz has none.
+    from soma_jax.rig_build import load_public_rig
     full = dict(np.load(args.soma, allow_pickle=True))
-    from scipy.sparse import csc_matrix
-    W_full = csc_matrix((hf["skinning_weights_data"], hf["skinning_weights_indices"],
-                         hf["skinning_weights_indptr"]), shape=tuple(hf["skinning_weights_shape"])).toarray()
-    bind = hf["bind_shape"].astype(np.float64)
-    joints_t = hf["bind_pose_world"][:, :3, 3].astype(np.float64)
-    parents = hf["joint_parent_ids"].astype(int).copy(); parents[0] = 0
+    rig = load_public_rig(args.soma)
+    W_full = rig["weights"].astype(np.float64)
+    bind = rig["bind_shape"].astype(np.float64)
+    joints_t = rig["bind_pose_world"][:, :3, 3].astype(np.float64)
+    parents = rig["parents"].astype(int).copy(); parents[0] = 0
     J = W_full.shape[1]
     children = {j: [k for k in range(J) if parents[k] == j and k != j] for j in range(J)}
     # Refit regressor on the low-LOD vertex subset.
-    Jreg_low = build_regressor(bind[:n_low], joints_t, W_full[:n_low], parents, children)
-    err = np.linalg.norm(Jreg_low @ bind[:n_low] - joints_t, axis=1)
-    real = ~np.array(["End" in str(n) or "Eye" in str(n) for n in hf["joint_names"]])
+    Jreg_low = build_regressor(bind[lod], joints_t, W_full[lod], parents, children)
+    err = np.linalg.norm(Jreg_low @ bind[lod] - joints_t, axis=1)
+    real = ~np.array(["End" in str(n) or "Eye" in str(n) for n in rig["joint_names"]])
     print(f"  low-LOD J_regressor fit (body joints): max {err[real].max():.3f} cm")
 
-    # Slice every per-vertex array and remap the vertex-index lists (eye/mouth
-    # bags, mirror map) the way SOMALayer(lod="low") does, so the archive
-    # loads as a consistent low-LOD layer; then swap in the refitted regressor.
-    from soma_jax.soma import _slice_rig_to_low_lod
-    full.setdefault("lod_mid_to_low", lod.astype(np.int32))
+    # The same slice `SOMALayer.load(lod="low")` applies (upstream's
+    # `lod="low"`): every per-vertex array, `triangles_low` faces and the
+    # facial segments remapped into the subset — then the refitted regressor.
+    from soma_jax.body.soma import _slice_rig_to_low_lod
+    full.setdefault("lod_mid_to_low", lod)
     full.setdefault("triangles_low", faces_low)
     soma_low = _slice_rig_to_low_lod(full)
     soma_low["J_regressor"] = Jreg_low.astype(np.float32)
@@ -82,9 +85,11 @@ def main():
             print(f"  [{name}] {src} missing — skipping")
             continue
         pk = dict(np.load(src, allow_pickle=False))
+        # Per-SOMA-vertex rows: keep the low-LOD subset (indexed by the
+        # mid-to-low map, as `SOMALayer(lod="low")` slices the rig).
         for key in ("bary_face_ids", "bary_coords", "soma_wrap_vertices"):
             if key in pk:
-                pk[key] = pk[key][:n_low]
+                pk[key] = pk[key][lod]
         np.savez(out / f"identity_{name}.npz", **pk)
         print(f"  wrote {out/f'identity_{name}.npz'}")
 

@@ -28,19 +28,20 @@ RESULTS = REPO / "benchmarks" / "results" / "runtime.json"
 # Series labels + colors chosen so the RELATIONSHIPS read off the legend:
 #   * The four setups differ only in the per-identity "skeleton fit" (mapping a
 #     body shape to its posed joints).
-#   * "full fit" = SOMA-X's exact RBF + 2-stage-Kabsch solve; its rotation step
-#     is a 3×3 SVD. The two SOMA-JAX full-fit rows are the SAME JAX pipeline and
-#     differ ONLY in which kernel runs that SVD — XLA or a Warp svd3 kernel — so
-#     they are two shades of the SAME hue (teal): they are alternatives.
+#   * "full fit" = SOMA-X's RBF + 2-stage-Kabsch solve. The two SOMA-JAX
+#     full-fit rows are the SAME JAX pipeline and differ ONLY in the per-joint
+#     covariance -> rotation step: pure JAX runs upstream's "auto" solve
+#     (Newton-Schulz, Kabsch SVD fallback); the hybrid hands it to a Warp svd3
+#     Kabsch kernel. Same hue (teal): they are alternatives.
 #   * "linear fit" swaps the whole solve for a cheaper, approximate linear
-#     regressor (no SVD) — a different method, so its own colour (purple).
+#     regressor (no rotation solve) — a different method, so its own colour.
 #   * SOMA-X (the original, whole forward in PyTorch + NVIDIA Warp) is the
-#     orange reference. Its "Warp" is the entire GPU backend, NOT the same thing
-#     as the hybrid's single Warp SVD kernel — the colour keeps them separate.
+#     black reference. Its "Warp" is the entire GPU backend, NOT the same thing
+#     as the hybrid's single Warp svd3 kernel — the colour keeps them separate.
 _LABELS = {
     "soma_x":          "SOMA-X (PyTorch + Warp)",
-    "soma_jax_st":     "SOMA-JAX · full fit (SVD in XLA)",
-    "soma_jax_hybrid": "SOMA-JAX · full fit (SVD in Warp)",
+    "soma_jax_st":     "SOMA-JAX · full fit (pure JAX)",
+    "soma_jax_hybrid": "SOMA-JAX · full fit (JAX + Warp svd3)",
     "soma_jax_linear": "SOMA-JAX · linear fit (approx.)",
     "soma_jax":        "SOMA-JAX · linear fit (approx.)",   # legacy key
 }
@@ -50,18 +51,18 @@ _COLORS = {
     # (validated: teal↔indigo ΔE 20.6 CVD / 24.8 normal, contrast ≥3:1). The two
     # full-fit rows are the SAME pipeline → the SAME teal, told apart by line
     # style (solid vs dashed + ×), not colour.
-    "soma_jax_st":     "#0d9488",  # teal    — full fit, SVD in XLA   (solid)
-    "soma_jax_hybrid": "#0d9488",  # teal    — full fit, SVD in Warp  (dashed ×)
+    "soma_jax_st":     "#0d9488",  # teal    — full fit, pure JAX         (solid)
+    "soma_jax_hybrid": "#0d9488",  # teal    — full fit, JAX + Warp svd3  (dashed ×)
     "soma_jax_linear": "#4f46b8",  # indigo  — linear approximation
     "soma_jax":        "#4f46b8",
 }
 # Per-series line style: the Warp full-fit is dashed with × markers so it is
-# distinct from the (same-colour) XLA full-fit.
+# distinct from the (same-colour) pure-JAX full-fit.
 _STYLE = {"soma_jax_hybrid": dict(ls="--", marker="x", markersize=4)}
 _DEFAULT_STYLE = dict(ls="-", marker="o", markersize=3)
-# One-line key printed under the title so "full/linear" and "SVD" aren't jargon.
-_KEY = ("skeleton fit: full = SOMA-X's exact RBF+Kabsch solve (rotation step = a 3×3 SVD)   ·   "
-        "linear = cheaper approximation (no SVD)   ·   SVD in XLA / Warp = which kernel runs it")
+# One-line key printed under the title so "full/linear" and "svd3" aren't jargon.
+_KEY = ("skeleton fit: full = SOMA-X's RBF + Kabsch solve; pure JAX runs upstream's rotation "
+        "method, Warp svd3 a plain-Kabsch kernel   ·   linear = cheaper approximation")
 
 
 def _collect(results: dict) -> dict[str, dict[str, np.ndarray]]:

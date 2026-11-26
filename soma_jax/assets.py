@@ -2,8 +2,11 @@
 
 Upstream: ``soma/assets.py``
     Same role — locate the model data the layer needs — but resolved locally
-    rather than via a HuggingFace snapshot, because most of it already ships in
-    the vendored submodule.
+    rather than via a HuggingFace snapshot. Upstream's ``get_assets_dir()``
+    downloads the ``nvidia/soma-x`` HF repo at the immutable tag matching the
+    package release (``revision="v0.3.3"``); that tag's file set is exactly the
+    vendored submodule's ``assets/`` directory (upstream
+    ``tools/ci/hf_assets_v0.3.json``), so the submodule *is* that snapshot.
 
 Layout
 ======
@@ -15,19 +18,20 @@ Assets come from these places, searched in this order:
    (``pip install .`` / ``pip install git+...``), because the repository-relative
    locations below then point into ``site-packages``; also handy for keeping one
    shared copy of the assets on a cluster.
-1. **``third_party/SOMA-X/assets/``** — the vendored upstream submodule. It
-   already carries the template rig, procedural-transform JSON, correctives
-   checkpoint, and the MHR / Anny / SMPL / SMPL-X / GarmentMeasurements packs,
-   so there is no reason to keep a second copy of ~1 GB of identical files.
-   ``git submodule update --init --recursive`` is all that is needed — **with
-   git-lfs active**, since upstream stores every one of those files in Git LFS.
-2. **``assets/third_party/``** — everything the submodule does *not* carry,
-   fetched by ``tools/download_assets.py``. Git-ignored. The same script also
-   fills in submodule files that arrived as Git LFS pointer stubs.
+1. **``third_party/SOMA-X/assets/``** — the vendored upstream submodule, at the
+   same release as the code. It carries everything upstream's HF snapshot
+   does: ``SOMA_neutral.npz``, the template rig, the procedural-transform JSON,
+   the correctives checkpoint, ``SOMAHand.npz`` and the MHR / Anny / SMPL /
+   SMPL-X / MANO / GarmentMeasurements packs.
+   ``git submodule update --init --recursive`` is all that is needed, with
+   git-lfs active: upstream stores those files in Git LFS.
+2. **``assets/third_party/``** — what the submodule does *not* carry, i.e.
+   ``GarmentMeasurements/point.npz``, fetched by ``tools/download_assets.py``.
+   Git-ignored. The same script fills in submodule files that arrived as Git
+   LFS pointer stubs, without git-lfs.
 
-Derived artefacts that this repo builds (notably
-``SOMA_neutral_fixed.npz``, see ``docs/INSTALL.md`` §4.2) live directly in
-``assets/``.
+Derived artefacts that this repo builds (notably ``SOMA_neutral_fixed.npz``,
+a SOMA-JAX-only cache — see ``docs/INSTALL.md``) live directly in ``assets/``.
 
 Git LFS pointer stubs
 =====================
@@ -38,21 +42,27 @@ but hold no data. :func:`resolve` skips such stubs instead of handing them to a
 loader that would then fail with an opaque parse error, and reports them by
 name when nothing usable is found.
 
-The one asset that must be downloaded
-=====================================
+The v0.3 asset contract
+=======================
 
-``SOMA_neutral.npz`` **cannot** be taken from the submodule. That copy is the
-slim v0.2.1 archive and is missing all eleven rig keys the conversion needs
-(``bind_pose_world``, ``bind_pose_local``, ``bind_shape``, ``joint_names``,
-``joint_parent_ids``, ``t_pose_world``, ``t_pose_local`` and the four
-``skinning_weights_*`` arrays). :func:`resolve` enforces this rather than
-silently handing back an archive that fails later with a missing-key error —
-for the submodule copy and for a slim archive found anywhere else.
+Since SOMA-X v0.3 ``SOMA_neutral.npz`` is a **shape/topology asset only**:
+shape PCA, topology, UVs, LOD maps, segments and the historical reference
+T-poses behind ``get_reference_pose(version=...)``. Its metadata's
+``asset_contract.removed_npz_rig_fields`` lists the eleven rig keys it no longer
+carries (``bind_pose_*``, ``bind_shape``, ``joint_names``, ``joint_parent_ids``,
+``t_pose_*`` and the four ``skinning_weights_*``); the rig, bind pose, bind shape
+and skinning come from ``SOMA_template_rig.usda`` alone, and the public joint
+names from ``SOMA_procedural_transforms.json``. :mod:`soma_jax.rig_build` does
+that merge.
+
+``GarmentMeasurements/point.npz`` is not part of upstream's asset set at all:
+upstream's ``docs/data_assets.md`` has users generate it from the public
+``point.pca`` of the GarmentMeasurements repo with
+``tools/convert_gm_pca_to_npz.py`` (here ``tools/convert/convert_gm_pca_to_npz.py``).
 """
 from __future__ import annotations
 
 import os
-import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -69,43 +79,51 @@ SOURCE_REPOSITORIES = {
     "Anny": "https://github.com/naver/anny",
 }
 
-#: HuggingFace repo holding the full-schema SOMA archive.
-HF_REPO_ID = "nvidia/SOMA-X"
-#: Immutable revision pinned by ``docs/INSTALL.md`` §4.1.
+#: HuggingFace asset repo, upstream's ``soma.assets.REPO_ID``.
+REPO_ID = "nvidia/soma-x"
+#: SOMA-JAX's earlier name for :data:`REPO_ID`.
+HF_REPO_ID = REPO_ID
+#: Upstream's default ``get_assets_dir(revision=...)``: the immutable asset tag
+#: matching the package release. Kept in step with the submodule's version.
+UPSTREAM_ASSET_REVISION = "v0.3.3"
+#: Older immutable HF revision used ONLY by ``tools/download_assets.py`` as a
+#: convenience fallback for ``GarmentMeasurements/point.npz``, which upstream
+#: v0.3 no longer ships (it asks users to convert it locally). SOMA-JAX extra.
 HF_REVISION = "466879a83d57eabf3d875ded2d869f2075f90348"
 
 SUBMODULE_ASSETS = REPO_ROOT / "third_party" / "SOMA-X" / "assets"
 DOWNLOAD_ASSETS = REPO_ROOT / "assets" / "third_party"
 BUILT_ASSETS = REPO_ROOT / "assets"
 
-#: Relative paths the vendored submodule provides as-is.
+#: Relative paths the vendored submodule provides as-is — upstream's v0.3 HF
+#: asset set (``tools/ci/hf_assets_v0.3.json``) minus docs images.
 FROM_SUBMODULE = (
+    "SOMA_neutral.npz",
     "SOMA_template_rig.usda",
     "SOMA_procedural_transforms.json",
+    "SOMAHand.npz",
     "correctives_model.pt",
     "example_animation.npy",
     "MHR",
     "Anny",
+    "MANO",
     "SMPL",
     "SMPLX",
     "GarmentMeasurements",
 )
 
-#: Assets that must be downloaded; the submodule copy is unusable or absent.
+#: Assets that must come from outside the submodule.
 MUST_DOWNLOAD = {
-    "SOMA_neutral.npz": (
-        "the submodule ships the slim v0.2.1 archive, which omits the rig "
-        "arrays this port needs (bind_pose_world, skinning_weights_*, "
-        "joint_names, t_pose_world, ...)"
-    ),
     "GarmentMeasurements/point.npz": (
-        "the submodule ships only mean.obj and SOMA_wrap.obj for this pack; "
-        "the PCA archive is not vendored"
+        "upstream does not ship this PCA archive; generate it from the public "
+        "GarmentMeasurements point.pca with tools/convert/convert_gm_pca_to_npz.py "
+        "(upstream docs/data_assets.md)"
     ),
 }
 
-#: Individual files upstream's ``data_root`` contract expects. Checking whole
-#: directories is not enough — an empty ``GarmentMeasurements/`` would pass.
+#: Individual files upstream's full-body ``data_root`` contract expects.
+#: Checking whole directories is not enough — an empty ``GarmentMeasurements/``
+#: would pass.
 REQUIRED_FILES = (
     "SOMA_neutral.npz",
     "SOMA_template_rig.usda",
@@ -114,6 +132,10 @@ REQUIRED_FILES = (
     "MHR/base_body_lod1.obj",
     "MHR/mhr_model_lod1.pt",
     "MHR/SOMA_wrap_lod1.obj",
+    # Body MHR backend at ``low_lod`` (upstream `MHRIdentityModel`:
+    # ``lod = "lod1" if not low_lod else "lod6"``).
+    "MHR/base_body_lod6.obj",
+    "MHR/mhr_model_lod6.pt",
     "SMPL/base_body.obj",
     "SMPL/SOMA_wrap.obj",
     "SMPLX/base_body.obj",
@@ -125,23 +147,30 @@ REQUIRED_FILES = (
     "GarmentMeasurements/point.npz",
 )
 
-#: The ``third_party/SOMA-X`` commit the superproject pins (upstream v0.2.1).
-SOMA_X_COMMIT = "86632764684281dc98f31ab9c4aac36a4cdbc428"
-
-#: ``relative path -> (sha256, size in bytes, stored in Git LFS)`` for the
-#: submodule assets at :data:`SOMA_X_COMMIT`. Lets ``tools/download_assets.py``
+#: The ``third_party/SOMA-X`` commit the superproject pins (upstream v0.3.3).
+#: ``SOMA_X_ASSET_FILES`` maps each of its ``assets/`` files to
+#: ``(sha256, size in bytes, stored in Git LFS)``. Lets ``tools/download_assets.py``
 #: fetch and verify them without git-lfs — or without the submodule at all,
-#: e.g. from a GitHub "Download ZIP" checkout. Keep in sync with the gitlink
-#: when the submodule is bumped (``git lfs ls-files -l`` lists the LFS oids).
+#: e.g. from a GitHub "Download ZIP" checkout. Regenerate both with
+#: ``python tools/download_assets.py --print-table`` when the gitlink moves.
+SOMA_X_COMMIT = "d6aa640f7787498009c4e3d57fcc14a243905d10"
 SOMA_X_ASSET_FILES = {
-    "SOMA_template_rig.usda": (
-        "79f02176534ebc0671c76bf09203bbee8e1621f8b6d34cc63aec69b73460bba2", 344934193, True),
-    "SOMA_procedural_transforms.json": (
-        "5c135532d77932b547050b131a8fa0e67b63e9541c3cd621889ba483d946fb00", 20045, False),
-    "correctives_model.pt": (
-        "411d061a651051a7a4ec941543495d35eac21e5a7a69c8ce042b89cd12772a43", 70549157, True),
-    "example_animation.npy": (
-        "f424385dae3128278e74e81e0789ee4048753199d04fef77c27ba5457bd3819d", 5601024, True),
+    "Anny/SOMA_wrap.obj": (
+        "15e1500a13d3fac2db17b622ab54292cfb2e58d9efaa1e86cc11e46071bffb2e", 2613343, True),
+    "Anny/base_body.obj": (
+        "7bf31cbc0897670de51b7cd6b1a3da55a35fe56ef1d7b2e6aae2f95a11196504", 1182571, True),
+    "GarmentMeasurements/SOMA_wrap.obj": (
+        "c1871742042290cb6de7641e7e29fc1c42f331e8be1b4f9a019437d244986baa", 2192530, True),
+    "GarmentMeasurements/mean.obj": (
+        "4536d92bc379e818a4b29b83ab7ab19b3036cd7ceaf3469fba5883b88eb33c13", 3552167, True),
+    "MANO/SOMA_wrap_left.obj": (
+        "e198a37e9d33e32176d6325d47d48c153b5429dce5d248769ac03959b9c28aaa", 194628, True),
+    "MANO/SOMA_wrap_right.obj": (
+        "5c5f8dc18bd8386aacee78dfa4437f3cd1cfbad066ae3772d2f666db1d047771", 194585, True),
+    "MANO/base_hand_left.obj": (
+        "fd8b895d18e38cad9f082e4e7f8c66534c70253eedebdf77c5cd4987fcad54b8", 49391, True),
+    "MANO/base_hand_right.obj": (
+        "9d83807a5852cf35a85da421e32d6168de6e33c2ce6f42dd531aecc88febc3b6", 49408, True),
     "MHR/SOMA_wrap_lod1.obj": (
         "9ab7a2328d5b026c17ef1d09ed692ffeb68f96d3fc74970cba72e667dbe0f728", 1816801, True),
     "MHR/base_body_lod1.obj": (
@@ -162,18 +191,19 @@ SOMA_X_ASSET_FILES = {
         "7498e3a7873d7b4d8f1d3455a8af945589b1c494fbff99b14bc905a691208b6f", 2630564, True),
     "SMPLX/base_body.obj": (
         "f03f95e5e303c8dc070afa09387e9dde861eeb1567ccf61a70bf53a5f7fd2b70", 700964, True),
-    "Anny/SOMA_wrap.obj": (
-        "0e9caa78848b27c32f69601d289aeea8835237c38d02c8b0c0fce8f6ee699549", 2613345, True),
-    "Anny/base_body.obj": (
-        "7bf31cbc0897670de51b7cd6b1a3da55a35fe56ef1d7b2e6aae2f95a11196504", 1182571, True),
-    "GarmentMeasurements/SOMA_wrap.obj": (
-        "c1871742042290cb6de7641e7e29fc1c42f331e8be1b4f9a019437d244986baa", 2192530, True),
-    "GarmentMeasurements/mean.obj": (
-        "4536d92bc379e818a4b29b83ab7ab19b3036cd7ceaf3469fba5883b88eb33c13", 3552167, True),
+    "SOMAHand.npz": (
+        "233e9225c1da05c6a3dd98107b9f027f2366e3b972bbe67e0d164e5d28619fff", 993833, True),
+    "SOMA_neutral.npz": (
+        "5829af4a5333abdba5ad449360b868faacee99d395971e62f35c0e7169432b63", 26608121, True),
+    "SOMA_procedural_transforms.json": (
+        "9853e19ab51625ffaa7d9e7ccf0e443272c2740837604e6bacd66604e8edf509", 20045, False),
+    "SOMA_template_rig.usda": (
+        "a952cb7bdf4ccd801e355d53122d395b985b69d0d9181439edad5081bb171856", 28306038, True),
+    "correctives_model.pt": (
+        "411d061a651051a7a4ec941543495d35eac21e5a7a69c8ce042b89cd12772a43", 70549157, True),
+    "example_animation.npy": (
+        "f424385dae3128278e74e81e0789ee4048753199d04fef77c27ba5457bd3819d", 5601024, True),
 }
-
-#: Keys whose absence marks a ``SOMA_neutral.npz`` as the slim archive.
-_FULL_SCHEMA_KEYS = ("bind_shape", "bind_pose_world", "joint_names")
 
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/"
 #: Real LFS pointer files are ~130 bytes; anything larger is real content.
@@ -209,23 +239,33 @@ def lfs_pointer(path) -> tuple[str, int] | None:
     return (oid, size) if oid else None
 
 
-def _is_slim_soma_archive(path: Path) -> bool:
-    """True for a ``SOMA_neutral.npz`` that lacks the full-schema rig keys.
-
-    Reads only the zip directory, so it is cheap even for the 27 MB archive.
-    """
-    try:
-        with zipfile.ZipFile(path) as zf:
-            names = {n[:-4] if n.endswith(".npy") else n for n in zf.namelist()}
-    except (OSError, zipfile.BadZipFile):
-        return False   # not ours to judge — let the loader report it
-    return not all(k in names for k in _FULL_SCHEMA_KEYS)
-
-
 def env_asset_roots() -> tuple[Path, ...]:
     """Directories listed in ``$SOMA_JAX_ASSETS``, in order."""
     raw = os.environ.get(ASSETS_ENV_VAR, "")
     return tuple(Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip())
+
+
+#: Files the SOMA Hand layer (upstream ``soma.hand``, v0.3.0) reads from the
+#: same ``data_root``: the hand mapping/PCA archive and the per-side MANO
+#: correspondence pair. Its MHR backend reuses the body's ``MHR/*_lod1`` files.
+#: Kept separate so a body-only setup is not reported as incomplete;
+#: :func:`data_root` links both sets.
+HAND_REQUIRED_FILES = (
+    "SOMAHand.npz",
+    "MANO/base_hand_left.obj",
+    "MANO/base_hand_right.obj",
+    "MANO/SOMA_wrap_left.obj",
+    "MANO/SOMA_wrap_right.obj",
+)
+
+#: Example inputs that ship with the assets and that upstream's tools read from
+#: ``data_root``: the demo motion (``tools/hand/demo_soma_hand_vis.py``) and the
+#: SMPL clip ``tools/convert/smpl2soma.py`` converts. Linked by :func:`data_root`,
+#: never required.
+EXAMPLE_FILES = (
+    "example_animation.npy",
+    "SMPL/smpl_anim.npy",
+)
 
 
 def _search_roots() -> tuple[Path, ...]:
@@ -233,11 +273,22 @@ def _search_roots() -> tuple[Path, ...]:
         SUBMODULE_ASSETS, DOWNLOAD_ASSETS, DOWNLOAD_ASSETS / "hf", BUILT_ASSETS)
 
 
+def _pinned_size(name: str) -> int | None:
+    """Byte size the pinned submodule commit records for ``name``, when the
+    checkout does not hold the file itself (``None`` otherwise)."""
+    sub = SUBMODULE_ASSETS / name
+    pointer = lfs_pointer(sub)
+    if pointer is not None:
+        return pointer[1]
+    if not sub.exists() and name in SOMA_X_ASSET_FILES:
+        return SOMA_X_ASSET_FILES[name][1]
+    return None
+
+
 def resolve(name: str, *, required: bool = True) -> Path | None:
     """Locate an asset by relative name.
 
-    Git LFS pointer stubs are skipped, as is a slim ``SOMA_neutral.npz``, so
-    the first *usable* copy wins.
+    Git LFS pointer stubs are skipped, so the first *usable* copy wins.
 
     Args:
         name: e.g. ``"SOMA_template_rig.usda"``, ``"MHR/base_body_lod1.obj"``,
@@ -252,11 +303,17 @@ def resolve(name: str, *, required: bool = True) -> Path | None:
     """
     roots = _search_roots()
     if name in MUST_DOWNLOAD:
-        # Skip the submodule for these: a copy exists but is the wrong one.
+        # Never vendored upstream, so there is no point searching the submodule.
         roots = tuple(r for r in roots if r != SUBMODULE_ASSETS)
 
+    # When the checked-out submodule holds a pointer stub for this file — or
+    # has no copy at all (a "Download ZIP" checkout) — a copy found elsewhere
+    # must be the pinned release's file: one fetched for an earlier submodule
+    # pin (another size than the pointer, or SOMA_X_ASSET_FILES, records) is
+    # stale. A real file in the submodule needs no such check.
+    pinned_size = _pinned_size(name)
     pointers: list[Path] = []
-    slim: list[Path] = []
+    stale: list[Path] = []
     for root in roots:
         candidate = root / name
         if not candidate.exists():
@@ -264,8 +321,9 @@ def resolve(name: str, *, required: bool = True) -> Path | None:
         if lfs_pointer(candidate) is not None:
             pointers.append(candidate)
             continue
-        if name == "SOMA_neutral.npz" and _is_slim_soma_archive(candidate):
-            slim.append(candidate)
+        if (pinned_size is not None and candidate.is_file()
+                and candidate.stat().st_size != pinned_size):
+            stale.append(candidate)
             continue
         return candidate
 
@@ -283,11 +341,11 @@ def resolve(name: str, *, required: bool = True) -> Path | None:
             "or `python tools/download_assets.py`, which fetches the files "
             "without git-lfs."
         )
-    if slim:
+    if stale:
         found += (
-            " Found only the slim SOMA_neutral.npz (no rig arrays): "
-            + ", ".join(str(p) for p in slim)
-            + ". Download the full-schema archive (docs/INSTALL.md §4.1)."
+            " Found only copies from another release (their size differs from the "
+            "pinned submodule commit's): " + ", ".join(str(p) for p in stale)
+            + ". Run `python tools/download_assets.py` to fetch this release's file."
         )
     raise FileNotFoundError(
         f"Asset {name!r} not found{detail}.{found} Searched: "
@@ -299,13 +357,51 @@ def resolve(name: str, *, required: bool = True) -> Path | None:
     )
 
 
-def get_assets_dir() -> Path:
-    """Directory holding the vendored upstream assets (submodule)."""
-    return SUBMODULE_ASSETS
+def get_assets_dir(revision: str = UPSTREAM_ASSET_REVISION, cache_dir=None) -> Path:
+    """The SOMA asset directory for ``revision`` (upstream ``get_assets_dir``).
+
+    Upstream downloads (or reuses from the HuggingFace cache) the
+    :data:`REPO_ID` snapshot at ``revision``. The vendored submodule's
+    ``assets/`` *is* that snapshot for the release this port tracks, so the
+    default revision returns it without network access when it is checked out;
+    any other revision, an explicit ``cache_dir``, or a missing submodule goes
+    through ``huggingface_hub.snapshot_download`` exactly as upstream does.
+
+    Args:
+        revision: git revision (branch, tag or commit) of the asset repo.
+        cache_dir: override the default HuggingFace cache directory.
+
+    Returns:
+        Path of the local asset directory.
+    """
+    if (revision == UPSTREAM_ASSET_REVISION and cache_dir is None
+            and (SUBMODULE_ASSETS / "SOMA_neutral.npz").is_file()):
+        return SUBMODULE_ASSETS
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo_id=REPO_ID, repo_type="model", revision=revision,
+                                  cache_dir=cache_dir))
 
 
 #: Materialised view satisfying upstream's single-directory contract.
 DATA_ROOT = REPO_ROOT / "assets" / "data_root"
+
+#: Licensed model files the user provides (registration required, never
+#: shipped): ``data/<dir>/`` here -> ``<data_root>/<MODEL>/`` where upstream's
+#: loaders look (``SMPL/SMPL_NEUTRAL.npz``, ``MANO/MANO_LEFT.pkl``, ...).
+LICENSED_MODEL_DIRS = {"SMPL": "smpl", "SMPLH": "smplh", "SMPLX": "smplx", "MANO": "mano"}
+
+
+def _licensed_model_files():
+    """``(data-root relative path, source)`` for each licensed file under ``data/``."""
+    for model, local in LICENSED_MODEL_DIRS.items():
+        folder = REPO_ROOT / "data" / local
+        if not folder.is_dir():
+            continue
+        for src in sorted(folder.iterdir()):
+            if (src.is_file() and src.suffix in (".npz", ".pkl")
+                    and src.name.startswith(model + "_")):
+                yield f"{model}/{src.name}", src
 
 
 def data_root(materialise: bool = True) -> Path:
@@ -317,8 +413,11 @@ def data_root(materialise: bool = True) -> Path:
     rest are downloaded — so no existing directory satisfies that contract.
 
     This assembles one out of symlinks (falling back to hardlink/copy where
-    symlinks are unavailable), pointing at whatever :func:`resolve` finds. It
-    is cheap, adds no duplicate bytes, and is refreshed when a link dangles.
+    symlinks are unavailable), pointing at whatever :func:`resolve` finds, plus
+    the licensed model files placed under ``data/smpl``, ``data/smplh``,
+    ``data/smplx`` and ``data/mano`` (upstream names, e.g. ``SMPL_NEUTRAL.npz``),
+    linked where upstream's loaders look for them. It is cheap, adds no
+    duplicate bytes, and is refreshed when a link dangles.
 
     Args:
         materialise: build/refresh the directory. Pass False to get the path
@@ -331,8 +430,10 @@ def data_root(materialise: bool = True) -> Path:
         return DATA_ROOT
 
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    for rel in REQUIRED_FILES:
-        src = resolve(rel, required=False)
+    links = [(rel, resolve(rel, required=False))
+             for rel in REQUIRED_FILES + HAND_REQUIRED_FILES + EXAMPLE_FILES]
+    links += list(_licensed_model_files())
+    for rel, src in links:
         dst = DATA_ROOT / rel
         if src is None:
             # Drop a link left from an earlier run (it may point at an LFS
@@ -367,6 +468,11 @@ def data_root(materialise: bool = True) -> Path:
     return DATA_ROOT
 
 
-def missing_assets() -> list[str]:
-    """Required files that cannot be resolved anywhere."""
-    return [rel for rel in REQUIRED_FILES if resolve(rel, required=False) is None]
+def missing_assets(*, hand: bool = False) -> list[str]:
+    """Required files that cannot be resolved anywhere.
+
+    Args:
+        hand: also check :data:`HAND_REQUIRED_FILES` (the SOMA Hand layer's).
+    """
+    files = REQUIRED_FILES + (HAND_REQUIRED_FILES if hand else ())
+    return [rel for rel in files if resolve(rel, required=False) is None]

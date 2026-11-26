@@ -1,4 +1,4 @@
-"""Anny children's-body identity model, JAX evaluation.
+"""Anny identity model, JAX evaluation.
 
 Upstream: ``soma/identity_model.py`` — ``AnnySimplified`` + ``AnnyIdentityModel``.
 
@@ -98,6 +98,16 @@ class AnnyNativeModel:
         """
         return len(self.phenotype_labels)
 
+    @property
+    def num_scale_params(self) -> int:
+        """Upstream ``AnnyIdentityModel.num_scale_params``: the local-change count."""
+        return len(self.local_change_labels)
+
+    @property
+    def scale_param_names(self) -> tuple:
+        """Upstream ``AnnyIdentityModel.scale_param_names``: the local-change labels."""
+        return tuple(self.local_change_labels)
+
     # ---- construction ----------------------------------------------------
     @classmethod
     def from_anny(cls, anny_model: Any = None, **create_kwargs) -> "AnnyNativeModel":
@@ -178,10 +188,13 @@ class AnnyNativeModel:
 
         Args:
             phenotypes: (B, num_identity_coeffs) values in Anny's own range,
-                one column per entry of :py:attr:`phenotype_labels`. ``None``
-                uses Anny's defaults.
+                one column per entry of :py:attr:`phenotype_labels`, or (as
+                upstream) a ``{label: (B,) values}`` dict whose unset labels take
+                Anny's defaults. ``None`` uses Anny's defaults.
             local_changes: forwarded to
-                ``get_phenotype_blendshape_coefficients``.
+                ``get_phenotype_blendshape_coefficients`` — a label dict, or
+                (upstream v0.3 ``AnnySimplified``) a ``(B, n_labels)`` array
+                with one column per :py:attr:`local_change_labels` entry.
 
         Returns:
             (B, 1132) coefficients, ready for :meth:`get_rest_vertices`.
@@ -204,7 +217,16 @@ class AnnyNativeModel:
             raise ValueError(
                 f"Invalid phenotype: {sorted(unknown)}; available: {sorted(available)}")
 
-        if phenotypes is not None:
+        if isinstance(phenotypes, dict):
+            # Upstream `AnnySimplified.forward`: a label -> (B,) dict, unset
+            # labels taking Anny's defaults via `parse_phenotype_kwargs`.
+            kwargs = self._anny.parse_phenotype_kwargs(
+                {k: torch.as_tensor(np.asarray(v, np.float64)) for k, v in phenotypes.items()})
+            invalid = set(kwargs) - available
+            if invalid:
+                raise ValueError(
+                    f"Invalid phenotype: {sorted(invalid)}; available: {sorted(available)}")
+        elif phenotypes is not None:
             values = np.atleast_2d(np.asarray(phenotypes, np.float64))
             if values.shape[1] != len(self.phenotype_labels):
                 raise ValueError(
@@ -218,6 +240,21 @@ class AnnyNativeModel:
                 if v.shape[0] != B:
                     kwargs[label] = v.expand(B).clone()
 
+        if local_changes is None:
+            local_changes = {}
+        elif isinstance(local_changes, dict):
+            local_changes = {k: torch.as_tensor(np.asarray(v, np.float64))
+                             for k, v in local_changes.items()}
+        else:
+            # SOMA-X v0.3 `AnnySimplified.forward`: a (B, n_labels) tensor
+            # becomes one entry per local-change label.
+            lc = np.atleast_2d(np.asarray(local_changes, np.float64))
+            if lc.ndim != 2 or lc.shape[1] != len(self.local_change_labels):
+                raise ValueError(
+                    f"local_changes must be a dict or a (B, {len(self.local_change_labels)}) "
+                    f"array (one column per local_change_labels entry), got {lc.shape}")
+            local_changes = {label: torch.tensor(lc[:, i], dtype=torch.float64)
+                             for i, label in enumerate(self.local_change_labels)}
         coeffs = self._anny.get_phenotype_blendshape_coefficients(
             **kwargs, local_changes=local_changes)
         return jnp.asarray(coeffs.detach().cpu().numpy(), jnp.float32)

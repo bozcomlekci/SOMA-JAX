@@ -13,6 +13,7 @@ from .transforms import (
     rotation_6d_to_rotmat,
     safe_normalize,
     kabsch,
+    kabsch_points,
     newton_schulz,
     se3_from_rt,
     se3_inverse,
@@ -25,9 +26,11 @@ from .transforms import (
     quaternion_half_angle_xyzw,
 )
 from .lbs import (
+    batch_rodrigues,
     forward_kinematics,
     lbs_transforms,
     lbs,
+    lbs_blend,
     lbs_sparse,
     compute_skeleton_levels,
     fk_levelorder,
@@ -50,6 +53,7 @@ from .rig_utils import (
     get_joint_descendents,
     get_joint_subtree,
     get_body_part_vertex_ids,
+    group_body_part_vertex_ids,
     joint_world_to_local,
     joint_local_to_world,
     precompute_joint_orient,
@@ -62,10 +66,13 @@ from .rig_utils import (
 )
 from .batched_skinning import (
     BatchedSkinning,
+    FKTopology,
+    RestJointSkinning,
     pose_from_bind,
     topk_skinning,
 )
 from .chamfer import (
+    ChamferLoss,
     chamfer_distance,
     chamfer_distance_batched,
     nearest_neighbor_indices,
@@ -82,6 +89,7 @@ __all__ = [
     "rotation_6d_to_rotmat",
     "safe_normalize",
     "kabsch",
+    "kabsch_points",
     "newton_schulz",
     "se3_from_rt",
     "se3_inverse",
@@ -95,7 +103,9 @@ __all__ = [
     # LBS / FK
     "forward_kinematics",
     "lbs_transforms",
+    "batch_rodrigues",
     "lbs",
+    "lbs_blend",
     "lbs_sparse",
     "compute_skeleton_levels",
     "fk_levelorder",
@@ -113,6 +123,7 @@ __all__ = [
     "get_joint_descendents",
     "get_joint_subtree",
     "get_body_part_vertex_ids",
+    "group_body_part_vertex_ids",
     "joint_world_to_local",
     "joint_local_to_world",
     "precompute_joint_orient",
@@ -124,9 +135,12 @@ __all__ = [
     "compute_bone_lengths",
     # Batched skinning
     "BatchedSkinning",
+    "FKTopology",
+    "RestJointSkinning",
     "pose_from_bind",
     "topk_skinning",
     # Chamfer
+    "ChamferLoss",
     "chamfer_distance",
     "chamfer_distance_batched",
     "nearest_neighbor_indices",

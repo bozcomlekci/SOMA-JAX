@@ -127,12 +127,17 @@ def main():
     smpl_pkl = REPO / "data" / "smpl" / "SMPL_NEUTRAL.npz"
     smplx_npz = REPO / "data" / "smplx" / "SMPLX_NEUTRAL.npz"
     corr_npz = REPO / "assets" / "correctives_model_v021.npz"
+    if not corr_npz.exists():
+        # Without a checkpoint the layer has no corrective network (upstream's
+        # correctives_model is None), so section [2] would have nothing to audit.
+        raise SystemExit(f"{corr_npz} is missing; convert it first with "
+                         "tools/convert/convert_correctives_pt_to_npz.py")
 
     corr = str(corr_npz) if corr_npz.exists() else None
     if Path(soma_npz).exists():
         layer = SOMALayer.load(str(soma_npz), identity_model_type="soma", correctives_path=corr)
     else:
-        # No baked archive (docs/INSTALL.md §4.2): build the same 78-joint rig
+        # No runtime archive (docs/INSTALL.md §4.3): build the same 78-joint rig
         # straight from the upstream assets.
         layer = SOMALayer.from_upstream_assets(
             identity_model_type="soma", correctives_path=corr, procedural=False)
@@ -249,7 +254,7 @@ def main():
 
     # --- correctives audit: ON vs OFF should be IDENTICAL if W2==0 ---
     print("Auditing pose correctives...")
-    corr_out = layer.correctives(rotmats)
+    corr_out = layer.correctives.offsets(rotmats)
     corr_max = float(jnp.abs(corr_out).max())
     corr_norm_mean = float(jnp.linalg.norm(corr_out, axis=-1).mean())
     w1_max = float(jnp.abs(layer.correctives.W1).max())

@@ -8,8 +8,9 @@ import pytest
 
 from soma_jax.geometry import (
     RadialBasisFunction, SkeletonTransfer, align_vectors, axis_angle_to_rotmat,
-    chamfer_distance, compute_skeleton_levels, fk_levelorder, forward_kinematics, kabsch,
-    lbs, lbs_sparse, lbs_transforms, newton_schulz, rotation_6d_to_rotmat,
+    chamfer_distance, compute_covariance, compute_skeleton_levels, fk_levelorder,
+    forward_kinematics, kabsch, kabsch_points, lbs, lbs_blend, lbs_sparse, lbs_transforms,
+    newton_schulz, rotation_6d_to_rotmat,
     rotation_matrices_are_valid, rotmat_to_6d, rotmat_to_axis_angle, topk_skinning,
 )
 from soma_jax.geometry.interpolate import rbf_basis_weights_np
@@ -44,7 +45,10 @@ def test_rotations_are_valid():
 def test_kabsch_and_align_vectors_recover_rotation():
     R = axis_angle_to_rotmat(jnp.array([0.3, -0.7, 0.4]))
     src = jnp.asarray(RNG.normal(size=(80, 3)), jnp.float32)
-    np.testing.assert_allclose(np.asarray(kabsch(src, src @ R.T)), np.asarray(R), atol=1e-4)
+    np.testing.assert_allclose(np.asarray(kabsch_points(src, src @ R.T)), np.asarray(R), atol=1e-4)
+    # upstream's kabsch takes the covariance of (source, target) vectors
+    H = compute_covariance(src @ R.T, src)
+    np.testing.assert_allclose(np.asarray(kabsch(H)), np.asarray(R), atol=1e-4)
     for method in ("auto", "kabsch", "newton-schulz"):
         got = align_vectors(src @ R.T, src, method=method)
         np.testing.assert_allclose(np.asarray(got), np.asarray(R), atol=2e-3, err_msg=method)
@@ -74,9 +78,13 @@ def test_identity_pose_is_rest(synthetic_rig):
                            r["parents"])
     np.testing.assert_allclose(np.asarray(G[:, :3, 3]), r["joints"], atol=1e-6)
     T = lbs_transforms(G, jnp.asarray(r["joints"]))[None]
-    v = lbs(jnp.asarray(r["verts"])[None], jnp.zeros((1,) + r["verts"].shape), T,
-            jnp.asarray(r["weights"]))
+    v = lbs_blend(jnp.asarray(r["verts"])[None], jnp.zeros((1,) + r["verts"].shape), T,
+                  jnp.asarray(r["weights"]))
     np.testing.assert_allclose(np.asarray(v[0]), r["verts"], atol=1e-5)
+    # upstream's lbs: (J, 4, 4) skinning transforms (posed world @ inverse bind)
+    v_up = lbs(jnp.asarray(r["verts"]), jnp.asarray(r["weights"]),
+               jnp.broadcast_to(jnp.eye(4), (J, 4, 4)))
+    np.testing.assert_allclose(np.asarray(v_up), r["verts"], atol=1e-6)
 
 
 def test_sparse_lbs_matches_dense(synthetic_rig):
@@ -85,8 +93,8 @@ def test_sparse_lbs_matches_dense(synthetic_rig):
     G = forward_kinematics(_random_rotmats(J, 0.6), jnp.asarray(r["joints"]), r["parents"])
     T = lbs_transforms(G, jnp.asarray(r["joints"]))[None]
     v0 = jnp.asarray(r["verts"])[None]
-    dense = lbs(v0, jnp.zeros_like(v0), T, jnp.asarray(r["weights"]))
-    idx, val = topk_skinning(r["weights"], k=J)
+    dense = lbs_blend(v0, jnp.zeros_like(v0), T, jnp.asarray(r["weights"]))
+    idx, val = topk_skinning(r["weights"], K=J)
     sparse = lbs_sparse(v0, jnp.zeros_like(v0), T, jnp.asarray(val), jnp.asarray(idx))
     np.testing.assert_allclose(np.asarray(sparse), np.asarray(dense), atol=1e-5)
     np.testing.assert_allclose(np.asarray(val).sum(1), 1.0, atol=1e-5)
@@ -99,7 +107,7 @@ def test_fk_lbs_jit_vmap_grad(synthetic_rig):
 
     def energy(aa):
         G = forward_kinematics(jax.vmap(axis_angle_to_rotmat)(aa), rest_j, r["parents"])
-        v = lbs(v0[None], jnp.zeros_like(v0)[None], lbs_transforms(G, rest_j)[None], W)
+        v = lbs_blend(v0[None], jnp.zeros_like(v0)[None], lbs_transforms(G, rest_j)[None], W)
         return jnp.sum(v[0, :, 1] ** 2)
 
     aa = jnp.asarray(RNG.normal(size=(J, 3)) * 0.3, jnp.float32)
@@ -232,7 +240,7 @@ def test_barycentric_transfer_reproduces_surface_points():
 # ------------------------------------------------------------- pose inversion
 def _pose_inversion_case(synthetic_rig, hinge=None):
     from soma_jax import PoseInversion
-    from soma_jax.pose_inversion import _build_fk_lbs_fn
+    from soma_jax.pose_inversion_lite import _build_fk_lbs_fn
     r = synthetic_rig
     parents = r["parents"]
     inv = PoseInversion(rest_verts=jnp.asarray(r["verts"]), weights=jnp.asarray(r["weights"]),

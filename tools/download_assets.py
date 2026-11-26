@@ -1,47 +1,52 @@
 """Fetch the assets SOMA-JAX needs that a checkout does not already provide.
 
-Most model data ships inside the **`third_party/SOMA-X` submodule**
-(`third_party/SOMA-X/assets/`): the template rig, the procedural-transform
-JSON, the correctives checkpoint, and the MHR / Anny / SMPL / SMPL-X /
-GarmentMeasurements packs. Those are used in place — this script does not copy
-them. Run ``git submodule update --init --recursive`` to get them.
+Upstream: ``tools/download_assets.py``. Upstream's command downloads the
+``nvidia/soma-x`` HuggingFace asset snapshot for its release into the
+HuggingFace cache; :func:`download_assets` and the ``--target-dir`` /
+``--revision`` options do exactly that here too (through
+:func:`soma_jax.assets.get_assets_dir`, so ``huggingface_hub`` is needed).
 
-Upstream stores all of those files in **Git LFS**. A clone made without git-lfs
-active gets ~130-byte pointer stubs instead, and a GitHub "Download ZIP" gets no
-submodule at all. For either case this script fetches the real files for the
-pinned submodule commit and verifies them against their sha256 — no git-lfs
-needed. Pass ``--no-lfs`` to skip that step.
+SOMA-JAX reads its assets from the **`third_party/SOMA-X` submodule** instead
+(`third_party/SOMA-X/assets/`), which carries that same snapshot at the release
+the code tracks — ``git submodule update --init --recursive`` is all it needs.
+So the bare command does what *this* layout needs:
 
-What always needs downloading is the **full-schema `SOMA_neutral.npz`**. The
-submodule's copy is the slim v0.2.1 archive and omits every rig array the
-conversion needs (`bind_pose_world`, `bind_pose_local`, `bind_shape`,
-`joint_names`, `joint_parent_ids`, `t_pose_world`, `t_pose_local` and the four
-`skinning_weights_*` entries), so `SOMALayer.load` would fail with a
-missing-key error. It is fetched from an immutable revision of
-`nvidia/SOMA-X` on HuggingFace and checksum-verified.
+* Upstream stores the submodule's assets in **Git LFS**. A clone made without
+  git-lfs active gets ~130-byte pointer stubs instead, and a GitHub "Download
+  ZIP" gets no submodule at all. For either case the files of the pinned
+  submodule commit are fetched and verified against their sha256 — no git-lfs
+  needed (``--no-lfs`` skips this). A copy fetched for an earlier submodule pin
+  is refetched.
+* **`GarmentMeasurements/point.npz`** (the GarmentMeasurements shape PCA) ships
+  with neither upstream nor the submodule; it is fetched from the older
+  immutable `nvidia/SOMA-X` HuggingFace revision that published it. Upstream's
+  own instruction (`docs/data_assets.md`) is to convert it from the public
+  `point.pca` of https://github.com/mbotsch/GarmentMeasurements::
+
+      python tools/convert/convert_gm_pca_to_npz.py /path/to/point.pca \\
+          assets/third_party/GarmentMeasurements/point.npz
 
 Downloads land in ``assets/third_party/`` (git-ignored). Derived artefacts that
-this repo *builds* — notably ``assets/SOMA_neutral_fixed.npz``, see
-``docs/INSTALL.md`` §4.2 — live one level up in ``assets/``.
+this repo *builds* — notably the optional runtime archive
+``assets/SOMA_neutral_fixed.npz`` (``tools/pipeline/build_soma_rig.py``) — live
+one level up in ``assets/``.
 
-The script needs only the Python standard library: it does not import JAX (so
-``--check`` works on a machine where nothing is installed yet), and it uses
-``huggingface_hub`` when available but falls back to plain HTTPS otherwise.
-``HF_ENDPOINT`` (a HuggingFace mirror) and ``HF_TOKEN`` are honoured either way.
-
-Upstream source repositories, for provenance and for fetching anything further:
-
-    SOMA-X   https://github.com/NVlabs/SOMA-X
-    MHR      https://github.com/facebookresearch/MHR
-    Anny     https://github.com/naver/anny
+The default path needs only the Python standard library: it does not import
+JAX (so ``--check`` works on a machine where nothing is installed yet), and it
+uses ``huggingface_hub`` when available but falls back to plain HTTPS
+otherwise. ``HF_ENDPOINT`` (a HuggingFace mirror) and ``HF_TOKEN`` are honoured
+either way.
 
 Usage::
 
-    python tools/download_assets.py              # -> assets/third_party/
+    python tools/download_assets.py              # what the submodule checkout lacks
     python tools/download_assets.py --minimal    # only what SOMALayer.from_upstream_assets() needs
     python tools/download_assets.py --check      # report what is missing, download nothing
-    python tools/download_assets.py --only Anny/base_body.obj Anny/SOMA_wrap.obj
+    python tools/download_assets.py --extras     # only GarmentMeasurements/point.npz
+    python tools/download_assets.py --only SOMAHand.npz MANO/base_hand_left.obj
     python tools/download_assets.py --force
+    python tools/download_assets.py --target-dir DIR --revision v0.3.6   # upstream's download
+    python tools/download_assets.py --print-table   # maintainers: manifest for a submodule bump
 """
 from __future__ import annotations
 
@@ -74,28 +79,37 @@ def _load_assets_module():
 
 A = _load_assets_module()
 
-# (filename, sha256, size, description) — fetched from HuggingFace at --revision.
+# (filename, sha256, size, description) — fetched from HuggingFace at A.HF_REVISION.
 HF_DOWNLOADS = [
-    ("SOMA_neutral.npz",
-     "515f7d5bb74be4e370e9adf5e779760ec3581556374c0b33212a32d13ab3b53f", 27488638,
-     "full-schema SOMA rig — mean shape, PCA basis, sparse skinning, joint tree"),
     # The submodule ships only mean.obj / SOMA_wrap.obj for this pack.
     ("GarmentMeasurements/point.npz",
      "6ae75a1ab7a8ae4f46bac503146976ba59cf918bca8aefe7320a3ed02aa2416a", 8626920,
-     "CAESARS garment PCA archive (not vendored in the submodule)"),
+     "GarmentMeasurements shape PCA (shipped by neither upstream nor the submodule)"),
 ]
 
 #: What ``SOMALayer.from_upstream_assets()`` reads; ``--minimal`` fetches only these.
 MINIMAL_FILES = ("SOMA_neutral.npz", "SOMA_template_rig.usda",
-                 "SOMA_procedural_transforms.json")
-
-#: A HuggingFace publish of nvidia/SOMA-X whose files are byte-identical to the
-#: pinned submodule for most assets — a second source when GitHub is
-#: unreachable. Every download is sha256-verified, so a file that differs there
-#: (the v0.2.2 template rig, for one) is rejected, never used.
-HF_MIRROR_REVISION = "4cfe361e6bf093b4918deab851f97c74dd061356"
+                 "SOMA_procedural_transforms.json", "correctives_model.pt")
 
 _USER_AGENT = "soma-jax-download-assets"
+
+
+def download_assets(target_dir=None, revision="main"):
+    """Download the SOMA asset snapshot from HuggingFace (upstream ``download_assets``).
+
+    Args:
+        target_dir: If provided, used as the HuggingFace cache directory.
+            The actual assets will be stored in a subdirectory managed by
+            huggingface_hub.  If None, uses the default HF cache
+            (``~/.cache/huggingface/hub/``).
+        revision: Git revision (branch, tag, or commit hash) to download.
+
+    Returns:
+        Path to the downloaded assets directory.
+    """
+    path = A.get_assets_dir(revision=revision, cache_dir=target_dir)
+    print(f"Assets downloaded to: {path}")
+    return path
 
 
 def parse_args():
@@ -104,25 +118,38 @@ def parse_args():
         epilog="Source repositories: "
                + ", ".join(f"{k} {v}" for k, v in A.SOURCE_REPOSITORIES.items()),
     )
+    # Upstream's options: the HuggingFace snapshot, as upstream downloads it.
+    p.add_argument("--target-dir", default=None,
+                   help="upstream: download the HuggingFace snapshot, using DIR as the "
+                        "HuggingFace cache")
+    p.add_argument("--revision", default=None,
+                   help="upstream: download the HuggingFace snapshot at this revision "
+                        "(upstream's default: main)")
+    # SOMA-JAX's options: fill in what the vendored layout lacks.
     p.add_argument("--output-dir", default=str(A.DOWNLOAD_ASSETS),
                    help=f"download target (default: {A.DOWNLOAD_ASSETS}). A directory "
                         f"outside the checkout must be added to ${A.ASSETS_ENV_VAR}.")
-    p.add_argument("--repo-id", default=A.HF_REPO_ID,
-                   help=f"HuggingFace repository (default: {A.HF_REPO_ID})")
-    p.add_argument("--revision", default=A.HF_REVISION,
-                   help="immutable revision to pin (default: the one INSTALL.md verifies)")
     p.add_argument("--force", action="store_true", help="re-download even if present")
     p.add_argument("--check", action="store_true",
                    help="report availability and exit without downloading")
     p.add_argument("--minimal", action="store_true",
                    help="fetch only what SOMALayer.from_upstream_assets() needs "
                         f"({', '.join(MINIMAL_FILES)})")
+    p.add_argument("--hand", action="store_true",
+                   help="include the SOMA Hand layer's files (SOMAHand.npz, MANO packs)")
+    p.add_argument("--extras", action="store_true",
+                   help="fetch only the files the submodule does not ship "
+                        "(GarmentMeasurements/point.npz)")
     p.add_argument("--no-lfs", action="store_true",
                    help="do not fetch submodule files that are missing or Git LFS stubs")
     p.add_argument("--only", nargs="+", metavar="FILE", default=None,
                    help="fetch (or --check) just these relative paths, e.g. "
                         "Anny/base_body.obj — any required asset or any file of the "
-                        "pinned submodule, such as example_animation.npy")
+                        "pinned submodule, such as SOMA_example_animation.usda")
+    p.add_argument("--print-table", nargs="?", const="HEAD", metavar="COMMIT",
+                   help="maintainers: print soma_jax/assets.py's SOMA_X_COMMIT and "
+                        "SOMA_X_ASSET_FILES for a submodule commit (default: the "
+                        "checked-out one) and exit")
     return p.parse_args()
 
 
@@ -142,21 +169,58 @@ def _human(n: int) -> str:
     return f"{n} B"
 
 
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(REPO_ROOT / "third_party" / "SOMA-X"), *args],
+                          capture_output=True, timeout=120, check=True)
+
+
 def _submodule_commit() -> str:
     """Commit the submodule is checked out at; the pinned one when unknown."""
     sub = REPO_ROOT / "third_party" / "SOMA-X"
     try:
-        out = subprocess.run(["git", "-C", str(sub), "rev-parse", "HEAD"],
-                             capture_output=True, text=True, timeout=30, check=True)
-        commit = out.stdout.strip()
+        commit = _git("rev-parse", "HEAD").stdout.decode().strip()
         # A submodule that was never initialised resolves to the superproject.
-        top = subprocess.run(["git", "-C", str(sub), "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, timeout=30, check=True)
-        if Path(top.stdout.strip()).resolve() == sub.resolve() and len(commit) == 40:
+        top = _git("rev-parse", "--show-toplevel").stdout.decode().strip()
+        if Path(top).resolve() == sub.resolve() and len(commit) == 40:
             return commit
     except (OSError, subprocess.SubprocessError):
         pass
     return A.SOMA_X_COMMIT
+
+
+def print_table(commit: str) -> int:
+    """Print the ``SOMA_X_COMMIT`` / ``SOMA_X_ASSET_FILES`` block for ``commit``.
+
+    Reads the submodule's git objects: an LFS pointer gives the real file's
+    sha256 and size; any other file is hashed as stored.
+    """
+    try:
+        commit = _git("rev-parse", f"{commit}^{{commit}}").stdout.decode().strip()
+        listing = _git("ls-tree", "-r", "-l", commit, "assets/").stdout.decode()
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"cannot read the submodule at {commit}: {e}", file=sys.stderr)
+        return 1
+    rows = []
+    for line in listing.splitlines():
+        meta, path = line.split("\t", 1)
+        _, kind, blob, _size = meta.split()
+        if kind != "blob":
+            continue
+        rel = path[len("assets/"):]
+        if rel.startswith("images/"):          # README images, not model data
+            continue
+        data = _git("cat-file", "blob", blob).stdout
+        if data.startswith(A._LFS_POINTER_PREFIX):
+            fields = dict(ln.split(" ", 1) for ln in data.decode().splitlines() if " " in ln)
+            rows.append((rel, fields["oid"].split(":", 1)[1], int(fields["size"]), True))
+        else:
+            rows.append((rel, hashlib.sha256(data).hexdigest(), len(data), False))
+    print(f'SOMA_X_COMMIT = "{commit}"')
+    print("SOMA_X_ASSET_FILES = {")
+    for rel, sha, size, is_lfs in sorted(rows):
+        print(f'    "{rel}": (\n        "{sha}", {size}, {is_lfs}),')
+    print("}")
+    return 0
 
 
 def _expected(rel: str) -> tuple[str | None, int | None, bool]:
@@ -252,15 +316,21 @@ def download_hf(repo_id: str, revision: str, filename: str, out_dir: Path,
            sha256=sha256, size=size, headers=_hf_headers())
 
 
-def download_submodule_file(rel: str, target: Path, commit: str, repo_id: str) -> None:
-    """A submodule asset at ``commit``: GitHub first, then the HF mirror."""
+def download_submodule_file(rel: str, target: Path, commit: str) -> None:
+    """A submodule asset at ``commit``: GitHub first, then HuggingFace.
+
+    The HuggingFace snapshot at the release tag holds the same files as the
+    submodule at that release; every download is sha256-verified, so a file
+    that differs there is rejected, never used.
+    """
     sha256, size, is_lfs = _expected(rel)
     if sha256 is None:
         raise RuntimeError(f"no checksum known for {rel}; cannot verify a download")
     host = "media.githubusercontent.com/media" if is_lfs else "raw.githubusercontent.com"
     sources = [
         ("GitHub", f"https://{host}/NVlabs/SOMA-X/{commit}/assets/{rel}", {}),
-        ("HuggingFace", f"{_hf_base()}/{repo_id}/resolve/{HF_MIRROR_REVISION}/{rel}",
+        ("HuggingFace",
+         f"{_hf_base()}/{A.REPO_ID}/resolve/{A.UPSTREAM_ASSET_REVISION}/{rel}",
          _hf_headers()),
     ]
     errors = []
@@ -276,16 +346,19 @@ def download_submodule_file(rel: str, target: Path, commit: str, repo_id: str) -
 
 
 def _status(rel: str) -> tuple[str, Path | None]:
-    """``ok`` / ``lfs-stub`` / ``slim`` / ``missing`` for one required file."""
+    """``ok`` / ``lfs-stub`` / ``stale`` / ``missing`` for one file."""
     path = A.resolve(rel, required=False)
     if path is not None:
         return "ok", path
+    pinned = A.lfs_pointer(A.SUBMODULE_ASSETS / rel)
     for root in A._search_roots():
         candidate = root / rel
-        if candidate.exists() and A.lfs_pointer(candidate) is not None:
-            return "lfs-stub", candidate
-    if rel == "SOMA_neutral.npz" and (A.SUBMODULE_ASSETS / rel).exists():
-        return "slim", A.SUBMODULE_ASSETS / rel
+        if not candidate.exists():
+            continue
+        if A.lfs_pointer(candidate) is None and pinned is not None:
+            return "stale", candidate
+    if pinned is not None:
+        return "lfs-stub", A.SUBMODULE_ASSETS / rel
     return "missing", None
 
 
@@ -310,14 +383,17 @@ def check(files) -> int:
             print(f"  [LFS-STUB] {rel}  ({path} is a Git LFS pointer, not the data)")
             stubs.append(rel)
             continue
+        if state == "stale":
+            print(f"  [STALE   ] {rel}  ({path} is another release's file)")
+            stubs.append(rel)
+            continue
         if state != "ok":
-            print(f"  [MISSING ] {rel}" + ("  (only the slim submodule archive exists)"
-                                          if state == "slim" else ""))
+            print(f"  [MISSING ] {rel}")
             missing.append(rel)
             continue
         origin = "submodule" if str(A.SUBMODULE_ASSETS) in str(path) else "download"
-        sha = expected.get(rel) or A.SOMA_X_ASSET_FILES.get(rel, (None,))[0]
-        if sha is not None and (origin == "download" or rel in expected):
+        sha = expected.get(rel) or _expected(rel)[0]
+        if sha is not None and origin == "download":
             digest = _sha256(path)
             if digest != sha:
                 print(f"  [CORRUPT ] {rel}  ({origin}) sha256 {digest[:12]}... != {sha[:12]}...")
@@ -328,7 +404,7 @@ def check(files) -> int:
             print(f"  [ok      ] {rel}  ({origin})")
 
     if stubs:
-        print("\n  Git LFS stubs: the checkout was made without git-lfs active. Either")
+        print("\n  Git LFS stubs or another release's files. Either")
         print("  -> git lfs install && git submodule foreach --recursive git lfs pull")
         print("  -> python tools/download_assets.py           (no git-lfs needed)")
     if missing:
@@ -343,16 +419,27 @@ def check(files) -> int:
 
 def main():
     args = parse_args()
+    if args.print_table is not None:
+        sys.exit(print_table(args.print_table))
+    if args.target_dir is not None or args.revision is not None:
+        download_assets(target_dir=args.target_dir, revision=args.revision or "main")
+        return
+
+    hf_names = tuple(name for name, _, _, _ in HF_DOWNLOADS)
     if args.only:
-        known = (set(A.REQUIRED_FILES) | set(A.SOMA_X_ASSET_FILES)
-                 | {name for name, _, _, _ in HF_DOWNLOADS})
+        known = (set(A.REQUIRED_FILES) | set(A.HAND_REQUIRED_FILES)
+                 | set(A.SOMA_X_ASSET_FILES) | set(hf_names))
         unknown = [f for f in args.only if f not in known]
         if unknown:
             sys.exit(f"unknown asset(s): {', '.join(unknown)}\n"
                      f"choose from: {', '.join(sorted(known))}")
         files = tuple(dict.fromkeys(args.only))
+    elif args.extras:
+        files = hf_names
     else:
         files = MINIMAL_FILES if args.minimal else A.REQUIRED_FILES
+        if args.hand:
+            files = tuple(dict.fromkeys(files + A.HAND_REQUIRED_FILES))
     if args.check:
         sys.exit(check(files))
 
@@ -373,15 +460,14 @@ def main():
                 continue
         print(f"\n{filename}: {description}")
         try:
-            download_hf(args.repo_id, args.revision, filename, out_dir, sha256, size)
+            download_hf(A.HF_REPO_ID, A.HF_REVISION, filename, out_dir, sha256, size)
         except Exception as e:  # noqa: BLE001 — report every failure, then continue
             print(f"  Failed: {e}")
-            print(f"  Download manually to {target} — see docs/INSTALL.md §4.1")
+            print(f"  Download manually to {target} — see docs/INSTALL.md §4.2")
             failures.append(filename)
             continue
         print(f"  sha256 OK — saved to {target}")
 
-    hf_names = {name for name, _, _, _ in HF_DOWNLOADS}
     pending = [rel for rel in files if rel not in hf_names
                and (args.force or _status(rel)[0] != "ok")]
     if pending and args.no_lfs:
@@ -390,13 +476,13 @@ def main():
               "skipped because of --no-lfs.")
     elif pending:
         commit = _submodule_commit()
-        print(f"\nSubmodule assets missing or stored as Git LFS stubs: {len(pending)} "
-              f"(fetching NVlabs/SOMA-X@{commit[:8]} without git-lfs)")
+        print(f"\nSubmodule assets missing, stored as Git LFS stubs, or from another "
+              f"release: {len(pending)} (fetching NVlabs/SOMA-X@{commit[:8]} without git-lfs)")
         for rel in pending:
             target = out_dir / rel
             print(f"\n{rel}")
             try:
-                download_submodule_file(rel, target, commit, args.repo_id)
+                download_submodule_file(rel, target, commit)
             except Exception as e:  # noqa: BLE001
                 print(f"  Failed: {e}")
                 failures.append(rel)
@@ -414,7 +500,7 @@ def main():
     print("All requested assets are in place.")
     if all(_status(rel)[0] == "ok" for rel in MINIMAL_FILES):
         print("SOMALayer.from_upstream_assets() needs nothing else "
-              "(docs/INSTALL.md §4.2 is optional).")
+              "(the runtime archive of docs/INSTALL.md §4.3 is optional).")
 
 
 if __name__ == "__main__":

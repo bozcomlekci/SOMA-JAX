@@ -25,18 +25,18 @@ FIELD = "peak_mib"
 CARD_GIB = 16.0
 
 # Labels + colours match plot_runtimes.py: the two "full fit" rows are the same
-# JAX pipeline differing only in the rotation kernel (teal pair); "linear fit"
+# JAX pipeline differing only in the rotation step (teal pair); "linear fit"
 # is the approximate method (indigo); SOMA-X is the black reference.
 _LABELS = {
     "soma_x": "SOMA-X (PyTorch + Warp)",
-    "fair":   "SOMA-JAX · full fit (SVD in XLA)",
-    "hybrid": "SOMA-JAX · full fit (SVD in Warp)",
+    "fair":   "SOMA-JAX · full fit (pure JAX)",
+    "hybrid": "SOMA-JAX · full fit (JAX + Warp svd3)",
     "linear": "SOMA-JAX · linear fit (approx.)",
 }
 _COLORS = {
     "soma_x": "#000000",  # BLACK   — the original/reference, set apart
-    "fair":   "#0d9488",  # teal    — full fit, SVD in XLA   (solid)
-    "hybrid": "#0d9488",  # teal    — full fit, SVD in Warp  (dashed ×)
+    "fair":   "#0d9488",  # teal    — full fit, pure JAX         (solid)
+    "hybrid": "#0d9488",  # teal    — full fit, JAX + Warp svd3  (dashed ×)
     "linear": "#4f46b8",  # indigo  — linear approximation
 }
 _ORDER = ["soma_x", "fair", "hybrid", "linear"]
@@ -116,7 +116,7 @@ def main():
                   frameon=False, fontsize=6.4, handletextpad=0.4)
         fig.suptitle("SOMA forward-pass peak GPU memory (RTX 5080)",
                      fontsize=9, y=0.985)
-        ax.set_title("CUDA context + live allocator high-water, Warp included",
+        ax.set_title("CUDA context + requested-bytes high-water, Warp included",
                      fontsize=6.8, color="0.35", pad=3)
 
         out = REPO / "benchmarks" / "figures"

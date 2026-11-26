@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -132,7 +131,7 @@ def main():
     )
     if not args.no_smooth:
         # Compute vertex normals for smooth shading
-        tm.vertex_normals  # populates _cache
+        _ = tm.vertex_normals  # populates _cache
 
     material = pyrender.MetallicRoughnessMaterial(
         baseColorFactor=[*args.color, 1.0],

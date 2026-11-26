@@ -5,7 +5,7 @@ This package provides standalone JAX implementations of:
     - SMPL-H (52 joints with hands)    — Romero et al. 2017
     - SMPL-X (55 joints with hands, face, eyes) — Pavlakos et al. 2019
     - MHR   (Meta Human Rig, per-body-part scales)
-    - Anny  (children's body, Z-up coordinate system)
+    - Anny  (anthropometric controls, broad age coverage; Z-up coordinate system)
 
 Each model can be used standalone (full forward pass with pose blend shapes
 and LBS) or as an identity source for SOMA-JAX's pivot system.

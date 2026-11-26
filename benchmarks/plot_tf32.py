@@ -88,11 +88,15 @@ def main() -> None:
         ax_thr.plot(b_sx, mps_sx, color=C_SOMAX, ls="-", marker="o", markersize=3,
                     label="SOMA-X  ·  float32")
         ax_thr.plot(b_f32, mps_f32, color=C_F32, ls="-", marker="o", markersize=3,
-                    label="SOMA-JAX full fit  ·  float32  (fair match)")
+                    label="SOMA-JAX full fit (Warp svd3)  ·  float32  (matched)")
         ax_thr.plot(b_tf, mps_tf, color=C_TF32, ls="--", marker="s", markersize=3.5,
-                    markerfacecolor="none", label="SOMA-JAX full fit  ·  TF32  (JAX-only)")
-        # Shade the gap TF32 opens over its own float32 — the precision-bought speed.
-        ax_thr.fill_between(b_f32, mps_f32, mps_tf, where=(mps_tf >= mps_f32),
+                    markerfacecolor="none",
+                    label="SOMA-JAX full fit (Warp svd3)  ·  TF32  (JAX-only)")
+        # Shade the gap TF32 opens over its own float32 — the precision-bought
+        # speed — at the batches both sweeps measured.
+        common, i_f32, i_tf = np.intersect1d(b_f32, b_tf, return_indices=True)
+        ax_thr.fill_between(common, mps_f32[i_f32], mps_tf[i_tf],
+                            where=(mps_tf[i_tf] >= mps_f32[i_f32]),
                             color=C_TF32, alpha=0.10, linewidth=0)
         ax_thr.set_xscale("log", base=2)
         ax_thr.set_yscale("log")
@@ -100,7 +104,7 @@ def main() -> None:
         ax_thr.set_ylabel("Throughput (meshes/sec)")
         ax_thr.set_title("Throughput — float32 is the only fair pair", fontsize=7.5)
         ax_thr.grid(True, which="both", linewidth=0.3, alpha=0.4)
-        ax_thr.legend(loc="upper left", frameon=False, fontsize=5.8,
+        ax_thr.legend(loc="lower right", frameon=False, fontsize=5.8,
                       handletextpad=0.5, borderaxespad=0.3)
 
         # ---- right: the trade at B=2048 (speedup vs SOMA-X + precision cost) ----

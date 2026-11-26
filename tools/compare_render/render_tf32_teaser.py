@@ -10,24 +10,27 @@ top-left panel itself acting as the progress bar:
     px/frame scale, so their final widths read the speedup directly.
   * SOMA-X's speed is constant, so its baseline bar reaches the same length
     every run; SOMA-JAX renders ratio x more frames in the same wall-clock, so
-    its bar reaches ~1.6x the SOMA-X bar at float32 and ~2.7x at TF32.
+    its bar reaches the float32 ratio times the SOMA-X bar, then the TF32 one
+    (both read from benchmarks/results at batch 2048).
   * The runtime multiplier sits big in the CENTRE of the composite (in the gap
     between the two figures).
-  * The body animates the first half at float32 (bar -> 1.6x), then PAUSES on
-    the completed float32 state so it can be read, then switches to TF32 and
-    resumes: SOMA-JAX renders every-frame-smooth while SOMA-X stays choppy, and
-    its bar extends 1.6x -> 2.7x as the multiplier counts up and the precision
-    flips. The final 2.7x frame holds for a couple seconds before the clip loops.
+  * The body animates the first half at float32 (bar -> float32 ratio), then
+    PAUSES on the completed float32 state so it can be read, then switches to
+    TF32 and resumes: SOMA-JAX renders every-frame-smooth while SOMA-X stays
+    choppy, and its bar extends to the TF32 ratio as the multiplier counts up
+    and the precision flips. The final frame holds for a couple seconds before
+    the clip loops.
 
 Precision honesty (the whole point of this repo's benchmark work):
   * float32 is the ONLY like-for-like comparison; SOMA-X cannot use TF32 (its
     Warp scalar kernels + sparse RBF are not tensor-core-eligible).
-  * float32 and TF32 pose the SAME mesh to ~0.02 mm, so ONE SOMA-JAX vertex
-    sequence is reused for both phases.
-  * The TF32 SOMA-JAX throughput is not re-measured here; it is the measured
-    float32 teaser throughput scaled by the benchmark's TF32/float32 factor at
-    the same batch (see benchmarks/results/runtime_tf32.json). The fair float32
-    ratio is the teaser's own SOMA-JAX/SOMA-X measurement.
+  * float32 and TF32 pose the same mesh to within the measured TF32 cost
+    (mean 0.015 mm, max 0.21 mm; benchmarks/results/tf32_precision.json), so
+    ONE SOMA-JAX vertex sequence is reused for both phases.
+  * Nothing is timed here: the float32 ratio is the benchmark's
+    SOMA-JAX/SOMA-X throughput at batch 2048 (benchmarks/results/runtime.json)
+    and the TF32 ratio scales it by the benchmark's TF32/float32 factor at the
+    same batch (runtime_tf32.json).
 """
 from __future__ import annotations
 import argparse
@@ -74,7 +77,7 @@ def _panel_bar(img, name, precision, bar_len, accent):
     """The top-left panel IS the progress bar: a rounded horizontal bar with the
     method name at the left and the precision at the right end, growing in width
     as frames are processed. Bars share one px/frame scale, so their final widths
-    read the speedup directly (SOMA-JAX ~1.6x float32, ~2.7x TF32 of SOMA-X).
+    read the speedup directly (the float32, then the TF32 ratio to SOMA-X).
     No separate bar, no frame count."""
     from PIL import Image, ImageDraw
     pil = Image.fromarray(img.copy()).convert("RGBA")
@@ -129,9 +132,8 @@ def _f32_ratio():
 
     Read from ``runtime.json`` rather than from the capture's own ``fps``
     fields. Both measure the same thing at the same batch, but the capture is a
-    single ~30 ms timing run while ``runtime.json`` is a median over 20 iters
-    with p10/p90 -- and they disagree: the capture put SOMA-X 6.8% faster,
-    pulling the ratio to 1.60 where the harness gives 1.68. Sourcing the badge
+    single 20-call timing run while ``runtime.json`` is the harness's warmed
+    median, and the two can disagree by several percent. Sourcing the badge
     from the harness keeps the GIF, the READMEs and the benchmark table on one
     number instead of three.
     """
@@ -213,11 +215,12 @@ def main():
     # ONE continuous motion pass. The body switches float32 -> TF32 at the MIDDLE
     # of the motion, so the TF32 speed is shown LIVE: SOMA-X stays choppy
     # throughout, SOMA-JAX renders smoother at float32 and every-frame-smooth
-    # after the TF32 switch, and its bar leaps from ~1.6x to ~2.7x the SOMA-X bar.
+    # after the TF32 switch, and its bar extends from the float32 to the TF32
+    # ratio of the SOMA-X bar.
     max_bar = W - 28
     baseline = max_bar / ratio_tf32                  # width of a 1.0x (SOMA-X) bar
     half = T // 2                                    # switch at the middle of the motion
-    ramp = 16                                        # slots to extend the bar 1.6x -> 2.7x
+    ramp = 16                                        # slots to extend the bar float32 -> TF32
     # sample-and-hold quantisation = how many display slots each pose is held for;
     # bigger = choppier. SOMA-X is the choppy reference throughout; SOMA-JAX gets
     # smoother (fewer held slots) once TF32 turns on at the midpoint.
@@ -236,8 +239,9 @@ def main():
         tf32 = t > half
         precision, accent = ("TF32", AMBER) if tf32 else ("float32", TEAL)
         # SOMA-X bar fills 0 -> baseline over the FIRST HALF, then holds; SOMA-JAX
-        # bar = mult x it, so it reads a clean 1.6x at the midpoint and then
-        # extends to 2.7x when TF32 turns on. Motion plays through both halves.
+        # bar = mult x it, so it reads the float32 ratio at the midpoint and then
+        # extends to the TF32 ratio when TF32 turns on. Motion plays through
+        # both halves.
         sx_bar = min(1.0, t / half) * baseline
         sj_bar = m * sx_bar
         left = _panel_bar(cache_a[_hold(t, Q_X)], "SOMA-X", "float32", sx_bar, SLATE)
@@ -246,11 +250,11 @@ def main():
         return _center_mult(np.concatenate([left, right], axis=1), m, accent)
 
     duration_s = float(A["duration_s"]); play_fps = T / duration_s
-    frames = [compose(t) for t in range(half + 1)]          # first half: float32, bar -> 1.6x
-    # PAUSE on the completed float32 state (1.6x) so it can be read, then resume.
+    frames = [compose(t) for t in range(half + 1)]          # first half: float32
+    # PAUSE on the completed float32 state so it can be read, then resume.
     frames += [frames[-1]] * max(1, int(round(1.5 * play_fps)))
-    frames += [compose(t) for t in range(half + 1, T)]      # resume: switch to TF32, bar -> 2.7x
-    # Hold the final 2.7x image for a couple seconds, then loop.
+    frames += [compose(t) for t in range(half + 1, T)]      # resume: switch to TF32
+    # Hold the final TF32 image for a couple seconds, then loop.
     frames += [frames[-1]] * max(1, int(round(2.0 * play_fps)))
 
     dur = int(round(1000.0 * duration_s / T))       # ms/frame = realtime playback

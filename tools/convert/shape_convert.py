@@ -1,180 +1,239 @@
-"""Convert identity coefficients between identity models.
+"""MHR shape to SMPL shape converter.
 
-Fits the *target* model's identity coefficients so that its body reproduces
-the *source* body. Both bodies are compared the way SOMA compares identities:
-in SOMA topology, after the per-identity skeleton fit and the repose to SOMA's
-shared bind pose (``SOMALayer.prepare_identity(repose_to_bind_pose=True)``),
-so the models' different rest poses — MHR's, SMPL's T-pose, SOMA's own — do not
-leak into the fitted shape. The fit is damped Gauss–Newton through the target
-layer's differentiable ``prepare_identity``; for a PCA backend it converges in
-a few steps. A source that the target's shape space cannot represent leaves a
-residual (reported per sample); ``--prior`` regularises such fits.
+Upstream: ``tools/shape_convert.py`` (SOMA-X v0.3.3). :class:`ShapeTransfer`
+converts MHR shape parameters to SMPL betas through SOMA: the MHR rest shape
+(SOMA topology) is skeleton-fitted, posed into the SMPL template's T-pose,
+carried onto SMPL topology through the SMPL ``SOMA_wrap``, and the betas are
+solved by least squares against the SMPL shape basis. The script renders random
+smooth MHR identities next to their SMPL conversions.
 
-Supported backends: ``soma`` (128-coefficient PCA), ``smpl`` / ``smplx`` /
-``smplh`` (betas; need the registration-only model files), ``mhr`` and
-``garment_measurement`` (identity packs from
-``tools/pipeline/build_identity_packs.py``), ``anny``.
+Upstream v0.3.3 raises in :meth:`ShapeTransfer.forward` with its default
+procedural layer: the pose-into-SMPL step builds a ``BatchedSkinning`` from the
+layer's ``joint_parent_ids`` / ``skinning_weights`` (the 110-joint twist rig)
+around the 78-joint ``skeleton_transfer.fit`` binds. The port skins on the
+public 78-joint rig those binds belong to (upstream's
+``enable_procedural_transforms=False`` legacy rig).
+
+JAX port: ``--device`` is accepted and ignored; ``--seed`` (SOMA-JAX extra)
+seeds the random identities, which upstream draws unseeded. ``--data-root`` is
+accepted as an alias of upstream's ``--data_root``.
 
 Usage::
 
-    # GarmentMeasurement coefficients -> SOMA PCA coefficients
-    python tools/convert/shape_convert.py \\
-        --src-model garment_measurement --src-asset assets/identity/identity_garment.npz \\
-        --src-coeffs garment.npy --tgt-model soma --output soma.npy
-
-    # SOMA -> MHR
-    python tools/convert/shape_convert.py \\
-        --src-model soma --src-coeffs soma.npy \\
-        --tgt-model mhr --tgt-asset assets/identity/identity_mhr.npz --output mhr.npy
-
-``--soma-asset`` is optional: without it the rig is built from the resolved
-upstream assets (NVIDIA's ``SOMA_neutral.npz`` or a SOMA-JAX archive also work).
+    python tools/convert/shape_convert.py --sequence-length 300 --output-dir out/
 """
 from __future__ import annotations
 
 import argparse
-import os
+import logging
 import sys
+from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = Path(__file__).resolve().parents[2]
+for _p in (REPO, REPO / "tools"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
-BACKENDS = ["soma", "smpl", "smplx", "smplh", "mhr", "anny", "garment_measurement"]
-JACOBIAN_CHUNK = 16     # tangent columns per compiled forward-mode pass
+from logging_utils import add_logging_args, configure_logging  # noqa: E402
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Convert identity coefficients between models")
-    p.add_argument("--src-coeffs", required=True, help="source coefficients (.npy), (K,) or (B, K)")
-    p.add_argument("--src-model", required=True, choices=BACKENDS)
-    p.add_argument("--tgt-model", required=True, choices=BACKENDS)
-    p.add_argument("--soma-asset", default=None,
-                   help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
-                        "(default: build from the resolved upstream assets)")
-    p.add_argument("--src-asset", default=None, help="identity data for the source backend")
-    p.add_argument("--tgt-asset", default=None, help="identity data for the target backend")
-    p.add_argument("--num-coeffs", type=int, default=None,
-                   help="target coefficients to fit (default: all the target model has)")
-    p.add_argument("--iters", type=int, default=8, help="max Gauss-Newton iterations")
-    p.add_argument("--prior", type=float, default=0.0,
-                   help="optional Tikhonov weight pulling coefficients toward zero, relative "
-                        "to the mean curvature of the fit. Plain least squares by default "
-                        "(as upstream's converter); a target shape space that cannot "
-                        "represent the source well can drift to large coefficients — the "
-                        "printed max |coeff| shows it — and a small prior (1e-3) curbs that")
-    p.add_argument("--no-repose", action="store_true",
-                   help="compare raw rest shapes instead of bind-pose ones")
-    p.add_argument("--output", required=True, help="output (.npy) for the converted coefficients")
-    return p.parse_args()
+logger = logging.getLogger(__name__)
 
 
-def forward_jacobian(fn, num_coeffs: int, chunk: int = JACOBIAN_CHUNK):
-    """``c -> d fn(c) / dc`` by forward mode, ``chunk`` tangent columns at a time.
-
-    One ``jax.jacfwd`` over the whole skeleton fit is a single very large
-    batched program; the XLA in the oldest supported JAX (0.4.26) segfaults
-    compiling it. Fixed-size chunks (the last one zero-padded) compile once and
-    cost the same arithmetic.
-    """
-    import jax
-    import jax.numpy as jnp
-
-    jvps = jax.jit(lambda c, tangents: jax.vmap(lambda t: jax.jvp(fn, (c,), (t,))[1])(tangents))
-    n_chunks = -(-num_coeffs // chunk)
-    basis = jnp.zeros((n_chunks * chunk, num_coeffs), jnp.float32)
-    basis = basis.at[jnp.arange(num_coeffs), jnp.arange(num_coeffs)].set(1.0)
-
-    def jacobian(c):
-        cols = [jvps(c, basis[i * chunk:(i + 1) * chunk]) for i in range(n_chunks)]
-        return jnp.concatenate(cols, axis=0)[:num_coeffs].T          # (M, K)
-    return jacobian
+def get_smooth_noise(T, dim, rng=None, num_keyframes=None, mode="normal"):
+    """(T, dim) noise linearly interpolated between random keyframes
+    (``F.interpolate(mode="linear", align_corners=True)``)."""
+    rng = np.random.default_rng() if rng is None else rng
+    if num_keyframes is None:
+        num_keyframes = max(3, T // 30)
+    if mode == "normal":
+        keyframes = rng.standard_normal((dim, num_keyframes))
+    elif mode == "uniform":
+        keyframes = rng.random((dim, num_keyframes))
+    else:
+        raise ValueError(f"Unknown noise mode {mode!r}")
+    x = np.linspace(0.0, num_keyframes - 1, T)
+    xp = np.arange(num_keyframes)
+    return np.stack([np.interp(x, xp, k) for k in keyframes], axis=1).astype(np.float32)
 
 
-def fit_coefficients(body_fn, target, num_coeffs: int, iters: int = 8, prior: float = 0.0):
-    """Damped Gauss-Newton: ``argmin_c ||body_fn(c) - target||^2 + mu ||c||^2``.
+class ShapeTransfer:
+    """MHR shape to SMPL shape converter."""
 
-    Args:
-        body_fn: ``(K,) -> (V, 3)`` differentiable body of the target model.
-        target: ``(V, 3)`` body to reproduce.
-        num_coeffs: ``K``.
-        iters: maximum iterations.
-        prior: ``mu`` relative to the mean diagonal of ``J^T J`` at the start.
+    def __init__(self, data_root, device="cuda"):
+        import trimesh
 
-    Returns:
-        ``(coeffs (K,), rms_error)`` with the RMS vertex error of the fit.
-    """
-    import jax
-    import jax.numpy as jnp
+        from soma_jax import SOMALayer
 
-    target = jnp.asarray(target)
-    residual = jax.jit(lambda c: (body_fn(c) - target).reshape(-1))
-    jacobian = forward_jacobian(lambda c: body_fn(c).reshape(-1), num_coeffs)
+        del device
+        self.data_root = Path(data_root)
+        self.mhr_soma = SOMALayer.from_upstream_assets(identity_model_type="mhr",
+                                                       data_root=str(self.data_root))
+        self.smpl_soma = SOMALayer.from_upstream_assets(identity_model_type="smpl",
+                                                        data_root=str(self.data_root))
+        self.soma_to_smpl = self.get_soma_to_smpl_interpolator()
 
-    c = jnp.zeros((num_coeffs,), jnp.float32)
-    eye = jnp.eye(num_coeffs, dtype=jnp.float32)
-    mu = None
-    r = residual(c)
-    cost = float(r @ r)
-    lam = 1e-6
-    for _ in range(iters):
-        J = jacobian(c)
-        JtJ = J.T @ J
-        scale = float(jnp.trace(JtJ)) / num_coeffs + 1e-12
-        if mu is None:
-            mu = prior * scale
-        g = J.T @ r + mu * c
-        step = jnp.linalg.solve(JtJ + (mu + lam * scale) * eye, -g)
-        r_new = residual(c + step)
-        cost_new = float(r_new @ r_new)
-        total, total_new = cost + mu * float(c @ c), cost_new + mu * float((c + step) @ (c + step))
-        if total_new < total:
-            converged = total - total_new < 1e-10 * max(total, 1e-30)
-            c, r, cost = c + step, r_new, cost_new
-            lam = max(lam / 10.0, 1e-9)
-            if converged:
-                break
-        else:
-            lam *= 10.0
-    return np.asarray(c), float(np.sqrt(cost / target.shape[0]))
+        smpl_rest_mesh = trimesh.load(self.data_root / "SMPL" / "base_body.obj",
+                                      maintain_order=True, process=False)
+        smpl_rest_shape = np.asarray(smpl_rest_mesh.vertices, np.float32)[None]
+        self.smpl_rest_shape_soma = self.smpl_soma.identity_model.identity_model_to_soma(
+            smpl_rest_shape)
+        self.posed_world_smpl_tpose = self.mhr_soma.skeleton_transfer.fit(
+            self.smpl_rest_shape_soma)
+
+    def get_soma_to_smpl_interpolator(self):
+        """Upstream ``BarycentricInterpolator(V_soma, F_soma, V_smpl)``: the SMPL
+        base mesh embedded in the SOMA-topology wrap of SMPL."""
+        import trimesh
+
+        from soma_jax.geometry.barycentric_interp import compute_barycentric_coords
+        mesh_smpl = trimesh.load(self.data_root / "SMPL" / "base_body.obj",
+                                 maintain_order=True, process=False)
+        mesh_soma = trimesh.load(self.data_root / "SMPL" / "SOMA_wrap.obj",
+                                 maintain_order=True, process=False)
+        V_smpl = np.asarray(mesh_smpl.vertices, np.float32)
+        V_soma = np.asarray(mesh_soma.vertices, np.float32)
+        F_soma = np.asarray(mesh_soma.faces, np.int32)
+        face_ids, bary = compute_barycentric_coords(V_smpl, V_soma, F_soma)
+        return F_soma, np.asarray(face_ids, np.int32), np.asarray(bary, np.float32)
+
+    def _soma_to_smpl(self, vertices):
+        import jax.numpy as jnp
+
+        from soma_jax.geometry.barycentric_interp import barycentric_interpolate
+        faces, face_ids, bary = self.soma_to_smpl
+        return barycentric_interpolate(jnp.asarray(vertices), jnp.asarray(faces),
+                                       jnp.asarray(face_ids), jnp.asarray(bary))
+
+    def forward(self, identity_coeffs, scale_params):
+        """MHR ``(identity_coeffs, scale_params)`` -> SMPL betas ``(B, 10)``."""
+        import jax.numpy as jnp
+
+        from soma_jax.geometry.batched_skinning import pose_from_bind, topk_skinning
+        from soma_jax.geometry.lbs import compute_skeleton_levels
+
+        identity_coeffs = jnp.asarray(identity_coeffs, jnp.float32)
+        batch_size = identity_coeffs.shape[0]
+
+        # 1. MHR rest shape (SOMA topology).
+        mhr_rest_shape_soma = self.mhr_soma.identity_model(
+            identity_coeffs, jnp.asarray(scale_params, jnp.float32))
+        # 2. MHR bind: the skeleton fitted to it (public 78-joint rig).
+        posed_world_mhr = self.mhr_soma.skeleton_transfer.fit(mhr_rest_shape_soma)
+
+        # 3. Skin the MHR rest shape into the SMPL rest pose: identity local
+        # rotations relative to the SMPL T-pose orient, hips at the SMPL hips.
+        parents = np.asarray(self.mhr_soma._parents_np, np.int64)
+        weights = np.asarray(self.mhr_soma.public_skinning_weights(), np.float32)
+        indices, values = topk_skinning(weights, 8)
+        orient = self.posed_world_smpl_tpose[0, :, :3, :3]
+        # Upstream's precompute_joint_orient: orient[parent].T, the
+        # self-parented root included.
+        orient_parent_T = jnp.swapaxes(orient[parents], -2, -1)
+        pose_rotations = jnp.broadcast_to(jnp.eye(3, dtype=jnp.float32),
+                                          (batch_size, len(parents), 3, 3))
+        local = jnp.einsum("jrs,bjsk,jkt->bjrt", orient_parent_T, pose_rotations, orient)
+        pose_translations = jnp.broadcast_to(self.posed_world_smpl_tpose[:, 1, :3, 3],
+                                             (batch_size, 3))
+        vertices, _ = pose_from_bind(
+            posed_world_mhr, mhr_rest_shape_soma, jnp.asarray(weights),
+            compute_skeleton_levels(parents), parents, local, pose_translations, hips_idx=1,
+            weight_values=jnp.asarray(values), weight_indices=jnp.asarray(indices))
+
+        # 4. SMPL topology.
+        mhr_vertices_smpl = self._soma_to_smpl(vertices)
+
+        # 5. Solve the betas against the SMPL shape basis.
+        smpl_model = self.smpl_soma.identity_model.identity_model      # SMPLSimplified
+        shape_dirs = smpl_model.shape_dirs
+        B = (mhr_vertices_smpl - smpl_model.v_template[None]).reshape(batch_size, -1)
+        A = shape_dirs.reshape(-1, shape_dirs.shape[-1])
+        return jnp.linalg.lstsq(A, B.T)[0].T
+
+    __call__ = forward
 
 
 def main():
-    args = parse_args()
+    import imageio
+
     import jax.numpy as jnp
-    from _common import load_layer
+    from tqdm import tqdm
 
-    src_coeffs = np.load(args.src_coeffs).astype(np.float32)
-    if src_coeffs.ndim == 1:
-        src_coeffs = src_coeffs[None]
+    from soma_jax.assets import data_root as default_data_root
+    from soma_jax.types import SOMAParams
+    from vis_pyrender import MeshRenderer, look_at, set_pyopengl_platform
 
-    src = load_layer(args.soma_asset, identity_model_type=args.src_model,
-                     identity_model_path=args.src_asset)
-    tgt = load_layer(args.soma_asset, identity_model_type=args.tgt_model,
-                     identity_model_path=args.tgt_asset)
-    K = int(tgt.identity_model.n_betas if args.num_coeffs is None else args.num_coeffs)
-    if K <= 0:
-        sys.exit(f"target model {args.tgt_model!r} has no identity coefficients to fit")
-    repose = not args.no_repose
+    parser = argparse.ArgumentParser(description="Shape transfer.")
+    parser.add_argument("--data_root", "--data-root", dest="data_root", type=str, default=None,
+                        help="Path to the data root (default: soma_jax.assets).")
+    parser.add_argument("--device", default="cuda:0",
+                        help="Accepted for upstream CLI compatibility; JAX uses its default "
+                             "device (set JAX_PLATFORMS to choose).")
+    parser.add_argument("--output-dir", default="out/")
+    parser.add_argument("--image-size", type=int, default=1920)
+    parser.add_argument("--sequence-length", type=int, default=300)
+    parser.add_argument("--pyopengl-platform", default="osmesa")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for the random identities (SOMA-JAX extra; upstream is "
+                             "unseeded).")
+    add_logging_args(parser)
+    args = parser.parse_args()
+    configure_logging(args)
 
-    def body(layer, coeffs):
-        return layer.prepare_identity(coeffs, repose_to_bind_pose=repose)[0]
+    set_pyopengl_platform(args.pyopengl_platform)
 
-    sources = np.asarray(body(src, jnp.asarray(src_coeffs)))          # (B, V, 3)
-    out = np.zeros((src_coeffs.shape[0], K), np.float32)
-    for i, target in enumerate(sources):
-        out[i], rms = fit_coefficients(lambda c: body(tgt, c[None])[0], target, K,
-                                       args.iters, args.prior)
-        start = float(np.sqrt(np.mean(np.sum(
-            (np.asarray(body(tgt, jnp.zeros((1, K))))[0] - target) ** 2, axis=-1))))
-        print(f"  [{i}] RMS vertex distance to the source body: "
-              f"{start * 1e3:.2f} mm (target at zero) -> {rms * 1e3:.2f} mm (fitted), "
-              f"max |coeff| {np.abs(out[i]).max():.2f}")
+    data_root = Path(args.data_root) if args.data_root else default_data_root()
+    shape_transfer = ShapeTransfer(data_root)
+    T = args.sequence_length
+    rng = np.random.default_rng(args.seed)
 
-    np.save(args.output, out)
-    print(f"Saved converted coefficients to: {args.output}")
-    print(f"  Source: {args.src_model} {src_coeffs.shape}")
-    print(f"  Target: {args.tgt_model} {out.shape}")
+    mhr_im = shape_transfer.mhr_soma.identity_model
+    identity_coeffs = jnp.asarray(get_smooth_noise(T, mhr_im.num_identity_coeffs, rng))
+    scale_params = jnp.asarray(
+        get_smooth_noise(T, mhr_im.num_scale_params, rng, mode="normal") * 0.2)
+    zero_pose = jnp.zeros((T, 77, 3), jnp.float32)
+    zero_transl = jnp.zeros((T, 3), jnp.float32)
+
+    betas = shape_transfer(identity_coeffs, scale_params)
+
+    smpl_vertices = shape_transfer.smpl_soma(
+        SOMAParams(poses=zero_pose, transl=zero_transl, identity_coeffs=betas)).vertices
+    mhr_vertices = shape_transfer.mhr_soma(
+        SOMAParams(poses=zero_pose, transl=zero_transl, identity_coeffs=identity_coeffs,
+                   scale_params=scale_params)).vertices
+    smpl_vertices = np.asarray(smpl_vertices)
+    mhr_vertices = np.asarray(mhr_vertices)
+
+    logger.info("Rendering videos...")
+    colors = {
+        "mhr": (0.98, 0.65, 0.15, 1.0),
+        "anny": (0.25, 0.75, 1.0, 1.0),
+        "smpl": (0.55, 0.15, 0.85, 1.0),
+    }
+
+    def save_video(frames, path, fps=30):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        imageio.mimsave(path, frames, fps=fps)
+        logger.info(f"Saved {path}")
+
+    renderer = MeshRenderer(image_size=args.image_size, light_intensity=5)
+    cam_pose = look_at(eye=np.array([0.0, 0.0, 6.0]), target=np.array([0.0, 0.0, 0.0]),
+                       up=np.array([0.0, 1.0, 0.0]))
+    light_dir = np.array([0.0, -0.5, -1.0])
+    faces = np.asarray(shape_transfer.mhr_soma.faces)
+    render_kw = dict(cam_pose=cam_pose, light_dir=light_dir, metallic=0.0, roughness=0.5,
+                     base_color_factor=[0.9, 0.9, 0.9, 1.0])
+    frames = []
+    for t in tqdm(range(T)):
+        mhr_img = renderer.render(mhr_vertices[t], faces, mesh_color=colors["mhr"], **render_kw)
+        smpl_img = renderer.render(smpl_vertices[t], faces, mesh_color=colors["smpl"],
+                                   **render_kw)
+        merged_img = (0.5 * mhr_img + 0.5 * smpl_img).astype(np.uint8)
+        img = np.concatenate([mhr_img, merged_img, smpl_img], axis=1)
+        frames.append(img[..., ::-1])
+    renderer.delete()
+    save_video(frames, Path(args.output_dir) / "shape_transfer.mp4")
 
 
 if __name__ == "__main__":

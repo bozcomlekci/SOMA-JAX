@@ -153,7 +153,7 @@ def _skel_state_apply(state: jnp.ndarray, points: jnp.ndarray) -> jnp.ndarray:
 
 
 class MHRNativeModel:
-    """Pure-JAX evaluation of ``mhr_model_lod1.pt``.
+    """Pure-JAX evaluation of ``mhr_model_lod1.pt`` (and the low-resolution ``lod6``).
 
     Construct with :meth:`from_torchscript` (needs ``torch`` once) or
     :meth:`from_npz` (no ``torch``). :meth:`to_npz` writes the lifted weights so
@@ -166,14 +166,21 @@ class MHRNativeModel:
         "parameter_transform", "joint_translation_offsets", "joint_prerotations",
         "joint_parents", "inverse_bind_pose",
         "skin_indices", "skin_weights", "vert_indices",
-        "pc_sparse_indices", "pc_sparse_weight", "pc_linear_weight",
     )
+    #: The pose-corrective network. ``mhr_model_lod1.pt`` carries it; the
+    #: low-resolution ``mhr_model_lod6.pt`` has none.
+    CORRECTIVE_FIELDS = ("pc_sparse_indices", "pc_sparse_weight", "pc_linear_weight")
+
+    #: Face-expression coefficients upstream always passes (``zeros(B, 72)``).
+    NUM_EXPRESSION_COEFFS = 72
 
     def __init__(self, **arrays: Any):
         missing = [f for f in self.FIELDS if f not in arrays]
         if missing:
             raise ValueError(f"MHRNativeModel missing arrays: {missing}")
-        for name in self.FIELDS:
+        self.has_pose_correctives = all(f in arrays for f in self.CORRECTIVE_FIELDS)
+        names = self.FIELDS + (self.CORRECTIVE_FIELDS if self.has_pose_correctives else ())
+        for name in names:
             value = arrays[name]
             if name in ("joint_parents", "skin_indices", "vert_indices",
                         "pc_sparse_indices"):
@@ -185,9 +192,12 @@ class MHRNativeModel:
         self.num_vertices = int(self.base_shape.shape[0])
         self.num_identity_coeffs = int(self.shape_vectors.shape[0])
         self.num_expression_coeffs = int(self.expr_shape_vectors.shape[0])
-        # The transform consumes model parameters plus a zero identity block.
+        # The transform consumes the model parameters plus a zero block: as wide
+        # as the identity coefficients in lod1, as the whole identity+expression
+        # basis (117) in lod6.
+        self.parameter_padding = int(arrays.get("parameter_padding", self.num_identity_coeffs))
         self.num_model_parameters = (
-            int(self.parameter_transform.shape[1]) - self.num_identity_coeffs)
+            int(self.parameter_transform.shape[1]) - self.parameter_padding)
         self.pc_hidden = int(arrays.get("pc_sparse_shape", (3000, 750))[0])
         self.pc_in = int(arrays.get("pc_sparse_shape", (3000, 750))[1])
 
@@ -207,13 +217,9 @@ class MHRNativeModel:
         module = torch.jit.load(str(path), map_location="cpu")
         sd = {k: v.numpy() for k, v in module.state_dict().items()}
         c = "character_torch."
-        sparse_shape = tuple(
-            int(x) for x in
-            module.pose_correctives_model.pose_dirs_predictor._modules["0"].sparse_shape)
-        return cls(
-            shape_vectors=sd[c + "blend_shape.shape_vectors"],
+        shape_vectors = sd[c + "blend_shape.shape_vectors"]
+        arrays = dict(
             base_shape=sd[c + "blend_shape.base_shape"],
-            expr_shape_vectors=sd["face_expressions_model.shape_vectors"],
             parameter_transform=sd[c + "parameter_transform.parameter_transform"],
             joint_translation_offsets=sd[c + "skeleton.joint_translation_offsets"],
             joint_prerotations=sd[c + "skeleton.joint_prerotations"],
@@ -222,24 +228,46 @@ class MHRNativeModel:
             skin_indices=sd[c + "linear_blend_skinning.skin_indices_flattened"].astype(np.int32),
             skin_weights=sd[c + "linear_blend_skinning.skin_weights_flattened"],
             vert_indices=sd[c + "linear_blend_skinning.vert_indices_flattened"].astype(np.int32),
-            pc_sparse_indices=sd["pose_correctives_model.pose_dirs_predictor.0.sparse_indices"],
-            pc_sparse_weight=sd["pose_correctives_model.pose_dirs_predictor.0.sparse_weight"],
-            pc_linear_weight=sd["pose_correctives_model.pose_dirs_predictor.2.weight"],
-            pc_sparse_shape=sparse_shape,
         )
+        if "face_expressions_model.shape_vectors" in sd:
+            # lod1: a separate expression model; the transform pads with a zero
+            # identity block.
+            arrays.update(shape_vectors=shape_vectors,
+                          expr_shape_vectors=sd["face_expressions_model.shape_vectors"])
+        else:
+            # lod6: ONE basis over cat[identity, face_expr] and a transform padded
+            # with zeros as wide as that whole basis (its TorchScript forward).
+            n_id = shape_vectors.shape[0] - cls.NUM_EXPRESSION_COEFFS
+            arrays.update(shape_vectors=shape_vectors[:n_id],
+                          expr_shape_vectors=shape_vectors[n_id:],
+                          parameter_padding=shape_vectors.shape[0])
+        if "pose_correctives_model.pose_dirs_predictor.0.sparse_indices" in sd:
+            arrays.update(
+                pc_sparse_indices=sd["pose_correctives_model.pose_dirs_predictor.0.sparse_indices"],
+                pc_sparse_weight=sd["pose_correctives_model.pose_dirs_predictor.0.sparse_weight"],
+                pc_linear_weight=sd["pose_correctives_model.pose_dirs_predictor.2.weight"],
+                pc_sparse_shape=tuple(
+                    int(x) for x in
+                    module.pose_correctives_model.pose_dirs_predictor._modules["0"].sparse_shape),
+            )
+        return cls(**arrays)
 
     @classmethod
     def from_npz(cls, path: str | Path) -> "MHRNativeModel":
         data = np.load(path, allow_pickle=False)
-        arrays = {k: data[k] for k in cls.FIELDS}
+        arrays = {k: data[k] for k in cls.FIELDS + cls.CORRECTIVE_FIELDS if k in data}
         if "pc_sparse_shape" in data:
             arrays["pc_sparse_shape"] = tuple(int(x) for x in data["pc_sparse_shape"])
+        if "parameter_padding" in data:
+            arrays["parameter_padding"] = int(data["parameter_padding"])
         return cls(**arrays)
 
     def to_npz(self, path: str | Path) -> None:
         """Write the lifted weights so inference needs no ``torch``."""
-        out = {name: np.asarray(getattr(self, name)) for name in self.FIELDS}
+        names = self.FIELDS + (self.CORRECTIVE_FIELDS if self.has_pose_correctives else ())
+        out = {name: np.asarray(getattr(self, name)) for name in names}
         out["pc_sparse_shape"] = np.asarray([self.pc_hidden, self.pc_in], np.int64)
+        out["parameter_padding"] = np.asarray(self.parameter_padding, np.int64)
         np.savez_compressed(path, **out)
 
     # ---- forward stages --------------------------------------------------
@@ -353,15 +381,17 @@ class MHRNativeModel:
         face_expr_coeffs = jnp.atleast_2d(jnp.asarray(face_expr_coeffs, jnp.float32))
 
         rest = self.blend_shape(identity_coeffs)
-        # The archive appends a zero identity block before the transform.
+        # The archive appends a zero block before the transform.
         mp_full = jnp.concatenate(
-            [model_parameters, jnp.zeros_like(identity_coeffs)], axis=-1)
+            [model_parameters,
+             jnp.zeros((model_parameters.shape[0], self.parameter_padding), jnp.float32)],
+            axis=-1)
         joint_parameters = self.model_parameters_to_joint_parameters(mp_full)
         skel_state = self.global_skeleton_state(
             self.local_skeleton_state(joint_parameters))
 
         unposed = rest + self.face_expressions(face_expr_coeffs)
-        if apply_correctives:
+        if apply_correctives and self.has_pose_correctives:
             unposed = unposed + self.pose_correctives(joint_parameters)
         return self.skin(skel_state, unposed), skel_state
 

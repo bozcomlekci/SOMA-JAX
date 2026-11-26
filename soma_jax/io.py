@@ -22,37 +22,112 @@ Metadata:
     keep_root: bool — whether virtual root joint (index 0) is included
 
 Upstream: ``soma/io.py (NPZ half)``
-    Partial port of that code. Shares save_soma_npz's field names; root/absolute-pose defaults differ - see docs/FAITHFULNESS.md.
+    Partial port of that code: ``save_soma_npz`` / ``load_soma_npz`` /
+    ``add_npz_args`` (shared field names; root/absolute-pose defaults differ —
+    see docs/FAITHFULNESS.md) and the template-rig asset contract constants
+    (``SOMA_NEUTRAL_RIG_KEYS``, ``missing_soma_neutral_rig_keys``,
+    ``SOMA_TEMPLATE_RIG_FILENAME``). The USD half is :mod:`soma_jax.usd_io`.
 """
 from __future__ import annotations
 import argparse
+import logging
+from pathlib import Path
 from typing import Optional, Any
 import numpy as np
 
 from .units import Unit
 
+logger = logging.getLogger(__name__)
+
+
+class SOMANPZData(dict):
+    """Dictionary returned by :func:`load_soma_npz` (upstream's type).
+
+    A ``dict`` (``data["poses"]``) with attribute access (``data.poses``).
+    Optional fields (``scale_params``, ``joint_orient``, ``global_scale``,
+    ``hand_type``) are present only if they were saved.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+
+class RigUSDData(dict):
+    """Dictionary returned by :func:`soma_jax.usd_io.load_rig_from_usd` (upstream's type).
+
+    A ``dict`` (``rig["joint_names"]``) with attribute access
+    (``rig.joint_names``). Mesh fields (``face_vert_indices``,
+    ``face_vert_counts``, ``uv_data``) are present only when the body skin mesh
+    carries polygon / UV data.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+
+# ---------------------------------------------------------------------------
+# SOMA template-rig asset contract (upstream ``soma/io.py``)
+# ---------------------------------------------------------------------------
+#: Filename of the SOMA body template rig asset (in ``data_root``).
+SOMA_TEMPLATE_RIG_FILENAME = "SOMA_template_rig.usda"
+#: The xlo LOD is read from the same template since SOMA-X v0.2.2.
+SOMA_XLO_TEMPLATE_RIG_FILENAME = SOMA_TEMPLATE_RIG_FILENAME
+#: Rig keys a pre-v0.3 ``SOMA_neutral.npz`` carried. Since SOMA-X v0.3 the npz
+#: ships none of them — its ``metadata`` lists them under
+#: ``asset_contract.removed_npz_rig_fields`` — and ``SOMA_template_rig.usda``
+#: supplies them (``soma_jax.usd_io.load_rig_from_usd``).
+SOMA_NEUTRAL_RIG_KEYS = (
+    "joint_names",
+    "joint_parent_ids",
+    "bind_pose_world",
+    "bind_pose_local",
+    "t_pose_world",
+    "t_pose_local",
+    "bind_shape",
+    "skinning_weights_data",
+    "skinning_weights_indices",
+    "skinning_weights_indptr",
+    "skinning_weights_shape",
+)
+
+
+def missing_soma_neutral_rig_keys(data) -> tuple[str, ...]:
+    """Rig keys absent from a loaded ``SOMA_neutral.npz`` mapping (upstream ``soma.io``)."""
+    return tuple(key for key in SOMA_NEUTRAL_RIG_KEYS if key not in data)
+
 
 def save_soma_npz(
-    path: str,
+    out_path: str,
     poses: np.ndarray,
     transl: np.ndarray,
+    *,
     joint_names: list[str],
     identity_model_type: str,
     identity_coeffs: np.ndarray,
     scale_params: Optional[np.ndarray] = None,
     joint_orient: Optional[np.ndarray] = None,
+    global_scale: Optional[float] = None,
+    hand_type: Optional[str] = None,
+    unit: str = "meters",
+    keep_root: bool = False,
     extra_arrays: Optional[dict[str, np.ndarray]] = None,
     rotation_repr: Optional[str] = None,
     absolute_pose: Optional[bool] = None,
-    unit: str = "meters",
-    keep_root: bool = False,
-    global_scale: Optional[float] = None,
-    hand_type: Optional[str] = None,
 ) -> None:
     """Save a SOMA animation sequence to a compressed NPZ file.
 
+    Upstream's signature, keyword-only after ``transl`` as upstream's is;
+    ``rotation_repr`` and ``absolute_pose`` are SOMA-JAX extras that override
+    what upstream infers from the pose shape and from ``joint_orient``.
+
     Args:
-        path: output file path (will add .npz if absent).
+        out_path: output file path (will add .npz if absent).
         poses: (N, J, 3) axis-angle or (N, J, 3, 3) rotation matrices.
         transl: (N, 3) root translations.
         joint_names: list of J joint name strings.
@@ -120,72 +195,91 @@ def save_soma_npz(
     if hand_type is not None:
         arrays["hand_type"] = np.array(hand_type)
 
-    if extra_arrays is not None:
-        for k, v in extra_arrays.items():
-            if k in arrays:
-                raise ValueError(f"extra_arrays key {k!r} conflicts with a reserved field.")
-            arrays[k] = np.asarray(v)
+    if extra_arrays:
+        # Upstream updates the dict, so an extra array replaces a field.
+        arrays.update({k: np.asarray(v) for k, v in extra_arrays.items()})
 
-    np.savez_compressed(path, **arrays)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(str(out_path), **arrays)
+
+    pose_label = "absolute" if _absolute_pose else "relative"
+    root_label = "with Root (J=78)" if keep_root else "no Root (J=77)"
+    summary_lines = [f"Saved: {out_path}"]
+    if hand_type is not None:
+        summary_lines.append(f"  hand_type: {hand_type}")
+    summary_lines.append(f"  identity_model_type: {identity_model_type}")
+    summary_lines.append(f"  identity_coeffs: {arrays['identity_coeffs'].shape}")
+    if scale_params is not None:
+        summary_lines.append(f"  scale_params: {np.shape(scale_params)}")
+    if global_scale is not None:
+        summary_lines.append(f"  global_scale: {float(global_scale):.4f}")
+    summary_lines.append(f"  poses: {poses.shape} ({rotation_repr}, {pose_label}, {root_label})")
+    summary_lines.append(f"  transl: {np.shape(transl)} ({unit})")
+    summary_lines.append(f"  joint_names: {len(joint_names)} joints")
+    logger.info("\n".join(summary_lines))
 
 
-def load_soma_npz(path: str) -> dict:
-    """Load a SOMA animation NPZ file into a dict of numpy arrays.
+def load_soma_npz(path) -> SOMANPZData:
+    """Load a SOMA animation ``.npz`` saved by :func:`save_soma_npz`.
+
+    Port of upstream ``soma.io.load_soma_npz``. Keys: ``poses`` ((N, J, 3)
+    rotvec or (N, J, 3, 3) matrices), ``transl`` (N, 3), ``joint_names``,
+    ``identity_model_type``, ``identity_coeffs``, ``rotation_repr``,
+    ``absolute_pose``, ``unit`` and ``keep_root``; optional ``scale_params``,
+    ``joint_orient``, ``global_scale`` and ``hand_type``; any extra arrays
+    stored via ``extra_arrays`` as-is.
 
     Args:
-        path: path to .npz file.
+        path: path to the ``.npz`` file.
 
     Returns:
-        Dict with all stored fields, including decoded metadata scalars.
+        :class:`SOMANPZData` of numpy arrays and Python scalars.
     """
-    raw = np.load(path, allow_pickle=True)
-    data = {}
+    data = np.load(str(path), allow_pickle=True)
+    result = SOMANPZData(
+        poses=data["poses"],
+        transl=data["transl"],
+        joint_names=list(data["joint_names"]),
+        identity_model_type=str(data["identity_model_type"]),
+        identity_coeffs=data["identity_coeffs"],
+        rotation_repr=str(data["rotation_repr"]),
+        absolute_pose=bool(data["absolute_pose"]),
+        unit=str(data["unit"]),
+        keep_root=bool(data.get("keep_root", False)),
+    )
+    if "scale_params" in data:
+        result["scale_params"] = data["scale_params"]
+    if "joint_orient" in data:
+        result["joint_orient"] = data["joint_orient"]
+    if "global_scale" in data:
+        result["global_scale"] = float(data["global_scale"])
+    if "hand_type" in data:
+        result["hand_type"] = str(data["hand_type"])
 
-    for k in raw.files:
-        v = raw[k]
-        # Unwrap 0-d object arrays (scalars stored as np.array)
-        if v.ndim == 0 and v.dtype == object:
-            data[k] = v.item()
-        elif v.ndim == 0:
-            data[k] = v.item()
-        elif v.dtype == object:
-            data[k] = list(v)
-        else:
-            data[k] = v
-
-    return data
+    known = {"poses", "transl", "joint_names", "identity_model_type", "identity_coeffs",
+             "rotation_repr", "absolute_pose", "unit", "keep_root", "scale_params",
+             "joint_orient", "global_scale", "hand_type"}
+    for key in data.files:
+        if key not in known:
+            result[key] = data[key]
+    return result
 
 
 def add_npz_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add SOMA NPZ output arguments to an argparse parser.
+    """Add the common NPZ output arguments to an argparse parser.
 
-    Args:
-        parser: existing ArgumentParser to extend.
-
-    Returns:
-        The same parser with SOMA NPZ arguments added.
+    Upstream ``soma.io.add_npz_args``: ``--output-npz``, ``--keep-root``
+    (Root stripped by default, J=77, matching ``SOMALayer.pose()`` input) and
+    ``--output-unit``. Returns the parser for chaining (upstream returns None).
     """
-    grp = parser.add_argument_group("SOMA NPZ output")
-    grp.add_argument(
-        "--output-npz", type=str, default=None,
-        help="Path to save output SOMA NPZ animation file.",
-    )
-    grp.add_argument(
-        "--unit", type=str, default="meters",
-        choices=["meters", "centimeters", "millimeters"],
-        help="Translation unit for output NPZ (default: meters).",
-    )
-    # Both defaults mirror upstream ``soma.io.save_soma_npz``: Root is stripped
-    # unless asked for, and absolute-vs-relative is *inferred* from whether a
-    # joint orient is present rather than forced to a fixed value.
-    grp.add_argument(
-        "--absolute-pose", action=argparse.BooleanOptionalAction, default=None,
-        help="Store poses in absolute world frame "
-             "(default: inferred — absolute iff no joint_orient is written).",
-    )
-    grp.add_argument(
-        "--keep-root", action=argparse.BooleanOptionalAction, default=False,
-        help="Include the virtual Root joint in pose output "
-             "(default: stripped, matching SOMA-X).",
-    )
+    parser.add_argument("--output-npz", default=None,
+                        help="Output .npz file with SOMA pose parameters.")
+    parser.add_argument("--keep-root", action="store_true",
+                        help="Include the virtual Root joint (J=78). Off by default (J=77) "
+                             "to match SOMALayer.pose() input convention.")
+    parser.add_argument("--output-unit", choices=[u.unit_name for u in Unit],
+                        default=Unit.METERS.unit_name,
+                        help="Unit for translational quantities in the output .npz. "
+                             "Default: meters.")
     return parser

@@ -137,11 +137,11 @@ def test_load_rejects_upstream_archive_with_guidance():
 
 
 def test_prebuilt_archive_route_agrees(layer_plain):
-    """If a §4.2 archive was baked, it and the torch-free route give one model."""
+    """If a runtime archive was built, it and the torch-free route give one model."""
     from soma_jax.assets import resolve
     fixed = resolve("SOMA_neutral_fixed.npz", required=False)
     if fixed is None:
-        pytest.skip("no SOMA_neutral_fixed.npz (optional, docs/INSTALL.md §4.2)")
+        pytest.skip("no SOMA_neutral_fixed.npz (optional, docs/INSTALL.md §4.3)")
     p = _params(layer_plain, sigma=0.3)
     a = np.asarray(SOMALayer.load(str(fixed))(p).vertices)
     b = np.asarray(layer_plain(p).vertices)

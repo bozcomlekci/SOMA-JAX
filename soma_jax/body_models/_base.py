@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from ..geometry.transforms import axis_angle_to_rotmat
-from ..geometry.lbs import forward_kinematics, lbs_transforms, lbs
+from ..geometry.lbs import forward_kinematics, lbs_transforms, lbs_blend
 
 
 def shape_blend_shapes(
@@ -167,7 +167,7 @@ class BaseBodyModel(ABC):
 
         # 6. LBS
         bone_T = lbs_transforms(G, joints)                          # (B, J, 3, 4)
-        v_posed = lbs(v_shaped, pose_corr, bone_T, self.weights)    # (B, V, 3)
+        v_posed = lbs_blend(v_shaped, pose_corr, bone_T, self.weights)    # (B, V, 3)
 
         # 7. Apply translation
         v_posed = v_posed + params.transl[:, None, :]
