@@ -94,13 +94,14 @@ def test_demo_renders(tmp_path):
 
 
 def test_shape_convert_round_trip(tmp_path):
-    """SOMA -> SOMA through the fitting converter recovers the coefficients."""
+    """SOMA -> SOMA through the fitting converter (shape_space_convert.py)
+    recovers the coefficients."""
     need_module("pxr")
     need_assets(*UPSTREAM_ASSETS)
     rng = np.random.default_rng(3)
     src = (rng.standard_normal((2, 128)) * 0.8).astype(np.float32)
     np.save(tmp_path / "src.npy", src)
-    out = _run(REPO / "tools" / "convert" / "shape_convert.py",
+    out = _run(REPO / "tools" / "convert" / "shape_space_convert.py",
                "--src-model", "soma", "--src-coeffs", tmp_path / "src.npy",
                "--tgt-model", "soma", "--output", tmp_path / "out.npy")
     got = np.load(tmp_path / "out.npy")

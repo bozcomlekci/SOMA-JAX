@@ -184,7 +184,7 @@ def _pose_smplx(model, poses_seq, transl_seq):
     )
 
 
-def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_seq, transl_seq, n_id_coeffs=10,
+def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_seq, transl_seq, n_id_coeffs=None,
                                return_joints=False):
     """Pose a SOMALayer with the given identity model over a (T, J, 3) sequence.
 
@@ -198,12 +198,13 @@ def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_se
     import jax.numpy as jnp
     import numpy as np
     from soma_jax import SOMAParams
-    from _common import load_layer
+    from _common import fit_identity_coeffs, load_layer
     layer = load_layer(
         soma_path,
         identity_model_type=identity_type,
         identity_model_path=identity_path,
     )
+    zero_identity = jnp.asarray(fit_identity_coeffs(None, layer)[0])
     T = poses_seq.shape[0]
     # Match this variant's joint count (SOMA topology = 78, but slice to be safe).
     n_joints = len(layer.joint_names)
@@ -217,7 +218,7 @@ def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_se
         params = SOMAParams(
             poses=jnp.asarray(seq[i]),
             transl=jnp.asarray(transl_seq[i]),
-            identity_coeffs=jnp.zeros(n_id_coeffs, dtype=jnp.float32),
+            identity_coeffs=zero_identity,
         )
         out = layer(params)
         verts.append(np.array(out.vertices))
@@ -229,12 +230,14 @@ def run_soma_identity_sequence(soma_path, identity_type, identity_path, poses_se
 
 
 def pose_soma_identity_sequence(soma_path, identity_type, identity_path, soma_poses,
-                                n_id_coeffs=10, correctives=None, identity_coeffs=None,
+                                n_id_coeffs=None, correctives=None, identity_coeffs=None,
                                 rest_verts_override=None, transl_seq=None):
     """Apply a precomputed SOMA pose sequence to a SOMA-family identity.
 
-    identity_coeffs: optional (n_id_coeffs,) shape coefficients (e.g. for
-        --random-shape). Defaults to the neutral (zero) shape.
+    identity_coeffs: optional (K,) shape coefficients (e.g. for
+        --random-shape), zero-padded to the backend's width. Defaults to the
+        neutral (zero) shape. ``n_id_coeffs`` is accepted for compatibility
+        and ignored: the width is the backend's.
     rest_verts_override: optional (V_soma, 3) SOMA-topology rest vertices to use
         instead of the identity model's (e.g. the full MHR rig with scale_params,
         or the SMPL-X-transferred SOMA rest from the --motion retarget — required
@@ -254,16 +257,15 @@ def pose_soma_identity_sequence(soma_path, identity_type, identity_path, soma_po
     import jax.numpy as jnp
     import numpy as np
     from soma_jax import SOMAParams
-    from _common import load_layer
+    from _common import fit_identity_coeffs, load_layer
     from soma_jax.geometry.transforms import axis_angle_to_rotmat
     layer = load_layer(soma_path, identity_model_type=identity_type,
                            identity_model_path=identity_path)
     T = soma_poses.shape[0]
     J = soma_poses.shape[1]
     verts, joints = [], []
-    if identity_coeffs is None:
-        identity_coeffs = np.zeros(n_id_coeffs, dtype=np.float32)
-    id_coeffs = jnp.asarray(identity_coeffs, dtype=jnp.float32)
+    # Sized to this backend's coefficients (a short vector is zero-padded).
+    id_coeffs = jnp.asarray(fit_identity_coeffs(identity_coeffs, layer)[0])
     transl_arr = (np.asarray(transl_seq, dtype=np.float32) if transl_seq is not None
                   else np.zeros((T, 3), dtype=np.float32))
 
@@ -646,7 +648,7 @@ def main():
         ensure_headless_gl()
     import jax.numpy as jnp
     from soma_jax import SOMAParams
-    from _common import load_layer
+    from _common import fit_identity_coeffs, load_layer
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -658,13 +660,14 @@ def main():
     print(f"  Joints: {n_joints}, Vertices: {layer.v_template.shape[0]}, Faces: {faces.shape[0]}")
 
     # 1. Rest mesh (zero shape)
-    rest_verts, _ = layer.prepare_identity(jnp.zeros((1, 10)), repose_to_bind_pose=False, skeleton_fit="linear")
+    zero_identity = jnp.asarray(fit_identity_coeffs(None, layer))
+    rest_verts, _ = layer.prepare_identity(zero_identity, repose_to_bind_pose=False, skeleton_fit="linear")
     verts_rest = np.array(rest_verts[0])
     print("\n[1/3] Computed rest mesh (zero shape)")
 
     # 2. Custom shape
     rng = np.random.default_rng(0)
-    coeffs = jnp.array(rng.standard_normal((1, 10)).astype(np.float32) * 0.5)
+    coeffs = jnp.asarray(fit_identity_coeffs(rng.standard_normal((1, 10)) * 0.5, layer))
     custom_verts, _ = layer.prepare_identity(coeffs, repose_to_bind_pose=False, skeleton_fit="linear")
     verts_custom = np.array(custom_verts[0])
     print("[2/3] Computed mesh with custom shape coefficients")
@@ -677,7 +680,7 @@ def main():
         params = SOMAParams(
             poses=jnp.asarray(poses_seq[i]),
             transl=jnp.asarray(transl[i]),
-            identity_coeffs=jnp.zeros(10),
+            identity_coeffs=zero_identity[0],
         )
         out = layer(params)
         posed_verts_seq.append(np.array(out.vertices))
@@ -1027,7 +1030,8 @@ def main():
                             # via soma_jax's identity model (one-shot, neutral coeffs).
                             tmp = load_layer(args.soma_model, identity_model_type=id_type,
                                                  identity_model_path=id_path)
-                            rv, _ = tmp.prepare_identity(jnp.zeros((1, 10)), repose_to_bind_pose=False, skeleton_fit="linear")
+                            rv, _ = tmp.prepare_identity(jnp.asarray(fit_identity_coeffs(None, tmp)),
+                                                         repose_to_bind_pose=False, skeleton_fit="linear")
                             bs = np.asarray(rv[0]).astype(np.float32)
                         # Anchor each identity's feet to Y=0 so the regressor-fit joints
                         # land inside the mesh consistently.
@@ -1219,7 +1223,7 @@ def main():
                     root_translation=soma_extras["root_translation"],          # (N, 3)
                     joint_names=soma_extras["joint_names"],
                     per_vertex_error=soma_extras["per_vertex_error"],          # (N, V)
-                    identity_coeffs=np.zeros((10,), np.float32),
+                    identity_coeffs=np.zeros((128,), np.float32),   # the SOMA PCA's width
                 )
                 print(f"  Exported SOMA motion → {args.export_soma_npz}")
         else:

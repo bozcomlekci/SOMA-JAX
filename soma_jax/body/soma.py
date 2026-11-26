@@ -2830,6 +2830,10 @@ class SOMALayer(eqx.Module):
                 )
             rotmats, _ = self._procedural.extend_to_template_rig(
                 rotmats, list(self.joint_names))
+        elif rotmats.shape[-3] not in (n_public, len(self.joint_names)):
+            raise ValueError(
+                f"Expected {n_public} public joints (or {n_public - 1} posable, "
+                f"excluding Root), got {rotmats.shape[-3]}.")
 
         rest_verts, rest_joints, bind_transforms, identity_rest = self.prepare_identity(
             identity_coeffs, scale_params,

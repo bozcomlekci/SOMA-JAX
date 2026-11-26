@@ -65,7 +65,8 @@ from ._helpers import UPSTREAM_ASSETS, need_assets, need_module  # noqa: E402
 
 @pytest.fixture(scope="session")
 def layer_procedural():
-    """Upstream's default 122-joint procedural rig, built from the upstream assets."""
+    """Upstream's default procedural rig (78 public / 110 skinning joints),
+    built from the upstream assets."""
     need_module("pxr")
     need_assets(*UPSTREAM_ASSETS)
     from soma_jax import SOMALayer

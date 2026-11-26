@@ -88,16 +88,12 @@ def main():
     args = parse_args()
     import jax.numpy as jnp
     from soma_jax import SOMAParams, load_soma_npz
-    from _common import load_layer
+    from _common import fit_identity_coeffs, load_layer
 
-    if args.identity_coeffs:
-        identity_coeffs = np.load(args.identity_coeffs).astype(np.float32)
-        if identity_coeffs.ndim == 1:
-            identity_coeffs = identity_coeffs[None]
-    else:
-        identity_coeffs = np.zeros((1, 10), dtype=np.float32)
+    identity_coeffs = np.load(args.identity_coeffs) if args.identity_coeffs else None
 
     layer = load_layer(args.soma_model, identity_model_type=args.identity_model)
+    identity_coeffs = fit_identity_coeffs(identity_coeffs, layer)
     faces = np.array(layer.faces)
 
     if args.animation is None:
@@ -115,9 +111,7 @@ def main():
     poses = np.asarray(anim["poses"], dtype=np.float32)
     transl = np.asarray(anim["transl"], dtype=np.float32)
     if "identity_coeffs" in anim:
-        identity_coeffs = np.asarray(anim["identity_coeffs"], dtype=np.float32)
-        if identity_coeffs.ndim == 1:
-            identity_coeffs = identity_coeffs[None]
+        identity_coeffs = fit_identity_coeffs(anim["identity_coeffs"], layer)
 
     N = poses.shape[0]
     frame_idxs = range(N) if args.all_frames else [args.frame]

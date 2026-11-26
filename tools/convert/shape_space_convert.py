@@ -157,7 +157,7 @@ def main():
                      identity_model_path=args.src_asset)
     tgt = load_layer(args.soma_asset, identity_model_type=args.tgt_model,
                      identity_model_path=args.tgt_asset)
-    K = int(tgt.identity_model.n_betas if args.num_coeffs is None else args.num_coeffs)
+    K = int(tgt.identity_model.num_identity_coeffs if args.num_coeffs is None else args.num_coeffs)
     if K <= 0:
         sys.exit(f"target model {args.tgt_model!r} has no identity coefficients to fit")
     repose = not args.no_repose

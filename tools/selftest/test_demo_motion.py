@@ -213,7 +213,7 @@ def test_retarget_turns_bones_with_the_capture(layer_procedural):
     from soma_jax import SOMAParams
     dw = _demo()
     layer = layer_procedural
-    names, parents = list(layer.public_joint_names), np.asarray(layer.parents)
+    names, parents = list(layer.public_joint_names), np.asarray(layer.public_joint_parent_ids)
     J, T = len(names), 3
     zero = layer(SOMAParams(poses=jnp.zeros((1, J, 3)), transl=jnp.zeros((1, 3)),
                             identity_coeffs=jnp.zeros((1, 128))), fk_only=True)

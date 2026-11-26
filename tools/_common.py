@@ -84,8 +84,8 @@ def load_layer(path=None, identity_model_type: str = "soma", **kwargs):
     Args:
         path: ``None`` to build from the resolved upstream assets
             (:meth:`SOMALayer.from_upstream_assets`, upstream's default
-            procedural rig); NVIDIA's full-schema ``SOMA_neutral.npz`` (same
-            route, from that file); or a SOMA-JAX archive such as
+            procedural rig); NVIDIA's ``SOMA_neutral.npz`` (same route, from
+            that file); or a SOMA-JAX archive such as
             ``SOMA_neutral_fixed.npz`` (:meth:`SOMALayer.load`).
         identity_model_type: identity backend.
         **kwargs: forwarded to the constructor that is used.
@@ -97,3 +97,23 @@ def load_layer(path=None, identity_model_type: str = "soma", **kwargs):
             npz_path=None if path is None else str(path),
             identity_model_type=identity_model_type, **kwargs)
     return SOMALayer.load(str(path), identity_model_type=identity_model_type, **kwargs)
+
+
+def fit_identity_coeffs(coeffs, layer):
+    """``(B, K)`` identity coefficients sized to ``layer``'s identity backend.
+
+    ``None`` gives one neutral identity. A narrower array is zero-padded — the
+    SOMA PCA's leading components, which is what a short coefficient file
+    means — and a wider one is rejected, as the layer would reject it.
+    """
+    import numpy as np
+
+    n = int(layer.identity_model.num_identity_coeffs)
+    if coeffs is None:
+        return np.zeros((1, n), np.float32)
+    c = np.atleast_2d(np.asarray(coeffs, np.float32))
+    if c.shape[-1] > n:
+        raise ValueError(f"{c.shape[-1]} identity coefficients given; this backend takes {n}.")
+    if c.shape[-1] < n:
+        c = np.concatenate([c, np.zeros(c.shape[:-1] + (n - c.shape[-1],), np.float32)], axis=-1)
+    return c

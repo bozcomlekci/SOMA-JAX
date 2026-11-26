@@ -81,12 +81,9 @@ def _check_deps(interactive: bool):
 
 def _compute_mesh(args, jnp, layer, SOMAParams):
     """Run SOMA forward to compute (vertices, faces, joints)."""
-    if args.identity_coeffs:
-        identity_coeffs = np.load(args.identity_coeffs).astype(np.float32)
-        if identity_coeffs.ndim == 1:
-            identity_coeffs = identity_coeffs[None]
-    else:
-        identity_coeffs = np.zeros((1, 10), dtype=np.float32)
+    from _common import fit_identity_coeffs
+    identity_coeffs = fit_identity_coeffs(
+        np.load(args.identity_coeffs) if args.identity_coeffs else None, layer)
 
     if args.animation is None:
         from soma_jax import load_soma_npz
@@ -98,9 +95,7 @@ def _compute_mesh(args, jnp, layer, SOMAParams):
     poses = np.asarray(anim["poses"], dtype=np.float32)
     transl = np.asarray(anim["transl"], dtype=np.float32)
     if "identity_coeffs" in anim:
-        identity_coeffs = np.asarray(anim["identity_coeffs"], dtype=np.float32)
-        if identity_coeffs.ndim == 1:
-            identity_coeffs = identity_coeffs[None]
+        identity_coeffs = fit_identity_coeffs(anim["identity_coeffs"], layer)
     coeffs = identity_coeffs[args.frame] if identity_coeffs.shape[0] > 1 else identity_coeffs[0]
 
     params = SOMAParams(

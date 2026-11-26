@@ -40,15 +40,16 @@ def test_readme_quickstart(layer_procedural):
 
 
 def test_procedural_rig_is_active(layer_procedural, layer_plain):
-    """Equal at rest; the twist joints move the posed surface."""
-    rest = _params(layer_plain, sigma=0.0)
-    a = np.asarray(layer_procedural(rest).vertices)
-    b = np.asarray(layer_plain(rest).vertices)
-    assert float(np.abs(a - b).max()) < 1e-4
-    posed = _params(layer_plain, sigma=0.45)
-    gap = np.linalg.norm(np.asarray(layer_procedural(posed).vertices)
-                         - np.asarray(layer_plain(posed).vertices), axis=-1)
-    assert float(gap.max()) > 5e-3, "procedural twist joints had no effect"
+    """The twist joints move the posed surface: the gap to the plain rig grows
+    with the pose. At the T-pose the two rigs already differ by about 2 cm, as
+    upstream's two rigs do (20.2 mm on the same identities)."""
+    def gap(p):
+        a = np.asarray(layer_procedural(p, apply_correctives=False).vertices)
+        b = np.asarray(layer_plain(p, apply_correctives=False).vertices)
+        return float(np.linalg.norm(a - b, axis=-1).max())
+    at_rest, posed = gap(_params(layer_plain, sigma=0.0)), gap(_params(layer_plain, sigma=0.45))
+    assert at_rest < 0.05, at_rest
+    assert posed > at_rest + 5e-3, ("procedural twist joints had no effect", at_rest, posed)
 
 
 def test_jit_matches_eager_and_batches_are_independent(layer_plain):
@@ -116,10 +117,15 @@ def test_low_lod(layer_plain):
 
 
 def test_fit_joint_regressor_false_still_builds():
+    """Without the linear regressor the full skeleton fit still poses the
+    layer; only skeleton_fit="linear", which needs it, refuses."""
     need_module("pxr")
     need_assets(*UPSTREAM_ASSETS)
     layer = SOMALayer.from_upstream_assets(procedural=False, fit_joint_regressor=False)
-    assert layer.J_regressor.shape == (78, 18056)
+    p = _params(layer, B=1)
+    assert np.isfinite(np.asarray(layer(p, apply_correctives=False).vertices)).all()
+    with pytest.raises(ValueError, match="J_regressor"):
+        layer.prepare_identity(p.identity_coeffs, skeleton_fit="linear")
 
 
 def test_explicit_npz_path_is_used(tmp_path):
@@ -166,8 +172,9 @@ def test_animation_npz_roundtrip(tmp_path, layer_plain):
     T, J = 5, len(layer_plain.joint_names)
     poses = np.random.default_rng(0).standard_normal((T, J, 3)).astype(np.float32) * 0.1
     path = tmp_path / "clip.soma.npz"
-    save_soma_npz(str(path), poses, np.zeros((T, 3), np.float32), layer_plain.joint_names,
-                  "soma", np.zeros(128, np.float32))
+    save_soma_npz(str(path), poses, np.zeros((T, 3), np.float32),
+                  joint_names=layer_plain.joint_names, identity_model_type="soma",
+                  identity_coeffs=np.zeros(128, np.float32))
     back = load_soma_npz(str(path))
     assert back["poses"].shape[0] == T
     assert list(map(str, back["joint_names"]))[-J + 1:] == layer_plain.joint_names[-J + 1:]

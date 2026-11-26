@@ -499,7 +499,7 @@ def pose_clip(layer, coeffs, asf, W, end, tpose, azimuth_deg: float) -> dict:
     import jax.numpy as jnp
 
     from soma_jax import SOMAParams
-    names, parents = list(layer.public_joint_names), layer.parents
+    names, parents = list(layer.public_joint_names), layer.public_joint_parent_ids
     local, hips, scale = retarget_to_soma(asf, W, end, names, parents, tpose)
     G, travels = stage_yaw(hips, W["root"], azimuth_deg)
     hip = names.index("Hips")
@@ -622,7 +622,7 @@ def run_motion(layer, coeffs, tpose, name: str, caption: str, asf_path, amc_path
     faces = np.asarray(layer.faces)
     t0 = time.time()
     images = render_clip(m["verts"], faces, hips, fps, camera, args.width, args.height,
-                         args.azimuth, *((m["joints"], layer.parents) if args.skeleton else ()))
+                         args.azimuth, *((m["joints"], layer.public_joint_parent_ids) if args.skeleton else ()))
     print(f"  rendered {T} frames ({camera} camera) in {time.time() - t0:.1f} s")
     save_gif(images, out_dir / f"{name}.gif", fps)
     print(f"  wrote {out_dir / f'{name}.gif'}")
