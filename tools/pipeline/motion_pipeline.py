@@ -322,7 +322,7 @@ def smplx_motion_to_soma_poses(smplx_model, soma_layer, motion, hf_dir=None,
     errs = []
     for n in range(N):
         R = jax.vmap(axis_angle_to_rotmat)(jnp.asarray(poses_local[n]))
-        out = soma_layer.pose(R[None], transl0, SR[None], RJ[None])
+        out = soma_layer.pose_arrays(R[None], transl0, SR[None], RJ[None])
         errs.append(np.linalg.norm(np.asarray(out.vertices[0]) - soma_posed[n], axis=-1))
     extras = {
         "per_vertex_error": np.stack(errs, axis=0).astype(np.float32),   # (N, V) meters

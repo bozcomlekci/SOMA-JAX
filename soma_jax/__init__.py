@@ -41,6 +41,7 @@ __version__ = "0.1.0"
 import sys as _sys
 
 from .body.soma import (
+    SOMAIdentity,
     SOMALayer,
     SOMAPoseOutput,
     SOMAPublicRigView,
@@ -148,6 +149,7 @@ __all__ = [
     # Parameters & outputs
     "SOMAParams",
     "SOMAOutput",
+    "SOMAIdentity",
     "SOMAPoseOutput",
     "SOMAPublicRigView",
     # SOMA Hand (SOMA-X v0.3.0)

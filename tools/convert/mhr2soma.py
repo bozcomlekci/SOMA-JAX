@@ -481,7 +481,7 @@ def main():
                 "shape as a fixed bind pose; skinning will be approximate for samples with "
                 "different body shapes.", stacklevel=1)
         from soma_jax.usd_io import export_soma_usd
-        rest, _, binds = soma.prepare_identity(
+        rest, _, binds = soma.prepare_identity_arrays(
             all_ic[:1], all_sp[:1], return_bind_transforms=True,
             kwargs={"bone_length_flexibles": all_bl[:1]})
         export_soma_usd(args.output_usd, soma, rotations, root_transl,
@@ -497,12 +497,12 @@ def main():
     mhr_verts_all, eval_verts_all = [], []
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
-        rest, joints, binds = soma.prepare_identity(
+        rest, joints, binds = soma.prepare_identity_arrays(
             all_ic[start:end], all_sp[start:end], return_bind_transforms=True,
             kwargs={"bone_length_flexibles": all_bl[start:end]})
         verts_cm, _ = mhr_model(all_ic[start:end], jnp.asarray(model_params_raw[start:end]))
         mhr_verts_all.append(np.asarray(verts_cm) * cm_to_m)
-        eval_v = soma.pose(rotations[start:end], root_transl[start:end], rest, joints,
+        eval_v = soma.pose_arrays(rotations[start:end], root_transl[start:end], rest, joints,
                            bind_transforms=binds, absolute_pose=True,
                            apply_correctives=False).vertices
         eval_verts_all.append(np.asarray(eval_v) * cm_to_m)

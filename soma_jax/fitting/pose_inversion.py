@@ -1033,7 +1033,7 @@ class PoseInversion:
                 and scale_params.ndim == 1):
             scale_params = scale_params[None]
 
-        rest_shape, _, bind_world = self.soma.prepare_identity(
+        rest_shape, _, bind_world = self.soma.prepare_identity_arrays(
             coeffs,
             scale_params,
             repose_to_bind_pose=repose_to_bind_pose,
@@ -1659,7 +1659,7 @@ class PoseInversion:
         def vertices_of(rot6d, transl):
             r6 = jnp.concatenate([root_6d, rot6d.reshape(B, J - 1, 6)], axis=1)
             R_local = jax.vmap(jax.vmap(rotation_6d_to_rotmat))(r6)
-            verts = layer.pose(
+            verts = layer.pose_arrays(
                 R_local, transl, bind_shape, None, absolute_pose=True,
                 apply_correctives=False, bind_transforms=bind_world, bone_scales=bone_scales,
             ).vertices

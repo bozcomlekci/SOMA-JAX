@@ -201,14 +201,14 @@ def bench_soma_jax(asset_path: str, batches: list[int],
     # JIT-compile the two phases.
     @jax.jit
     def prepare_only(identity):
-        return layer.prepare_identity(identity, repose_to_bind_pose=False, skeleton_fit="linear")
+        return layer.prepare_identity_arrays(identity, repose_to_bind_pose=False, skeleton_fit="linear")
 
     @jax.jit
     def full_forward(identity, poses, transl):
-        rest_v, rest_j = layer.prepare_identity(identity, repose_to_bind_pose=False, skeleton_fit="linear")
+        rest_v, rest_j = layer.prepare_identity_arrays(identity, repose_to_bind_pose=False, skeleton_fit="linear")
         # apply_correctives=False: LBS-only, matching the paper's Table 4 and
         # SOMA-X's benchmark (pose(apply_correctives=False)).
-        out = layer.pose(poses, transl, rest_v, rest_j, apply_correctives=False)
+        out = layer.pose_arrays(poses, transl, rest_v, rest_j, apply_correctives=False)
         # Materialize the full (B, V, 3) vertex buffer (torch does) — a scalar
         # reduction here would let XLA fuse away the output write.
         return out.vertices

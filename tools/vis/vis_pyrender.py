@@ -87,7 +87,7 @@ def _compute_mesh(args, jnp, layer, SOMAParams):
 
     if args.animation is None:
         from soma_jax import load_soma_npz
-        rest_verts, joints = layer.prepare_identity(jnp.asarray(identity_coeffs), repose_to_bind_pose=False, skeleton_fit="linear")
+        rest_verts, joints = layer.prepare_identity_arrays(jnp.asarray(identity_coeffs), repose_to_bind_pose=False, skeleton_fit="linear")
         return np.array(rest_verts[0]), np.array(layer.faces), np.array(joints[0])
 
     from soma_jax import load_soma_npz

@@ -3,7 +3,7 @@
 Command-line scripts (run from the repo root, e.g. `python tools/<sub>/<script>.py`).
 They are **not** imported by the `soma_jax` package.
 
-SOMA-X v0.3.3's tools are ported under their own names, with upstream's
+SOMA-X v0.3.6's tools are ported under their own names, with upstream's
 arguments — upstream's `third_party/SOMA-X/docs/tools.md` documents their usage —
 and each script's docstring names its upstream file and anything it does
 differently. Where upstream fails on its own default (procedural) layer — its
@@ -122,7 +122,11 @@ and their gradients on a synthetic rig, the layer on the real assets (README
 quickstart, procedural rig, `jit`/`vmap`/`grad`, low LOD, bone scales, pose
 inversion, NPZ/USD round trips, identity backends) and these tools, including an
 offscreen render whose shading is checked. Where torch + `warp-lang` are
-installed, `test_upstream_parity.py` also checks the forward and the corrective
-checkpoint against upstream SOMA-X (5e-5 m / 1e-4 m guards). Missing assets or optional packages
-skip with the reason. Unlike the local developer suite in `tests/`, this one
-ships with the repository.
+installed, `test_upstream_parity.py` runs SOMA-JAX against upstream SOMA-X from
+the pinned submodule on identical inputs: the body forward at every LOD on both
+rigs with and without correctives, `prepare_identity()` + `pose()`,
+`load_motion`, the hand layer, pose inversion, the rotation conversions, the
+corrective checkpoint reader and the NPZ export (`-s` prints the measured
+figures; CI's `parity` job runs it on every push). Missing assets or optional
+packages skip with the reason. Unlike the local developer suite in `tests/`,
+this one ships with the repository.

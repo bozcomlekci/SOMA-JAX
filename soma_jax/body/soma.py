@@ -6,33 +6,29 @@ SOMALayer wraps the full pipeline:
   3. Corrective MLP → pose-dependent displacements
   4. LBS → posed vertices
 
-Usage::
+Usage — upstream's prepare-once / pose-per-frame workflow::
 
-    import numpy as np
     import jax.numpy as jnp
-    from soma_jax import SOMALayer, SOMAParams
+    from soma_jax import SOMALayer
 
-    layer = SOMALayer.load("path/to/SOMA_neutral.npz")
-    rest_verts, rest_joints = layer.prepare_identity(identity_coeffs)
-    params = SOMAParams(
-        poses=jnp.eye(3)[None, None].repeat(B * J, axis=0).reshape(B, J, 3, 3),
-        transl=jnp.zeros((B, 3)),
-        identity_coeffs=identity_coeffs,
-    )
-    output = layer(params)
+    layer = SOMALayer.from_upstream_assets()
+    identity = layer.prepare_identity(jnp.zeros((1, 128)))      # SOMAIdentity
+    out = layer.pose(jnp.zeros((B, 77, 3)), identity=identity)  # SOMAPoseOutput
+    out = layer.forward(poses, identity_coeffs)                 # both in one call
+
+``layer(SOMAParams(...))`` is SOMA-JAX's one-call form (78 joints in and out);
+``prepare_identity_arrays`` / ``pose_arrays`` are the array-level forms.
 
 Upstream: ``soma/body/soma.py :: SOMALayer``
-    Forward pass is a faithful port: identity blend -> skeleton fit -> repose ->
-    joint-orient remap -> FK + LBS, pinned by tests/test_layer_parity.py to
-    3.2e-6 m (mid LOD) and 2.4e-6 m (low LOD) — both LBS-only with
-    identity_model_type="soma". **Constructor defaults differ from upstream**
-    (upstream defaults to MHR + Warp + procedural transforms + a real
-    corrective checkpoint), and `rebind()` updates only `v_template`, leaving
-    the identity model and skeleton-transfer caches stale.
+    Faithful port: identity blend -> skeleton fit -> repose -> joint-orient
+    remap -> FK + LBS (+ correctives), checked against upstream by
+    ``tools/selftest/test_upstream_parity.py``. The constructor is
+    :meth:`SOMALayer.from_upstream_assets`, with upstream's parameters; its
+    default identity backend is SOMA's PCA where upstream's is MHR.
 """
 from __future__ import annotations
 import copy
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 from dataclasses import dataclass
 import logging
 import warnings
@@ -42,6 +38,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
+from .._compat import optimization_barrier
 from ..types import SOMAParams, SOMAOutput
 from ..units import Unit
 from ..geometry.transforms import rotation_6d_to_rotmat
@@ -255,8 +252,41 @@ class _LazyCache:
         self.values = {}
 
 
+class SOMAIdentity(NamedTuple):
+    """A prepared identity: what upstream's ``prepare_identity()`` caches.
+
+    :meth:`SOMALayer.prepare_identity` returns one and :meth:`SOMALayer.pose`
+    poses it. Upstream keeps these on the layer; SOMA-JAX layers are immutable,
+    so the identity is a value instead — a pytree that passes through ``jit``
+    and ``vmap``. Arrays are batched ``(B, ...)``; lengths are in the layer's
+    ``output_unit``.
+
+    Attributes:
+        rest_shape: (B, V, 3) rest mesh, reposed to the bind pose when prepared
+            with ``repose_to_bind_pose=True`` (upstream's default).
+        joints: (B, J, 3) rest joints — the bind transforms' translations.
+        bind_transforms_world: (B, J, 4, 4) fitted bind transforms; ``None`` on
+            the linear-regressor path (``skeleton_fit="linear"``).
+        identity_rest_shape: (B, Vi, 3) the identity model's own rest shape,
+            before LOD transfer and repose (upstream's
+            ``_cached_identity_rest_shape``; xlo layers apply correctives to it).
+        scale_params: (B, S) SOMA-backend bone-length scales, normalized as
+            upstream caches them; ``None`` for other backends, whose scale
+            parameters the identity model consumes.
+        global_scale: the uniform scale applied at preparation; :meth:`pose`
+            scales the corrective offsets by it, as upstream does.
+    """
+
+    rest_shape: jnp.ndarray
+    joints: jnp.ndarray
+    bind_transforms_world: Optional[jnp.ndarray]
+    identity_rest_shape: jnp.ndarray
+    scale_params: Optional[jnp.ndarray] = None
+    global_scale: Any = 1.0
+
+
 class SOMAPoseOutput(dict):
-    """Upstream ``SOMAPoseOutput``: :meth:`SOMALayer.forward`'s result.
+    """Upstream ``SOMAPoseOutput``: :meth:`SOMALayer.pose` / ``forward``'s result.
 
     A ``dict`` (``out["vertices"]``) with attribute access (``out.vertices``).
     ``vertices`` is absent with ``fk_only``; ``joints`` and ``transforms`` are
@@ -1247,7 +1277,7 @@ class SOMALayer(eqx.Module):
         # `_expand_public_bind_transforms`. The barrier guards the parent
         # gathers below against jaxlib <= 0.6.2's constant-folding bug (see
         # `pose_from_bind`) when the bind is a closed-over constant.
-        bind_full = jax.lax.optimization_barrier(
+        bind_full = optimization_barrier(
             self._expanded_bind_transforms(bind_transforms))
 
         # 2b. The local step each joint composes comes from **that** bind, not
@@ -1493,7 +1523,7 @@ class SOMALayer(eqx.Module):
 
         Args:
             bind_transforms_world: optional (B, J, 4, 4) fitted binds from
-                ``prepare_identity(return_bind_transforms=True)`` (public, or the
+                ``prepare_identity_arrays(return_bind_transforms=True)`` (public, or the
                 expanded target rig's). Upstream defaults to its cached
                 identity; this immutable layer defaults to the public rig's
                 bind pose.
@@ -2225,7 +2255,7 @@ class SOMALayer(eqx.Module):
                    lod_transfer=lod_transfer, excluded_vert_ids=excluded_vert_ids,
                    identity_model_type=identity_model_type, output_unit=output_unit)
 
-    def prepare_identity(
+    def prepare_identity_arrays(
         self,
         identity_coeffs: jnp.ndarray,
         scale_params: Optional[jnp.ndarray] = None,
@@ -2237,10 +2267,10 @@ class SOMALayer(eqx.Module):
         return_bind_transforms: bool = False,
         return_identity_rest_shape: bool = False,
     ):
-        """Compute rest-pose vertices and joint positions for given identity.
+        """Rest-pose vertices and joint positions for an identity, as arrays.
 
-        Called once per identity (not per pose); cache the result across calls
-        to pose().
+        The array-level form of :meth:`prepare_identity` (SOMA-JAX), feeding
+        :meth:`pose_arrays`. Called once per identity, not per pose.
 
         Args:
             identity_coeffs: (B, C) or (C,) identity shape coefficients.
@@ -2261,7 +2291,7 @@ class SOMALayer(eqx.Module):
                 ``"auto"`` (default) — full when available, else linear.
             return_bind_transforms: if True, also return the fitted bind
                 world transforms (B, J, 4, 4) for the faithful
-                ``pose(bind_transforms=...)`` path (None on the linear path).
+                ``pose_arrays(bind_transforms=...)`` path (None on the linear path).
             kwargs: optional dict forwarded to the identity model's
                 ``get_rest_shape`` (upstream's ``kwargs``; e.g. MHR's
                 ``bone_length_flexibles``). Data-root backends only.
@@ -2358,6 +2388,63 @@ class SOMALayer(eqx.Module):
             out = out + (identity_rest,)
         return out
 
+    def prepare_identity(
+        self,
+        identity_coeffs,
+        scale_params: Optional[jnp.ndarray] = None,
+        repose_to_bind_pose: bool = True,
+        global_scale: float | jnp.ndarray = 1.0,
+        kwargs: Optional[dict] = None,
+        *,
+        skeleton_fit: str = "auto",
+    ) -> SOMAIdentity:
+        """Prepare an identity for :meth:`pose` — upstream ``prepare_identity``.
+
+        Upstream caches the rest shape, the fitted skeleton, the global scale
+        and the SOMA backend's bone scales on the layer; this immutable layer
+        returns them as a :class:`SOMAIdentity` for ``pose(..., identity=)``.
+
+        Args:
+            identity_coeffs: (B, K) or (K,) identity coefficients, or a
+                backend's dict (Anny).
+            scale_params: backend-dependent: SOMA bone-length scales, MHR scale
+                parameters, ... (B, S) or (S,).
+            repose_to_bind_pose: pose the fitted identity into the bind pose,
+                as the trained correctives expect (upstream's default ``True``).
+            global_scale: uniform scale scalar or (B,) array.
+            kwargs: forwarded to the identity model's ``get_rest_shape``.
+            skeleton_fit: SOMA-JAX extra — ``"auto"`` / ``"full"`` (upstream's
+                skeleton fit) or ``"linear"`` (the joint regressor).
+
+        Returns:
+            A batched :class:`SOMAIdentity`.
+        """
+        if not isinstance(identity_coeffs, dict) and jnp.ndim(identity_coeffs) == 1:
+            identity_coeffs = jnp.asarray(identity_coeffs)[None]
+            if scale_params is not None and jnp.ndim(scale_params) == 1:
+                scale_params = jnp.asarray(scale_params)[None]
+        rest, joints, binds, identity_rest = self.prepare_identity_arrays(
+            identity_coeffs, scale_params, repose_to_bind_pose=repose_to_bind_pose,
+            global_scale=global_scale, kwargs=kwargs, skeleton_fit=skeleton_fit,
+            return_bind_transforms=True, return_identity_rest_shape=True)
+        return SOMAIdentity(
+            rest_shape=rest, joints=joints, bind_transforms_world=binds,
+            identity_rest_shape=identity_rest,
+            scale_params=self._pose_bone_scales(scale_params, binds),
+            global_scale=global_scale)
+
+    def _pose_bone_scales(self, scale_params, bind_transforms) -> Optional[jnp.ndarray]:
+        """The bone scales posing consumes: SOMA-backend ``scale_params`` are
+        bone-length controls applied at pose time (upstream caches them in
+        ``prepare_identity``); other backends consume theirs in the identity
+        model. Legacy (B, 56) arrays get unit foot scales, as upstream's; any
+        other width is rejected, as by upstream's ``_normalize_soma_bone_scales``.
+        """
+        if (self.identity_model_type == "soma" and scale_params is not None
+                and bind_transforms is not None and self.num_bone_scale_params):
+            return self.normalize_bone_scales(scale_params)
+        return None
+
     def _identity_forward(self, identity_coeffs, scale_params, kwargs=None):
         """Rest vertices (metres) and, when a regressor exists, rest joints.
 
@@ -2399,7 +2486,7 @@ class SOMALayer(eqx.Module):
         if identity_rest_shape is None:
             raise ValueError(
                 "Correctives on an xlo layer need identity_rest_shape: pass the value "
-                "prepare_identity(..., return_identity_rest_shape=True) returns.")
+                "prepare_identity_arrays(..., return_identity_rest_shape=True) returns.")
         return self._apply_lod_transfer(identity_rest_shape + offsets) - rest_verts
 
     def _repose_full(
@@ -2497,10 +2584,7 @@ class SOMALayer(eqx.Module):
         )
         return posed_verts, posed_joints
 
-    # TODO: give pose() upstream's signature and semantics (poses, transl=None,
-    # pose2rot=True, ..., identity=...) and move this low-level form to its own
-    # name; see TODO.md.
-    def pose(
+    def pose_arrays(
         self,
         rotmats: jnp.ndarray,
         transl: jnp.ndarray,
@@ -2518,11 +2602,16 @@ class SOMALayer(eqx.Module):
         reference_pose=None,
         identity_rest_shape: Optional[jnp.ndarray] = None,
     ) -> SOMAOutput:
-        """Apply pose (rotations + translation) to rest vertices.
+        """Pose prepared rest arrays: the array-level form of :meth:`pose`.
+
+        SOMA-JAX's low-level entry point: every rig joint's rotation, the rest
+        arrays :meth:`prepare_identity_arrays` returns, and explicit control
+        over the joint orient. :meth:`pose` (upstream's signature) and
+        :meth:`__call__` are built on it.
 
         Args:
             identity_rest_shape: xlo layers only — the low-LOD identity rest
-                shape from ``prepare_identity(..., return_identity_rest_shape=
+                shape from ``prepare_identity_arrays(..., return_identity_rest_shape=
                 True)``. Correctives are evaluated on the low LOD there, and
                 upstream applies them as ``rest = transfer(identity_rest +
                 correctives)``, so they cannot be added to the xlo
@@ -2554,7 +2643,7 @@ class SOMALayer(eqx.Module):
                 MLP entirely (LBS-only forward — e.g. for runtime benchmarking
                 or when no trained checkpoint is loaded).
             bind_transforms: optional (B, J, 4, 4) per-identity bind world
-                transforms from ``prepare_identity(return_bind_transforms=
+                transforms from ``prepare_identity_arrays(return_bind_transforms=
                 True)``. When given, skinning runs against these binds via
                 ``pose_from_bind`` — the faithful mirror of SOMA-X's
                 ``BatchedSkinning.rebind + pose``. When None, the simplified
@@ -2704,7 +2793,7 @@ class SOMALayer(eqx.Module):
         if bone_scales is not None:
             raise ValueError(
                 "bone_scales require the faithful bind path; pass bind_transforms "
-                "from prepare_identity(return_bind_transforms=True)."
+                "from prepare_identity_arrays(return_bind_transforms=True)."
             )
 
         # FK: compute global transforms per sample.
@@ -2876,9 +2965,39 @@ class SOMALayer(eqx.Module):
             identity_coeffs = params.identity_coeffs
             scale_params = params.scale_params
 
+        identity = self.prepare_identity(
+            identity_coeffs, scale_params,
+            # upstream forward() since v0.2.2: procedural layers always repose
+            repose_to_bind_pose=(apply_correctives or self._procedural is not None
+                                 if repose_to_bind_pose is None else repose_to_bind_pose),
+            global_scale=global_scale,
+            kwargs=kwargs,
+        )
+        out = self._pose_identity(
+            rotmats, transl, identity, apply_correctives=apply_correctives,
+            absolute_pose=absolute_pose, fk_only=fk_only, reference_pose=reference_pose,
+            joint_orient=params.joint_orient)
+
+        if unbatched_poses:
+            return SOMAOutput(
+                vertices=None if out.vertices is None else out.vertices[0],
+                joints=out.joints[0],
+                transforms=None if out.transforms is None else out.transforms[0],
+            )
+        return out
+
+    def _pose_identity(self, rotmats, transl, identity: SOMAIdentity, *, apply_correctives,
+                       absolute_pose: bool, fk_only: bool, reference_pose=None,
+                       joint_orient=None) -> SOMAOutput:
+        """Pose a :class:`SOMAIdentity`: what :meth:`pose` and :meth:`__call__` share.
+
+        ``rotmats`` (B, J, 3, 3) cover the 77 posable or 78 public joints (or
+        every joint of the rig); ``reference_pose`` is already resolved.
+        Returns the public joints and transforms, Root included.
+        """
         # Expand the public pose onto the procedural rig before FK/LBS. Upstream
         # does this inside `pose()`; here it sits in front of the shared machinery
-        # so `pose()` stays a plain "rotations for every rig joint" entry point.
+        # so `pose_arrays()` stays a plain "rotations for every rig joint" entry point.
         n_public = len(self.public_joint_names)
         if rotmats.shape[-3] == n_public - 1:
             # Upstream's public contract is the 77 *posable* joints — Root is in
@@ -2900,48 +3019,28 @@ class SOMALayer(eqx.Module):
                 f"Expected {n_public} public joints (or {n_public - 1} posable, "
                 f"excluding Root), got {rotmats.shape[-3]}.")
 
-        rest_verts, rest_joints, bind_transforms, identity_rest = self.prepare_identity(
-            identity_coeffs, scale_params,
-            # upstream forward() since v0.2.2: procedural layers always repose
-            repose_to_bind_pose=(apply_correctives or self._procedural is not None
-                                 if repose_to_bind_pose is None else repose_to_bind_pose),
-            return_bind_transforms=True,
-            global_scale=global_scale,
-            return_identity_rest_shape=True,
-            kwargs=kwargs,
-        )
-
         # Upstream applies the reference joint orient unless absolute_pose: an
         # explicit/default reference if any, else the asset's T-pose.
-        joint_orient = params.joint_orient
         if reference_pose is not None:
             joint_orient = reference_pose
         elif joint_orient is None and not absolute_pose and self._public_t_pose_world is not None:
             joint_orient = self._public_t_pose_world[..., :3, :3]
 
-        # SOMA-backend `scale_params` are bone-length controls consumed at pose
-        # time (upstream caches them in prepare_identity); other identity
-        # backends consume them inside the identity model instead.
-        bone_scales = None
-        if (
-            self.identity_model_type == "soma"
-            and scale_params is not None
-            and bind_transforms is not None
-            and self.num_bone_scale_params
-        ):
-            # Legacy (B, 56) tensors get unit foot scales, as upstream; any
-            # other width is rejected, as upstream's `_normalize_soma_bone_scales`.
-            bone_scales = self.normalize_bone_scales(scale_params)
+        # Upstream broadcasts a single pose over a batch of identities.
+        n_identities = identity.rest_shape.shape[0]
+        if rotmats.shape[0] == 1 and n_identities > 1:
+            rotmats = jnp.broadcast_to(rotmats, (n_identities,) + rotmats.shape[1:])
+            transl = jnp.broadcast_to(transl, (n_identities,) + transl.shape[1:])
 
-        out = self.pose(
-            rotmats, transl, rest_verts, rest_joints, joint_orient,
+        out = self.pose_arrays(
+            rotmats, transl, identity.rest_shape, identity.joints, joint_orient,
             absolute_pose=absolute_pose,
             apply_correctives=apply_correctives,
-            bind_transforms=bind_transforms,
-            bone_scales=bone_scales,
+            bind_transforms=identity.bind_transforms_world,
+            bone_scales=identity.scale_params,
             fk_only=fk_only,
-            global_scale=global_scale,      # correctives are trained unscaled
-            identity_rest_shape=identity_rest,
+            global_scale=identity.global_scale,      # correctives are trained unscaled
+            identity_rest_shape=identity.identity_rest_shape,
         )
 
         # Upstream returns only the public joints: "The expanded twist skeleton is
@@ -2956,14 +3055,90 @@ class SOMALayer(eqx.Module):
                 joints=out.joints[..., sel, :],
                 transforms=None if out.transforms is None else out.transforms[..., sel, :, :],
             )
-
-        if unbatched_poses:
-            return SOMAOutput(
-                vertices=None if out.vertices is None else out.vertices[0],
-                joints=out.joints[0],
-                transforms=None if out.transforms is None else out.transforms[0],
-            )
         return out
+
+    def pose(
+        self,
+        poses: jnp.ndarray,
+        transl: Optional[jnp.ndarray] = None,
+        pose2rot: bool = True,
+        apply_correctives: bool = True,
+        absolute_pose: bool = False,
+        fk_only: bool = False,
+        return_transforms: Optional[bool] = None,
+        *,
+        reference_pose=None,
+        identity: Optional[SOMAIdentity] = None,
+    ) -> SOMAPoseOutput:
+        """Pose a prepared identity — upstream ``SOMALayer.pose``.
+
+        Upstream poses the identity ``prepare_identity()`` cached; this layer
+        takes it as ``identity=layer.prepare_identity(...)``. Otherwise the
+        signature, checks and output are upstream's.
+
+        Args:
+            poses: (B, 77, 3) axis-angle, or (B, 77, 3, 3) rotation matrices
+                with ``pose2rot=False``; ``poses[:, 0]`` is the Hips rotation
+                (global body rotation), the rest joint-local articulation.
+            transl: (B, 3) Hips translation in ``output_unit``; ``None`` keeps
+                the Hips at the origin.
+            pose2rot: convert axis-angle input to rotation matrices.
+            apply_correctives: apply the pose-corrective offsets (needs the
+                procedural rig and a loaded checkpoint, as upstream).
+            absolute_pose: rotations are absolute, not relative to the T-pose.
+            fk_only: forward kinematics only; ``vertices`` is omitted.
+            return_transforms: deprecated; ``transforms`` is always returned.
+            reference_pose: a :meth:`get_reference_pose` selector or ``(J, 3, 3)``
+                / ``(J, 4, 4)`` world orientations in ``public_joint_names``
+                order (virtual Root included). ``None`` uses the constructor
+                default, or the current T-pose; ``absolute_pose=True`` bypasses
+                the default and rejects an explicit reference.
+            identity: the :class:`SOMAIdentity` from :meth:`prepare_identity`.
+                A batch of one is shared by every pose; one pose is shared by
+                every identity.
+
+        Returns:
+            :class:`SOMAPoseOutput` (translations in ``output_unit``):
+            ``vertices`` (B, V, 3; omitted with ``fk_only``), ``joints``
+            (B, 77, 3) and ``transforms`` (B, 78, 4, 4) — the public skeleton,
+            Root included; a procedural layer's twist joints are not returned.
+        """
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if reference_pose is not None:
+            reference_pose = self._resolve_reference_pose(reference_pose)
+        if return_transforms is not None:
+            warnings.warn(
+                "return_transforms is deprecated; 'transforms' is always included in the result.",
+                DeprecationWarning, stacklevel=2)
+        if identity is None:
+            raise RuntimeError(
+                "No identity: pass identity=layer.prepare_identity(...) — SOMA-JAX layers "
+                "are immutable and cache none.")
+
+        poses = jnp.asarray(poses)
+        batch_size, num_joints = poses.shape[:2]
+        expected_pose_joints = len(self.public_joint_names) - 1
+        if num_joints != expected_pose_joints:
+            raise ValueError(
+                f"Expected poses to contain {expected_pose_joints} public SOMA joints; "
+                f"got {num_joints}")
+        if pose2rot:
+            rotmats = batch_rodrigues(poses.reshape(-1, 3)).reshape(batch_size, num_joints, 3, 3)
+        else:
+            rotmats = poses.reshape(batch_size, num_joints, 3, 3)
+        if transl is None:
+            transl = jnp.zeros((batch_size, 3), rotmats.dtype)
+        out = self._pose_identity(
+            rotmats, jnp.asarray(transl, rotmats.dtype), identity,
+            apply_correctives=apply_correctives, absolute_pose=absolute_pose,
+            fk_only=fk_only, reference_pose=reference_pose)
+        joints = out.joints[..., 1:, :]
+        if fk_only:
+            return SOMAPoseOutput(joints=joints, transforms=out.transforms)
+        return SOMAPoseOutput(vertices=out.vertices, joints=joints, transforms=out.transforms)
 
     def forward(
         self,
@@ -3010,24 +3185,19 @@ class SOMALayer(eqx.Module):
         """
         if reference_pose is not None and absolute_pose:
             raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
         if return_transforms is not None:
             warnings.warn(
                 "return_transforms is deprecated; 'transforms' is always included in the result.",
                 DeprecationWarning, stacklevel=2)
-        poses = jnp.asarray(poses)
-        if pose2rot:
-            rotations = batch_rodrigues(poses.reshape(-1, 3)).reshape(poses.shape[:-1] + (3, 3))
-        else:
-            rotations = poses
-        if transl is None:
-            transl = jnp.zeros((rotations.shape[0], 3), rotations.dtype)
-        out = self(
-            SOMAParams(poses=rotations, transl=jnp.asarray(transl),
-                       identity_coeffs=identity_coeffs, scale_params=scale_params),
-            apply_correctives=apply_correctives, absolute_pose=absolute_pose,
-            global_scale=global_scale, reference_pose=reference_pose, kwargs=kwargs)
-        return SOMAPoseOutput(vertices=out.vertices, joints=out.joints[..., 1:, :],
-                              transforms=out.transforms)
+        identity = self.prepare_identity(
+            identity_coeffs, scale_params,
+            repose_to_bind_pose=apply_correctives or self._procedural is not None,
+            global_scale=global_scale, kwargs=kwargs)
+        return self.pose(poses, transl=transl, pose2rot=pose2rot,
+                         apply_correctives=apply_correctives, absolute_pose=absolute_pose,
+                         reference_pose=reference_pose, identity=identity)
 
     def extend_rig_with_procedural_transforms(
         self,

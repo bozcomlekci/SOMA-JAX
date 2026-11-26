@@ -98,7 +98,7 @@ def main():
 
     if args.animation is None:
         # Just output the rest mesh
-        rest_verts, _ = layer.prepare_identity(jnp.asarray(identity_coeffs), repose_to_bind_pose=False, skeleton_fit="linear")
+        rest_verts, _ = layer.prepare_identity_arrays(jnp.asarray(identity_coeffs), repose_to_bind_pose=False, skeleton_fit="linear")
         verts = np.array(rest_verts[0])
         out_path = args.output or f"rest_mesh.{args.format}"
         write_mesh(out_path, verts, faces, args.format)

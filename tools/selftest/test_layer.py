@@ -38,6 +38,12 @@ def test_readme_quickstart(layer_procedural):
     height = float(out.vertices[0, :, 1].max() - out.vertices[0, :, 1].min())
     assert 1.4 < height < 2.1, f"implausible body height {height:.2f} m"
 
+    identity = layer.prepare_identity(jnp.zeros((1, 128)))
+    out = layer.pose(jnp.zeros((B, 77, 3)), identity=identity)
+    assert out["vertices"].shape == (B, 18056, 3)
+    assert out["joints"].shape == (B, 77, 3)
+    assert np.isfinite(np.asarray(out["vertices"])).all()
+
 
 def test_procedural_rig_is_active(layer_procedural, layer_plain):
     """The twist joints move the posed surface: the gap to the plain rig grows
@@ -74,6 +80,39 @@ def test_77_posable_joints_and_joint_count_errors(request, rig):
     np.testing.assert_allclose(posable, full, atol=1e-6)
     with pytest.raises(ValueError, match="public joints"):
         layer(p._replace(poses=p.poses[:, :50]))
+
+
+@pytest.mark.parametrize("rig", ["layer_plain", "layer_procedural"])
+def test_prepare_identity_then_pose_is_upstreams_workflow(request, rig):
+    """prepare_identity() -> SOMAIdentity -> pose(identity=) gives forward()
+    and __call__ one model; the identity is a pytree that jit passes through,
+    one identity serves many poses and one pose many identities."""
+    import equinox as eqx
+    from soma_jax import SOMAIdentity
+    layer = request.getfixturevalue(rig)
+    p = _params(layer, B=3)
+    poses = p.poses[:, 1:]                                   # upstream's 77 posable joints
+    identity = layer.prepare_identity(p.identity_coeffs)
+    assert isinstance(identity, SOMAIdentity) and identity.rest_shape.shape[0] == 3
+    out = layer.pose(poses, transl=p.transl, apply_correctives=False, identity=identity)
+    assert out["joints"].shape == (3, 77, 3) and out.transforms.shape == (3, 78, 4, 4)
+    fwd = layer.forward(poses, p.identity_coeffs, transl=p.transl, apply_correctives=False)
+    call = layer(p, apply_correctives=False, repose_to_bind_pose=True)
+    np.testing.assert_allclose(np.asarray(out.vertices), np.asarray(call.vertices), atol=1e-6)
+    if layer.procedural_transforms_enabled:   # forward reposes on procedural layers, as upstream
+        np.testing.assert_allclose(np.asarray(fwd.vertices), np.asarray(out.vertices), atol=1e-6)
+    jitted = eqx.filter_jit(lambda L, P, I: L.pose(P, apply_correctives=False, identity=I).vertices)
+    np.testing.assert_allclose(np.asarray(jitted(layer, poses, identity)),
+                               np.asarray(out.vertices), atol=1e-5)
+    one = layer.prepare_identity(p.identity_coeffs[:1])
+    many_poses = layer.pose(poses, apply_correctives=False, identity=one).vertices
+    single = layer.pose(poses[1:2], apply_correctives=False, identity=one).vertices
+    np.testing.assert_allclose(np.asarray(many_poses[1]), np.asarray(single[0]), atol=1e-5)
+    assert layer.pose(poses[:1], apply_correctives=False, identity=identity).vertices.shape[0] == 3
+    with pytest.raises(ValueError, match="77 public SOMA joints"):
+        layer.pose(p.poses, identity=identity)
+    with pytest.raises(RuntimeError, match="identity"):
+        layer.pose(poses)
 
 
 def test_rebind_keeps_the_skeleton_fit_consistent(layer_plain):
@@ -155,14 +194,14 @@ def test_prebuilt_archive_route_agrees(layer_plain):
 
 
 def test_bone_scales_change_the_skeleton(layer_plain):
-    rest, joints, binds = layer_plain.prepare_identity(jnp.zeros((1, 128)),
+    rest, joints, binds = layer_plain.prepare_identity_arrays(jnp.zeros((1, 128)),
                                                        return_bind_transforms=True)
     R = jnp.broadcast_to(jnp.eye(3), (1, len(layer_plain.joint_names), 3, 3))
     scales = jnp.ones((1, layer_plain.num_bone_scale_params))
-    base = layer_plain.pose(R, jnp.zeros((1, 3)), rest, joints, bind_transforms=binds,
+    base = layer_plain.pose_arrays(R, jnp.zeros((1, 3)), rest, joints, bind_transforms=binds,
                             bone_scales=scales, fk_only=True)
     i = layer_plain.scale_param_names.index("LeftForeArm")
-    longer = layer_plain.pose(R, jnp.zeros((1, 3)), rest, joints, bind_transforms=binds,
+    longer = layer_plain.pose_arrays(R, jnp.zeros((1, 3)), rest, joints, bind_transforms=binds,
                               bone_scales=scales.at[0, i].set(1.5), fk_only=True)
     assert float(jnp.abs(longer.joints - base.joints).max()) > 1e-3
 
@@ -196,7 +235,7 @@ def test_pose_inversion_roundtrip(layer_procedural):
 def test_usd_export_roundtrip(tmp_path, layer_plain):
     need_module("pxr")
     from soma_jax import export_soma_usd, load_usd_skeleton
-    rest, _, binds = layer_plain.prepare_identity(jnp.zeros((1, 128)),
+    rest, _, binds = layer_plain.prepare_identity_arrays(jnp.zeros((1, 128)),
                                                   return_bind_transforms=True)
     T, J = 3, len(layer_plain.joint_names)
     rot = np.broadcast_to(np.eye(3, dtype=np.float32), (T, J, 3, 3)).copy()
@@ -231,7 +270,7 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
     # Laplacian blend) on first call, and a cache built inside a trace would
     # hold tracers and break every later call with UnexpectedTracerError.
     ids = jnp.asarray(np.random.default_rng(0).standard_normal((1, 16)) * 0.5, jnp.float32)
-    jitted = np.asarray(jax.jit(lambda c: layer.prepare_identity(c)[0])(ids))
+    jitted = np.asarray(jax.jit(lambda c: layer.prepare_identity_arrays(c)[0])(ids))
     out = layer(SOMAParams(poses=jnp.zeros((1, 78, 3)), transl=jnp.zeros((1, 3)),
                            identity_coeffs=ids))
     v = np.asarray(out.vertices)
@@ -239,7 +278,7 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
     assert 0.9 < float(v[0, :, 1].max() - v[0, :, 1].min()) < 2.3
     # (float32 jit vs eager: XLA 0.4.26 differs by up to 0.15 mm where the
     # tetrahedral weights of off-surface vertices cancel.)
-    np.testing.assert_allclose(np.asarray(layer.prepare_identity(ids)[0]), jitted, atol=5e-4)
+    np.testing.assert_allclose(np.asarray(layer.prepare_identity_arrays(ids)[0]), jitted, atol=5e-4)
     # Every SOMA wrap vertex is embedded in the backend's own mesh, so the
     # zero-coefficient body must reproduce that backend's SOMA_wrap.obj: the
     # tetrahedral embedding recovers points off the source surface, and the
@@ -249,7 +288,7 @@ def test_identity_backend(tmp_path, backend, builder, layer_plain):
     wrap = trimesh.load(data_root() / {"anny": "Anny", "garment_measurement":
                                        "GarmentMeasurements"}[backend] / "SOMA_wrap.obj",
                         process=False, maintain_order=True, force="mesh").vertices
-    rest0 = np.asarray(layer.prepare_identity(jnp.zeros((1, 16)), repose_to_bind_pose=False)[0])
+    rest0 = np.asarray(layer.prepare_identity_arrays(jnp.zeros((1, 16)), repose_to_bind_pose=False)[0])
     np.testing.assert_allclose(
         rest0[0], np.asarray(wrap) * layer.identity_model.native_unit.meters_per_unit, atol=5e-4)
     if backend == "garment_measurement":

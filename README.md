@@ -15,9 +15,12 @@ hardware-portable graph.
 
 ## Overview
 
-- **Faithful.** A port of SOMA-X v0.3.3: the body forward matches upstream at
-  every LOD, on the default 110-joint procedural rig and the legacy one, with
-  pose correctives, to **≤ 3.1 µm**. Audited module by module in
+- **Faithful.** A port of SOMA-X v0.3.6, its latest release, with upstream's
+  API — `prepare_identity()` / `pose()` / `forward()`, `load_motion()` included.
+  The body forward matches upstream at every LOD, on the default 110-joint
+  procedural rig and the legacy one, with and without the pose correctives, to
+  **≤ 2.9 µm**, and the hand layer to 0.25 µm — checked on every push by the
+  parity suite that ships in `tools/selftest`. Audited module by module in
   [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md), which also lists what differs
   by design, which upstream defects are not reproduced, and what SOMA-JAX adds.
 - **Differentiable end to end.** Identity blend → skeleton fit → FK + LBS is a
@@ -71,6 +74,12 @@ out = eqx.filter_jit(layer)(SOMAParams(
 ))
 out.vertices    # (B, 18056, 3)
 out.joints      # (B, 78, 3)
+
+# Or upstream's API: prepare the identity once, then pose it frame by frame.
+identity = layer.prepare_identity(jnp.zeros((1, 128)))
+out = layer.pose(jnp.zeros((B, 77, 3)), identity=identity)   # 77 posable joints
+out["vertices"]  # (B, 18056, 3), with upstream's pose correctives
+out["joints"]    # (B, 77, 3)
 ```
 
 Recover pose from a posed mesh:

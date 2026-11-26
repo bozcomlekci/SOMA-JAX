@@ -163,7 +163,7 @@ def main():
     repose = not args.no_repose
 
     def body(layer, coeffs):
-        return layer.prepare_identity(coeffs, repose_to_bind_pose=repose)[0]
+        return layer.prepare_identity_arrays(coeffs, repose_to_bind_pose=repose)[0]
 
     sources = np.asarray(body(src, jnp.asarray(src_coeffs)))          # (B, V, 3)
     out = np.zeros((src_coeffs.shape[0], K), np.float32)

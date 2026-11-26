@@ -7,7 +7,7 @@ This product includes software developed by NVIDIA CORPORATION & AFFILIATES.
   Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   Licensed under the Apache License, Version 2.0.
 
-SOMA-JAX is a derivative work: it reimplements SOMA-X (v0.3.3) — its body,
+SOMA-JAX is a derivative work: it reimplements SOMA-X (v0.3.6) — its body,
 hand and SMPL-family layers, identity backends, skeletal and mesh-topology
 abstractions, procedural rig, pose correctives, pose inversion, smoothing, I/O
 and tools — in JAX/equinox in place of the upstream PyTorch + NVIDIA Warp

@@ -3,12 +3,13 @@
 **A faithful JAX port of NVIDIA [SOMA-X](https://github.com/NVlabs/SOMA-X) — the
 Skeleton-Oriented Mean Avatar universal body-model pivot.**
 
-SOMA-JAX reimplements SOMA-X **v0.3.3** in pure JAX (`jax.jit` / `jax.vmap` /
+SOMA-JAX reimplements SOMA-X **v0.3.6** in pure JAX (`jax.jit` / `jax.vmap` /
 `jax.grad` + `equinox`), replacing the upstream PyTorch + NVIDIA Warp backend.
 It reads the same assets, exposes the same API under the same names, and
 reproduces upstream's results: the body forward matches at every LOD, on both
-rigs, with the pose-corrective network, to ≤ 3.1 µm — while being end-to-end
-differentiable and hardware-portable (NVIDIA GPU / CPU / TPU).
+rigs, with the pose-corrective network, to ≤ 2.9 µm (checked by the shipped
+parity suite on every push) — while being end-to-end differentiable and
+hardware-portable (NVIDIA GPU / CPU / TPU).
 
 This document is the extended description; see the top-level
 [`README.md`](../README.md) for the quick start,
@@ -136,11 +137,14 @@ inversion. Notes that matter when you go past it:
   `from_upstream_assets(npz_path=...)` — the key schema differs.
 * `identity_coeffs` is 128-wide for the SOMA PCA backend; other backends take
   their own width (`layer.identity_model.num_identity_coeffs`).
-* `layer(SOMAParams(...))` returns all 78 joints, Root included;
-  `layer.forward(poses, identity_coeffs, ...)` has upstream's signature and
-  returns upstream's 77. `layer.pose(...)` is a lower-level, SOMA-JAX-shaped
-  entry point (see [`FAITHFULNESS.md`](FAITHFULNESS.md#differences-by-design));
-  code written for upstream's `pose()` should call `forward()`.
+* `layer.prepare_identity(...)` returns the identity upstream caches on its
+  layer, a `SOMAIdentity`; `layer.pose(poses, ..., identity=identity)` and
+  `layer.forward(poses, identity_coeffs, ...)` have upstream's signatures and
+  return upstream's 77 joints. `layer(SOMAParams(...))` is SOMA-JAX's one-call
+  form and returns all 78, Root included; `prepare_identity_arrays` /
+  `pose_arrays` are the array-level forms the tools use.
+* The default procedural layer applies upstream's pose correctives, read from
+  `correctives_model.pt` without PyTorch.
 
 Install: `pip install -e ".[dev,vis,usd]"` — see [`INSTALL.md`](INSTALL.md).
 Core dependencies are `jax`, `jaxlib`, `equinox`, `numpy`, `scipy`, `optax`.
@@ -210,7 +214,7 @@ elbows, so derive elbow axes from the rest skeleton:
 ```python
 from soma_jax import PoseInversion
 
-rest, joints = layer.prepare_identity(identity_coeffs)       # (1, V, 3), (1, J, 3)
+rest, joints = layer.prepare_identity_arrays(identity_coeffs)   # (1, V, 3), (1, J, 3)
 names, J = list(layer.joint_names), joints[0]
 
 def hinge(a, b, c):                   # normal of the rest bone pair a -> b -> c
@@ -243,18 +247,34 @@ parent it stretches (`scale_param_segments` gives the `(parent, child)` edge,
 so `"LeftForeArm"` lengthens the upper arm):
 
 ```python
-coeffs = jnp.zeros(128)                                    # one identity, unbatched
-rest, joints, binds = layer.prepare_identity(coeffs, return_bind_transforms=True)
-
-scales = jnp.ones((rest.shape[0], layer.num_bone_scale_params))
+scales = jnp.ones((1, layer.num_bone_scale_params))
 scales = scales.at[:, layer.scale_param_names.index("LeftForeArm")].set(1.5)
+identity = layer.prepare_identity(jnp.zeros((1, 128)), scale_params=scales)
 
-out = layer.pose(rotmats, transl, rest, joints,      # (B, J, 3, 3) local, (B, 3)
-                 bind_transforms=binds, bone_scales=scales)
-out.transforms   # (B, J, 4, 4) world joint transforms
+poses = jnp.zeros((2, 77, 3))                              # (B, 77, 3) axis-angle
+out = layer.pose(poses, transl=jnp.zeros((2, 3)), identity=identity)
+out.transforms   # (B, 78, 4, 4) world joint transforms
 ```
 
 Pass `fk_only=True` to skip skinning and get joints/transforms only.
+
+### Motion from USD
+
+Upstream's animation API (v0.3.4) reads a USD SkelAnimation that names the
+public SOMA joints; the assets ship one, `example_animation.usd` (931 frames
+at 24 fps):
+
+```python
+from soma_jax.assets import resolve
+
+poses, transl, fps = layer.load_motion(resolve("example_animation.usd"))  # (T, 77, 3, 3), (T, 3)
+identity = layer.prepare_identity(jnp.zeros((1, 128)))
+out = layer.pose(poses[:48], transl=transl[:48], pose2rot=False, identity=identity)
+```
+
+`SOMAHandLayer.load_motion` extracts one hand from full-body or hand-only USD
+motion; `soma_jax.load_soma_animation` and `load_usd_animation_sequence` are
+the readers underneath.
 
 ### USD export
 
@@ -264,7 +284,8 @@ Requires the optional `usd-core` package (`pip install usd-core`):
 from soma_jax import export_soma_usd
 
 export_soma_usd("anim.usda", layer, result.rotations, result.root_translation,
-                bind_transforms_world=binds, rest_shape=rest, fps=30.0)
+                bind_transforms_world=identity.bind_transforms_world,
+                rest_shape=identity.rest_shape, fps=30.0)
 ```
 
 ### Visualization

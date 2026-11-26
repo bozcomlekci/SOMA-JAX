@@ -11,9 +11,11 @@ signature. (SOMA-JAX's older pack-based backends —
 ``soma_jax.identity_packs.create_identity_model(type, soma_data, model_data)`` —
 remain available under their own module.)
 
-``SOMAPoseOutput`` (what :meth:`SOMALayer.forward` returns) and
+``SOMAPoseOutput`` (what :meth:`SOMALayer.pose` and ``forward`` return) and
 ``SOMAPublicRigView`` (what :meth:`SOMALayer.public_rig_view` returns) are
-upstream's types; :meth:`SOMALayer.__call__` returns SOMA-JAX's
+upstream's types. ``SOMAIdentity`` is what :meth:`SOMALayer.prepare_identity`
+returns — the identity upstream caches on the layer — and :meth:`SOMALayer.pose`
+takes; :meth:`SOMALayer.__call__` returns SOMA-JAX's
 :class:`~soma_jax.types.SOMAOutput` NamedTuple.
 """
 from .identity_model import (
@@ -24,10 +26,11 @@ from .identity_model import (
     SOMAIdentityModel,
     create_identity_model,
 )
-from .soma import SOMALayer, SOMAPoseOutput, SOMAPublicRigView
+from .soma import SOMAIdentity, SOMALayer, SOMAPoseOutput, SOMAPublicRigView
 
 __all__ = [
     "SOMALayer",
+    "SOMAIdentity",
     "SOMAPoseOutput",
     "SOMAPublicRigView",
     "AnnyIdentityModel",

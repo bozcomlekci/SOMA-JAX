@@ -158,11 +158,11 @@ def main():
     rotmats = jax.vmap(axis_angle_to_rotmat)(jnp.asarray(poses_aa)).reshape(1, J, 3, 3)
     transl = jnp.zeros((1, 3), dtype=jnp.float32)
 
-    rest_verts, rest_joints = layer.prepare_identity(ident_zero, repose_to_bind_pose=False, skeleton_fit="linear")
+    rest_verts, rest_joints = layer.prepare_identity_arrays(ident_zero, repose_to_bind_pose=False, skeleton_fit="linear")
     # Plain rest pose: no joint_orient remap, so identity rotations give the
     # rest-pose mesh directly. The trained-correctives smoke test below uses
     # joint_orient = t_pose_world to match the checkpoint's training frame.
-    out = layer.pose(rotmats, transl, rest_verts[None], rest_joints[None])
+    out = layer.pose_arrays(rotmats, transl, rest_verts[None], rest_joints[None])
     soma_verts = np.array(out.vertices[0])
     # Mask out Root (joint 0, sits at the floor — drawing a bone from Hips
     # down to it produces a stray vertical line below the feet) and the
@@ -279,9 +279,9 @@ def main():
     # rest produce ~0 displacement, which wouldn't visualize anything).
     import equinox as eqx
     layer_no_corr = eqx.tree_at(
-        lambda m: m.correctives.W2,
+        lambda m: m.correctives,
         layer,
-        jnp.zeros_like(layer.correctives.W2),
+        layer.correctives.scale_w2(0.0),
     )
     # absolute_pose=True bypasses the t_pose_world remap. The corrective input
     # frame is then slightly off vs. the trained checkpoint, but the body comes
@@ -308,10 +308,10 @@ def main():
             poses_dyn[name_to_idx[nm]] = aa
     rotmats_dyn = jax.vmap(axis_angle_to_rotmat)(jnp.asarray(poses_dyn)).reshape(1, J, 3, 3)
 
-    out_yes = layer.pose(rotmats_dyn, transl, rest_verts[None], rest_joints[None],
+    out_yes = layer.pose_arrays(rotmats_dyn, transl, rest_verts[None], rest_joints[None],
                          absolute_pose=True)
     posed_no_corr = np.array(out_yes.vertices[0])
-    out_nc = layer_no_corr.pose(
+    out_nc = layer_no_corr.pose_arrays(
         rotmats_dyn, transl, rest_verts[None], rest_joints[None],
         absolute_pose=True,
     )

@@ -14,9 +14,10 @@ Typical export::
 
     from soma_jax.usd_io import export_soma_usd
 
-    layer.prepare_identity(coeffs)                    # or use the returned binds
+    identity = layer.prepare_identity(coeffs)
     export_soma_usd("anim.usda", layer, rotations, root_translation,
-                    bind_transforms_world=bind_transforms, rest_shape=rest_verts)
+                    bind_transforms_world=identity.bind_transforms_world,
+                    rest_shape=identity.rest_shape)
 
 Upstream: ``soma/io.py (USD half)``
     Faithful port of that code: UsdSkel mesh/rig/animation read+write, the
@@ -882,9 +883,9 @@ def export_soma_usd(
     :class:`~soma_jax.hand.SOMAHandLayer`, or a MANO / SMPL-family layer.
 
     Because SOMA-JAX layers are immutable and do not cache identity state, the
-    fitted rig is passed explicitly — take both from
-    ``layer.prepare_identity(..., return_bind_transforms=True)`` (body) or the
-    identity :meth:`~soma_jax.hand.SOMAHandLayer.prepare_identity` returns
+    fitted rig is passed explicitly — take both from the identity that
+    :meth:`~soma_jax.SOMALayer.prepare_identity` (body) or
+    :meth:`~soma_jax.hand.SOMAHandLayer.prepare_identity` returns
     (``rest_shape``, ``bind_transforms_world``). Upstream reads them from the
     layer's ``_cached_*`` attributes instead.
 

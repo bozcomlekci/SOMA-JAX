@@ -128,7 +128,7 @@ def bind_pose_vertices(layer: Any, identity_coeffs, scale_params, global_scale) 
                              **kw)["vertices"]
         return rest + scaled - neutral
 
-    rest, joints, binds = layer.prepare_identity(
+    rest, joints, binds = layer.prepare_identity_arrays(
         identity_coeffs, scale_params, repose_to_bind_pose=True, global_scale=global_scale,
         return_bind_transforms=True)
     if layer.identity_model_type != "soma" or scale_params is None:
@@ -136,8 +136,8 @@ def bind_pose_vertices(layer: Any, identity_coeffs, scale_params, global_scale) 
     R = _bind_pose_rotations(layer, B)
     zeros = jnp.zeros((B, 3), rest.dtype)
     kw = dict(bind_transforms=binds, absolute_pose=True, apply_correctives=False)
-    scaled = layer.pose(R, zeros, rest, joints, bone_scales=scale_params, **kw).vertices
-    neutral = layer.pose(R, zeros, rest, joints,
+    scaled = layer.pose_arrays(R, zeros, rest, joints, bone_scales=scale_params, **kw).vertices
+    neutral = layer.pose_arrays(R, zeros, rest, joints,
                          bone_scales=neutral_scale_params(layer, B), **kw).vertices
     return rest + scaled - neutral
 

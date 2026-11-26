@@ -239,7 +239,7 @@ def _fitted_rig(layer, prepared):
     upstream's ``export_soma_usd`` reads from the layer's cache."""
     from soma_jax.smpl.transfer import _SOMABodyIdentity
     if isinstance(prepared, _SOMABodyIdentity):
-        rest, _, binds = layer.prepare_identity(
+        rest, _, binds = layer.prepare_identity_arrays(
             prepared.identity_coeffs, prepared.scale_params,
             repose_to_bind_pose=prepared.repose_to_bind_pose, return_bind_transforms=True,
             global_scale=prepared.global_scale, kwargs=prepared.kwargs)

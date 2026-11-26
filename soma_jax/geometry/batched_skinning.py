@@ -34,6 +34,8 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
+from .._compat import optimization_barrier
+
 from .lbs import (
     lbs,
     lbs_blend,
@@ -142,7 +144,7 @@ def pose_from_bind(
     # `t - t[:, parents]` below evaluates wrongly when a prepared identity's
     # binds are closed over as constants (a clip posed with them came out
     # metres off). jaxlib 0.11 folds it correctly. The barrier stops the fold.
-    bind_world, rest_verts = jax.lax.optimization_barrier((bind_world, rest_verts))
+    bind_world, rest_verts = optimization_barrier((bind_world, rest_verts))
     J = local_rotmats.shape[1]
     parents_np = np.asarray(parents).astype(np.int64)
 

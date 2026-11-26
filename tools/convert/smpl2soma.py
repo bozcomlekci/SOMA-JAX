@@ -166,7 +166,7 @@ def main():
     if args.output_usd:
         # The full-resolution layer with the fitted identity, as upstream exports.
         from soma_jax.usd_io import export_soma_usd
-        rest, _, binds = soma.prepare_identity(betas[:1], return_bind_transforms=True)
+        rest, _, binds = soma.prepare_identity_arrays(betas[:1], return_bind_transforms=True)
         export_soma_usd(args.output_usd, soma, rotations, root_transl,
                         bind_transforms_world=binds, rest_shape=rest, fps=float(args.fps))
 
@@ -176,14 +176,14 @@ def main():
     # --- Render: SMPL forward + SOMA reconstruction on the refit layer ---
     from vis_pyrender import default_pyopengl_platform, render_comparison_video, set_pyopengl_platform
     set_pyopengl_platform(default_pyopengl_platform())
-    rest, joints, binds = inv.soma.prepare_identity(betas[:1], return_bind_transforms=True)
+    rest, joints, binds = inv.soma.prepare_identity_arrays(betas[:1], return_bind_transforms=True)
     smpl_verts_all, soma_verts_all = [], []
     for start in range(0, num_frames, batch_size):
         end = min(start + batch_size, num_frames)
         smpl_verts_all.append(np.asarray(smpl_vertices(
             smpl_layer, smpl_identity, global_orient[start:end], body_pose[start:end],
             transl[start:end])))
-        sv = inv.soma.pose(rotations[start:end], root_transl[start:end], rest, joints,
+        sv = inv.soma.pose_arrays(rotations[start:end], root_transl[start:end], rest, joints,
                            bind_transforms=binds, absolute_pose=True,
                            apply_correctives=False).vertices
         soma_verts_all.append(np.asarray(sv))

@@ -1,16 +1,22 @@
 # Faithfulness to SOMA-X
 
 How SOMA-JAX corresponds to upstream [SOMA-X](https://github.com/NVlabs/SOMA-X)
-**v0.3.3** (the `third_party/SOMA-X` submodule, release commit `d6aa640`):
-what is ported, what is measured against upstream and how closely, what
-differs by design, which upstream defects are not reproduced, what SOMA-JAX
-adds, and what has no JAX counterpart.
+**v0.3.6**, its latest release (the `third_party/SOMA-X` submodule, release
+commit `d7bac2a`): what is ported, what is measured against upstream and how
+closely, what differs by design, which upstream defects are not reproduced,
+what SOMA-JAX adds, and what has no JAX counterpart.
 
-**On the test citations below.** The numbers come from modules under `tests/`,
-named so each figure is attributable. The suite is developed and run locally
-rather than distributed — `tests/` is git-ignored — so a clone will not contain
-the file a citation names. See [`DESCRIPTION.md`](DESCRIPTION.md#testing) for
-what the suite reports.
+**On the test citations below.** Figures marked **shipped** come from
+`tools/selftest/test_upstream_parity.py`, which ships with the repository and
+runs on every push in CI's `parity` job (CPU torch + Warp, upstream imported
+from the submodule); `python -m pytest tools/selftest/test_upstream_parity.py -s`
+prints them. The other citations name modules of the developer suite under
+`tests/`, which is run locally rather than distributed (`tests/` is
+git-ignored), so a clone will not contain them. Those were measured against
+v0.3.3; the modules they cover did not change in v0.3.4–v0.3.6, which changed
+the corrective weights, the hand correctives' wrist input, the rotation-vector
+conversions, the NPZ export tools and PoseInversion's internals, and added the
+USD animation API — all measured against v0.3.6 by the shipped suite.
 
 ## Summary
 
@@ -25,13 +31,15 @@ what the suite reports.
 * **Call shapes.** Upstream's constructors and functions keep upstream's
   parameters in upstream's order, so positional and keyword calls written for
   SOMA-X bind the same way here; SOMA-JAX's own options are keyword-only extras.
-  The exceptions are `SOMALayer` itself, built by the classmethod
-  `from_upstream_assets(...)`, which takes upstream's constructor parameters,
-  and `SOMALayer.pose` ([below](#differences-by-design)).
-* **Forward parity.** The body layer matches upstream at every LOD, on both
-  rigs, with and without the pose-corrective network, to float32 rounding:
-  **≤ 3.1 µm** on vertices and **≤ 5.1 µm** on joints
-  ([table](#the-body-forward)).
+  The exception is `SOMALayer` itself, built by the classmethod
+  `from_upstream_assets(...)`, which takes upstream's constructor parameters;
+  its `prepare_identity()` returns the identity upstream caches, which `pose()`
+  takes as `identity=` ([below](#differences-by-design)).
+* **Forward parity (shipped).** The body layer matches upstream v0.3.6 at every
+  LOD, on both rigs, with and without the v0.3.6 pose-corrective network, to
+  float32 rounding: **≤ 2.9 µm** on vertices and **≤ 3.5 µm** on joints
+  ([table](#the-body-forward)); `prepare_identity()` + `pose()` to ≤ 3.4 µm /
+  7.6 µm, the hand layer to 0.25 µm.
 * **Layer surface.** All 68 public attributes of upstream's `SOMALayer` exist
   here with upstream's meaning and values (torch state such as `device`
   excepted); on a procedural layer `bind_pose_world`, `t_pose_world`,
@@ -51,33 +59,44 @@ across BLAS and driver versions.
 
 ### The body forward
 
-`tests/test_body_lod_parity.py`: `SOMALayer.from_upstream_assets(lod=…,
-procedural=…)` against upstream `SOMALayer(lod=…, enable_procedural_transforms=…)`,
-poses `N(0, 0.35²)` rad, translations `N(0, 0.1²)` m, a zero and a random
-(`N(0, 0.5²)`) identity, `identity_model_type="soma"`:
+**Shipped** (`test_forward_matches_upstream`): `SOMALayer.from_upstream_assets(lod=…,
+procedural=…)` against upstream `SOMALayer(lod=…, enable_procedural_transforms=…)`
+through `forward()`, poses `N(0, 0.45²)` rad, translations `N(0, 0.1²)` m,
+random `N(0, 0.5²)` identities, `identity_model_type="soma"`, the v0.3.6
+corrective checkpoint:
 
 | LOD (vertices) | rig | correctives | max \|Δ vertex\| | max \|Δ joint\| |
 |---|---|---|---|---|
-| mid (18,056) | legacy (78 joints) | — | 3.1 µm | 5.0 µm |
-| mid | procedural (110 joints) | off | 3.0 µm | 5.1 µm |
-| mid | procedural | **on** | 3.0 µm | 5.1 µm |
-| low (4,505) | legacy | — | 1.8 µm | 3.2 µm |
-| low | procedural | off / on | 1.9 µm | 3.4 µm |
-| xlo (612) | legacy | — | 1.6 µm | 2.5 µm |
-| xlo | procedural | off | 1.7 µm | 2.4 µm |
-| xlo | procedural | **on** | 1.9 µm | 2.4 µm |
+| mid (18,056) | legacy (78 joints) | — | 2.9 µm | 3.4 µm |
+| mid | procedural (110 joints) | off | 2.9 µm | 3.5 µm |
+| mid | procedural | **on** | 2.9 µm | 3.5 µm |
+| low (4,505) | legacy | — | 1.6 µm | 2.0 µm |
+| low | procedural | off / on | 1.6 µm | 2.1 µm |
+| xlo (612) | legacy | — | 1.7 µm | 3.2 µm |
+| xlo | procedural | off | 1.8 µm | 3.3 µm |
+| xlo | procedural | **on** | 1.9 µm | 3.3 µm |
 
-The same test pins the reposed rest shape, the identity rest shape and the
-fitted bind transforms of `prepare_identity(repose_to_bind_pose=True)` to
-upstream's cached `_cached_rest_shape` / `_cached_identity_rest_shape` /
+Upstream's prepare-once / pose-per-frame workflow (**shipped**,
+`test_prepare_identity_and_pose_match_upstream`, poses `N(0, 0.3²)` rad,
+correctives on) agrees to ≤ 3.4 µm on vertices and ≤ 7.6 µm on joints and
+transforms by default and with `absolute_pose=True`, `fk_only=True`, a stored
+reference pose (`{"version": "v0.1.0"}`), SOMA bone scales and a global scale.
+`load_motion` on the shipped `example_animation.usd` (body, both rigs, also
+absolute and against a reference; hand, both sides) agrees to ≤ 4e-7 and its
+reader `load_soma_animation` exactly; `public_joint_orient` to 1.2e-7. The
+SOMA Hand layer's forward agrees to 0.25 µm with and without correctives,
+including v0.3.6's identity-wrist corrective input.
+
+The developer suite (v0.3.3) pins the reposed rest shape, the identity rest
+shape and the fitted bind transforms of `prepare_identity(repose_to_bind_pose=True)`
+to upstream's cached `_cached_rest_shape` / `_cached_identity_rest_shape` /
 `_cached_bind_transforms_world`, and the faces and facial exclusion lists of
-every LOD exactly. `tests/test_layer_parity.py` and
-`tests/test_procedural_parity.py` repeat the comparison through the other entry
-points (`pose()`, the explicit reposed path, bone scales).
+every LOD exactly (`tests/test_body_lod_parity.py`, `test_layer_parity.py`,
+`test_procedural_parity.py`).
 
 The other identity backends, built from the same assets as upstream builds
-them (`tests/test_body_identity_backends.py`; poses `N(0, 0.3²)` rad, random
-identities and body-part scales, no correctives):
+them (developer suite, v0.3.3: `tests/test_body_identity_backends.py`; poses
+`N(0, 0.3²)` rad, random identities and body-part scales, no correctives):
 
 | backend | max \|Δ vertex\| (mid / low / xlo) | max \|Δ joint\| |
 |---|---|---|
@@ -95,7 +114,15 @@ every backend and LOD.
 
 ### Pose inversion
 
-`tests/test_pose_inversion_parity.py`, upstream `PoseInversion` against
+**Shipped** (`test_pose_inversion_matches_upstream`): upstream `PoseInversion`
+and `SOMAPoseInversion` with their defaults (low LOD, analytical refit +
+Lie-GN) on the same posed meshes (σ = 0.25 rad): rotation entries agree to
+6.4e-3 (mean 3.6e-4) — neither side returns exactly orthonormal matrices, so
+they are compared entry by entry — root translation to 9.8 µm, and the mean
+per-vertex error is 2.416 vs 2.409 mm.
+
+The developer suite (v0.3.3, `tests/test_pose_inversion_parity.py`) breaks
+this down by stage, upstream `PoseInversion` against
 `soma_jax.fitting.PoseInversion` (`SOMAPoseInversion`) on the same posed mesh:
 
 | Stage | max \|ΔR\| | root translation | per-vertex error | mean error (upstream / JAX) |
@@ -125,6 +152,9 @@ modes agree to the same order. Upstream's own six tests pass on the stand-ins.
 
 | Component | Test | Agreement |
 |---|---|---|
+| `rotvec_to_matrix` / `matrix_to_rotvec` (v0.3.6), `align_vectors`, quaternions | **shipped** `test_transforms_match_upstream` | ≤2e-6 (rotation vectors, tiny angles and the zero rotation included), ≤1e-5 (`align_vectors`, all three methods); 5e-18 in float64 for the rotation vectors |
+| corrective checkpoint, read without torch | **shipped** `test_correctives_checkpoint_reads_without_torch` | every tensor bit-identical to `torch.load` |
+| NPZ export (`export_soma_npz`, v0.3.6 `resolve_joint_orient`) | **shipped** `test_npz_export_is_upstreams` | the fields of upstream's export, both rigs; each side reads the other's file |
 | `align_vectors` (`auto`, `kabsch`, `newton-schulz`) | `test_soma_x_parity.py`, `test_rotation_alignment.py` | ≤3e-15 in float64; in float32 against upstream's float64, ≤4e-7 on generic correspondences and ≤3e-6 on near-planar (rank-deficient) ones |
 | refit alignment `_align_vectors_auto` | `test_rotation_alignment.py` | ≤2.4e-7 forward; gradients equal torch's, including rank-deficient and zero covariances |
 | RBF basis weights | `test_skeleton_transfer.py` | 2.3e-13 (float64); 6.0e-6 `linear`, 1.3e-6 `gaussian`, 9.1e-5 `thin_plate_spline` (float32 conditioning) |
@@ -196,28 +226,16 @@ exist with upstream's meaning:
 **Immutable layers.** SOMA-JAX layers are `equinox` modules. Upstream's
 `prepare_identity()` caches the identity on the layer (`_cached_rest_shape`,
 `_cached_bind_transforms_world`, …) for later `pose()` / `forward()` calls; here
-`prepare_identity()` takes upstream's parameters and *returns* the identity
-(rest shape and joints; the fitted binds with `return_bind_transforms=True`),
-and `forward()` / `__call__` fit the identity per call. The hand and
-SMPL-family layers keep upstream's `pose(...)` signature plus one `identity=`
-argument, the object their `prepare_identity` returns. Upstream methods that
-default to "the cached identity" (`public_rig_view()`,
+`prepare_identity()` takes upstream's parameters and *returns* the identity, a
+`SOMAIdentity` (a pytree, so it passes through `jit` and `vmap`), and `pose()`
+takes upstream's parameters plus that identity as a keyword, `identity=`.
+`forward()` prepares and poses in one call, as upstream's does. The hand and
+SMPL-family layers do the same with their own identity objects. Upstream
+methods that default to "the cached identity" (`public_rig_view()`,
 `public_bind_transforms_world()`, …) default to the rig's bind pose instead, or
-take the fitted binds as an argument. `SOMAPoseInversion.prepare_identity` keeps
-upstream's stateful contract, since the inversion object is mutable on both
-sides.
-
-**`SOMALayer.pose` is SOMA-JAX-shaped.** Upstream's
-`pose(poses, transl=None, pose2rot=True, apply_correctives=True, absolute_pose=False, fk_only=False, return_transforms=None, *, reference_pose=None)`
-poses the cached identity. SOMA-JAX's `pose(rotmats, transl, rest_verts,
-rest_joints, ...)` is a lower-level entry point under the same name: it takes
-78-joint local rotation matrices (Root included; no `pose2rot`), the prepared
-rest shape and joints and, on the faithful path, `bind_transforms`; `transl` is
-required; `apply_correctives` defaults to "apply when a checkpoint is loaded";
-and it applies the T-pose orient only when given `joint_orient` or
-`reference_pose` (upstream's orients unless `absolute_pose=True`). Code written
-for upstream's `pose()` should call `forward()`, which has upstream's signature,
-semantics and 77-joint output.
+take the fitted binds as an argument. `SOMAPoseInversion.prepare_identity`
+keeps upstream's stateful contract, since the inversion object is mutable on
+both sides.
 
 **No torch state.** `device`, `dtype`, `.to()`, `training`, registered buffers
 and the stateful `batched_skinning` / `public_batched_skinning` objects do not
@@ -273,33 +291,31 @@ LAPACK routine); traced inputs keep the JAX path.
 
 ## Upstream defects not reproduced
 
-Each was confirmed against the v0.3.3 code; SOMA-JAX implements what the code
+Each was confirmed against the v0.3.6 code; SOMA-JAX implements what the code
 evidently intends.
 
-* **`PoseInversion(soma, low_lod=True)` — the default — fails on a mid or xlo
-  `SOMALayer`**: `soma/fitting/pose_inversion.py` builds its internal low-LOD
-  layer after `from .body import SOMALayer`, which resolves to the nonexistent
-  `soma.fitting.body` (`ModuleNotFoundError`). Upstream's `smpl2soma`,
-  `mhr2soma` and `convert_amass_to_soma` construct exactly that. SOMA-JAX builds
-  the low-LOD layer from the original's recorded construction.
 * **`PoseInversion(low_lod=True)` on a hand, MANO or SMPL-family layer** would
   build a *body* `SOMALayer`; SOMA-JAX raises instead.
-* **Upstream's conversion tools on the default (procedural) layer**: they remove
-  `soma._t_pose_orient` — computed on the 110-joint skinning rig — from the 78
-  public rotations `PoseInversion` returns (`RuntimeError` on the shape), label
-  clips with `rig_data["joint_names"]`, the 110 skinning joints (every public
-  joint from `RightShoulder` on mislabelled), and render through
-  `batched_skinning.pose` with public rotations. The tool ports use the public
-  rig's orient and names and the layer's own pose. `mhr2soma --autograd-iters`
-  ≥ 2 also fails upstream ("backward through the graph a second time": the
-  TorchScript parameters require grad, so the prepared identity carries graph
-  history); the port's identity is a constant.
-* **`matrix_to_rotvec`** returns twice the rotation vector below 1e-3 rad (its
-  small-angle series applies the `w` factor to a vector that is `2w`).
-* **`rotvec_to_matrix`** (unused upstream) does not return rotation matrices.
+* **Upstream's `mhr2soma` and `convert_amass_to_soma` on the default
+  (procedural) layer** render through `batched_skinning.pose` with the 78
+  public rotations, which that 110-joint rig rejects, and `mhr2soma`'s drift
+  summary labels joints with `rig_data["joint_names"]`, the 110 skinning joints
+  (every public joint from `RightShoulder` on mislabelled). The tool ports
+  render the layer's own pose and use the public names.
 * **Negative-index roots.** Upstream's torch indexing treats a parent id of `-1`
   as "the last joint" in several helpers; SOMA-JAX treats it as a root, as the
   self-parented convention upstream's own assets use.
+
+Fixed upstream since v0.3.3, and done right here before: `PoseInversion`'s
+default low-LOD layer import (`from .body import SOMALayer` inside
+`soma/fitting`, v0.3.6); the conversion tools' NPZ export on the procedural rig
+(the 110-joint orient and names applied to 78 public rotations, v0.3.6's
+`resolve_joint_orient`); `mhr2soma --autograd-iters` ≥ 2 ("backward through the
+graph a second time", v0.3.6); and `matrix_to_rotvec` / `rotvec_to_matrix`
+(twice the rotation vector below 1e-3 rad, and non-rotations from the unit-axis
+`K`, v0.3.6). `matrix_to_rotvec` keeps one float32 property of upstream's
+formula: between 1e-3 and 1e-2 rad its angle comes from `arccos` of the trace,
+which loses up to ~1e-4 rad there, on both sides alike.
 
 Reproduced on purpose, because they are part of a public contract:
 `ChamferLoss`'s mesh cache (a target mesh is captured on first use and reused,
@@ -347,8 +363,11 @@ API computes.
   `J_regressor`, `joint_names`, `skeleton_levels`, `correctives` (the loaded
   `CorrectivesMLP`, or `None` without a checkpoint, as `correctives_model`).
   `prepare_identity(skeleton_fit="linear")` places the skeleton with the fitted
-  `J_regressor` instead of the skeleton transfer, and `pose()` applies
-  translation as an additive shift when no fitted binds are given.
+  `J_regressor` instead of the skeleton transfer, and `pose_arrays()` applies
+  translation as an additive shift when no fitted binds are given;
+  `prepare_identity_arrays()` / `pose_arrays()` are the array-level forms of
+  `prepare_identity()` / `pose()` that the tools use, and `__call__(SOMAParams)`
+  is SOMA-JAX's one-call form (78 joints in and out).
 * `SkeletonTransfer(rotation_backend=…)` selects the optional Warp kernel;
   `SkeletonTransfer.fit_joint_rotations(vectorized=False)` runs the per-joint
   loop the vectorized path is checked against; upstream's `fit_rotations_warp`
@@ -360,7 +379,7 @@ API computes.
 * `PoseMirrorSOMA` / `PoseMirrorMHR` (aliased to upstream's `PoseMirror_SOMA` /
   `PoseMirror_MHR`) expose their permutation tables.
 * Keyword-only extras on upstream signatures: `SOMALayer.prepare_identity`'s
-  `skeleton_fit`, `return_bind_transforms`, `return_identity_rest_shape`;
+  `skeleton_fit` and `pose`'s `identity`;
   `PoseInversion(root_joint_idx=…)` and its `prepare_identity(skeleton_fit=…)`;
   `save_soma_npz`'s `rotation_repr` / `absolute_pose` (overriding what upstream
   infers); `export_soma_usd`'s `bind_transforms_world` / `rest_shape` (the
@@ -384,7 +403,11 @@ API computes.
   Face `get_assets_dir`.
 * `usd_io`: the LOD skin-mesh discovery helpers (`load_lod_rig`,
   `load_template_rig`, `LOD_*` constants).
-* `correctives_model`: `load_correctives_pt`, `resolve_correctives_model_path`.
+* `correctives_model`: `load_correctives_pt`, `resolve_correctives_model_path`,
+  and `read_torch_checkpoint`, which reads upstream's `.pt` checkpoint with
+  NumPy (tensors and plain values only, as `torch.load(weights_only=True)`), so
+  the default procedural layer applies upstream's correctives without PyTorch
+  — bit-identical to reading it with torch.
 * `procedural_transforms`: `ProceduralTransforms` (the layer's internal
   evaluator) and its helpers.
 * `geometry`: SOMA-JAX names for upstream's transforms (`axis_angle_to_rotmat`,

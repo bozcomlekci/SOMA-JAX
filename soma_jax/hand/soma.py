@@ -792,5 +792,4 @@ class SOMAHandLayer:
 
 def _scale_correctives(model: CorrectivesMLP, scale: float) -> CorrectivesMLP:
     """Rescale a metre-unit corrective model's output layer to another unit."""
-    import equinox as eqx
-    return eqx.tree_at(lambda m: m.W2, model, model.W2 * scale)
+    return model.scale_w2(scale)

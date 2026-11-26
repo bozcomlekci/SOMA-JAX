@@ -250,8 +250,8 @@ def _run_jax(method: str, B: int, hf: Path, soma_npz: Path,
 
         @jax.jit
         def fwd(coeffs, rotmats, transl):
-            rv, rj = layer.prepare_identity(coeffs, repose_to_bind_pose=False, skeleton_fit="linear")
-            out = layer.pose(rotmats, transl, rv, rj, apply_correctives=False)
+            rv, rj = layer.prepare_identity_arrays(coeffs, repose_to_bind_pose=False, skeleton_fit="linear")
+            out = layer.pose_arrays(rotmats, transl, rv, rj, apply_correctives=False)
             return out.vertices
     else:
         raise ValueError(method)

@@ -328,7 +328,7 @@ def main():
     rotations, root_transl = conv["rotations"], conv["root_transl"]
     betas, body_pose = conv["betas"], conv["body_pose"]
     global_orient, transl = conv["global_orient"], conv["transl"]
-    rest, joints, binds = inv.soma.prepare_identity(betas[:1], return_bind_transforms=True)
+    rest, joints, binds = inv.soma.prepare_identity_arrays(betas[:1], return_bind_transforms=True)
     smpl_identity = smpl_layer.prepare_identity(betas[:1])
 
     num_frames = rotations.shape[0]
@@ -339,7 +339,7 @@ def main():
         smpl_verts_all.append(np.asarray(smpl_vertices(
             smpl_layer, smpl_identity, global_orient[start:end], body_pose[start:end],
             transl[start:end])))
-        sv = inv.soma.pose(rotations[start:end], root_transl[start:end], rest, joints,
+        sv = inv.soma.pose_arrays(rotations[start:end], root_transl[start:end], rest, joints,
                            bind_transforms=binds, absolute_pose=True,
                            apply_correctives=False).vertices
         soma_verts_all.append(np.asarray(sv))

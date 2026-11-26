@@ -280,17 +280,22 @@ tools/vis/vis_pyrender.py ...`.
 
 ## Optional: SOMA-X parity & benchmarks (PyTorch + Warp)
 
-The parity tests (`tests/test_soma_x_parity.py`) and the `benchmarks/` scripts
-compare against the original SOMA-X, which runs on **PyTorch + NVIDIA Warp**:
+The shipped parity suite (`tools/selftest/test_upstream_parity.py`) and the
+`benchmarks/` scripts compare against the original SOMA-X, which runs on
+**PyTorch + NVIDIA Warp**:
 
 ```bash
 pip install torch warp-lang          # match your CUDA; see the PyTorch install matrix
 # CPU only:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pytest tools/selftest/test_upstream_parity.py -q    # SOMA-JAX vs upstream, CPU
 ```
 
 (The Warp package on PyPI is `warp-lang`; there is no `nvidia-warp`.) The
-scripts import upstream from the pinned `third_party/SOMA-X` submodule unless a
-`soma` package is installed. Warp's JAX kernel — the "hybrid" pipeline — runs
+parity suite imports upstream from the pinned `third_party/SOMA-X` submodule
+and skips where torch or Warp is missing; CI's `parity` job runs it on every
+push, with `SOMA_JAX_REQUIRE_PARITY=1` turning those skips into failures. The
+benchmark scripts import the submodule too, unless a `soma` package is
+installed. Warp's JAX kernel — the "hybrid" pipeline — runs
 only with JAX on a CUDA GPU; elsewhere the benchmark skips that row and
 `tools/compare_render/pose_somajax.py` falls back to the pure-JAX SVD. The
 SOMA-X side runs on CPU as well (`pose_somax.py --device cpu`).

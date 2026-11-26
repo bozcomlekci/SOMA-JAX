@@ -77,9 +77,9 @@ def resolve_correctives_model_path(
     procedural rig, and the deprecated ``load_correctives_model`` flag still
     works with a ``DeprecationWarning``.
 
-    SOMA-JAX extra: reading ``.pt`` checkpoints needs ``torch``; without it the
-    *default* checkpoint is skipped (a torch-free install gets pure LBS) rather
-    than failing, while an explicit path still fails loudly at load.
+    ``.pt`` checkpoints are read without ``torch`` (:func:`read_torch_checkpoint`),
+    so a torch-free install resolves and loads the default checkpoint as
+    upstream does.
     """
     path_is_default = correctives_model_path is _DEFAULT_CORRECTIVES_MODEL_PATH
     path_is_disabled = correctives_model_path is None
@@ -111,13 +111,7 @@ def resolve_correctives_model_path(
     if path_is_default:
         if not default_enabled:
             return None
-        path = Path(data_root) / _DEFAULT_CORRECTIVES_MODEL_FILENAME
-        if path.suffix == ".pt":
-            try:
-                import torch  # noqa: F401
-            except ImportError:
-                return None
-        return path
+        return Path(data_root) / _DEFAULT_CORRECTIVES_MODEL_FILENAME
 
     if not default_enabled:
         raise ValueError(
@@ -167,11 +161,19 @@ class CorrectivesMLP(eqx.Module):
 
     bindpose: jnp.ndarray            # (J, 3, 3)
     W1: jnp.ndarray                  # (D=J*6, K=J*C)
-    W2: jnp.ndarray                  # (K, 3*V)
     M1_prior: Optional[jnp.ndarray]  # (D, K) -- expanded from M1_mask (J,J)
-    M2_prior: Optional[jnp.ndarray]  # (K, 3*V) -- expanded from M2_mask (J,V)
     M1_mask: Optional[jnp.ndarray]   # (J, J)
     M2_mask: Optional[jnp.ndarray]   # (J, V)
+    # W2 (K, 3V) is held densely only without an M2 mask. With one (every
+    # trained checkpoint) only the weights inside the mask can contribute, so
+    # each joint keeps its (C, n_j, 3) block over the n_j vertices its mask
+    # reaches, with the mask values there: ~14 MiB for the SOMA checkpoint
+    # instead of 2 x 387 MiB for dense W2 and its expanded mask. `W2` and
+    # `M2_prior` are available densely as properties.
+    W2_dense: Optional[jnp.ndarray]  # (K, 3*V) -- only without M2_mask
+    W2_blocks: Optional[tuple]       # per joint (C, n_j, 3) -- W2 rows of the joint
+    W2_block_mask: Optional[tuple]   # per joint (n_j,) -- M2_mask on those vertices
+    W2_block_verts: Optional[tuple]  # per joint (n_j,) int32 -- the vertex ids
 
     def __init__(
         self,
@@ -242,9 +244,7 @@ class CorrectivesMLP(eqx.Module):
         # behaviour and lets callers safely skip the checkpoint without
         # corrupting their LBS output.
         if W2 is None:
-            self.W2 = jnp.zeros((K, 3 * self.n_vertices), dtype=jnp.float32)
-        else:
-            self.W2 = jnp.asarray(W2, dtype=jnp.float32)
+            W2 = np.zeros((K, 3 * self.n_vertices), dtype=np.float32)
 
         # M1 mask: (J, J) joint-to-joint anatomical adjacency. Expanded to
         # the (D=J*6, K=J*C) shape by repeat-interleaving the rows by 6
@@ -268,12 +268,70 @@ class CorrectivesMLP(eqx.Module):
             m2 = np.asarray(M2_mask, dtype=np.float32)
             assert m2.shape == (self.n_joints, self.n_vertices), \
                 f"M2_mask must be (J,V)=({self.n_joints},{self.n_vertices}), got {m2.shape}"
-            prior = np.repeat(np.repeat(m2, self.cors_per_joint, axis=0), 3, axis=1)
-            self.M2_prior = jnp.asarray(prior, dtype=jnp.float32)
             self.M2_mask = jnp.asarray(m2)
+            self.W2_dense = None
+            self.W2_blocks, self.W2_block_mask, self.W2_block_verts = _w2_blocks(
+                W2, m2, self.cors_per_joint)
         else:
-            self.M2_prior = None
             self.M2_mask = None
+            if isinstance(W2, jax.Array):
+                self.W2_dense = W2.astype(jnp.float32)
+            else:
+                self.W2_dense = jnp.asarray(np.asarray(W2, dtype=np.float32))
+            self.W2_blocks = self.W2_block_mask = self.W2_block_verts = None
+
+    # ---- W2 storage -------------------------------------------------------
+    @property
+    def W2(self) -> jnp.ndarray:
+        """The (K, 3V) layer-2 weights, dense (upstream's parameter).
+
+        With an M2 mask, weights outside it contribute nothing and are not
+        kept: they read as zero here (the shipped checkpoint has none).
+        """
+        if self.W2_dense is not None:
+            return self.W2_dense
+        return self._densify_w2(masked=False)
+
+    @property
+    def M2_prior(self) -> Optional[jnp.ndarray]:
+        """``M2_mask`` expanded to W2's (K, 3V) shape, dense (``None`` without it)."""
+        if self.M2_mask is None:
+            return None
+        m2 = jnp.asarray(self.M2_mask)
+        return jnp.repeat(jnp.repeat(m2, self.cors_per_joint, axis=0), 3, axis=1)
+
+    def _densify_w2(self, masked: bool) -> jnp.ndarray:
+        """Dense (K, 3V) W2 (or W2 * M2_prior) assembled from the joint blocks."""
+        C, V = self.cors_per_joint, self.n_vertices
+        W = jnp.zeros((self.n_joints, C, V, 3), jnp.float32)
+        for j, (blk, msk, verts) in enumerate(
+                zip(self.W2_blocks, self.W2_block_mask, self.W2_block_verts)):
+            if masked:
+                blk = blk * msk[None, :, None]
+            W = W.at[j, :, verts, :].set(jnp.swapaxes(blk, 0, 1))
+        return W.reshape(self.n_joints * C, 3 * V)
+
+    def _layer2(self, z: jnp.ndarray) -> jnp.ndarray:
+        """``z @ (W2 * M2_prior)`` -> (..., V, 3), without forming dense W2."""
+        V = self.n_vertices
+        if self.W2_dense is not None:
+            return (z @ self.W2_dense).reshape(z.shape[:-1] + (V, 3))
+        zj = z.reshape(z.shape[:-1] + (self.n_joints, self.cors_per_joint))
+        y = jnp.zeros(z.shape[:-1] + (V, 3), z.dtype)
+        for j, (blk, msk, verts) in enumerate(
+                zip(self.W2_blocks, self.W2_block_mask, self.W2_block_verts)):
+            if blk.shape[1] == 0:
+                continue
+            contrib = jnp.einsum("...c,cnd->...nd", zj[..., j, :], blk * msk[None, :, None])
+            y = y.at[..., verts, :].add(contrib)
+        return y
+
+    def scale_w2(self, scale) -> "CorrectivesMLP":
+        """The model with ``W2`` multiplied by ``scale`` (e.g. a unit change)."""
+        if self.W2_dense is not None:
+            return eqx.tree_at(lambda m: m.W2_dense, self, self.W2_dense * scale)
+        return eqx.tree_at(lambda m: m.W2_blocks, self,
+                           tuple(b * scale for b in self.W2_blocks))
 
     # Upstream's dimension names.
     @property
@@ -335,19 +393,18 @@ class CorrectivesMLP(eqx.Module):
         # values. The masks enforce spatial locality (a finger joint cannot
         # influence vertex positions on the opposite leg).
         W1 = self.W1 * self.M1_prior if self.M1_prior is not None else self.W1
-        W2 = self.W2 * self.M2_prior if self.M2_prior is not None else self.W2
 
         # Step 3 — two-layer MLP: feat (B, D) @ W1 (D, K) -> z (B, K),
-        # ReLU + optional tanh, then z @ W2 (K, 3V) -> y (B, 3V).
+        # ReLU + optional tanh, then z @ (W2 * M2_prior) (K, 3V) -> (B, V, 3),
+        # evaluated joint block by joint block (see `_layer2`).
         z = feat @ W1
         z = jax.nn.relu(z)
         if self.use_tanh:
             z = jnp.tanh(z)
-        y = z @ W2
 
         # Output: per-vertex displacement in the model's output unit (meters
-        # for the trained checkpoint shipped with v0.2.1).
-        return y.reshape(batch_shape + (self.n_vertices, 3))
+        # for the trained checkpoint).
+        return self._layer2(z)
 
     def forward(self, x: jnp.ndarray, V=None, *, training: bool = False,
                 key: Optional[jax.Array] = None) -> dict:
@@ -364,7 +421,6 @@ class CorrectivesMLP(eqx.Module):
         x = x.at[..., 1, 1].add(-1.0)
         features = x[..., :, :2].reshape(B, -1)
         W1 = self.W1 * self.M1_prior if self.M1_prior is not None else self.W1
-        W2 = self.W2 * self.M2_prior if self.M2_prior is not None else self.W2
         z = jax.nn.relu(features @ W1)
         if self.use_tanh:
             z = jnp.tanh(z)
@@ -373,8 +429,8 @@ class CorrectivesMLP(eqx.Module):
                 raise ValueError("training-mode dropout needs a PRNG key")
             keep = jax.random.bernoulli(key, 1.0 - self.dropout_p, z.shape)
             z = jnp.where(keep, z / (1.0 - self.dropout_p), 0.0)
-        y = z @ W2
-        return {"out": y.reshape(B, -1, 3), "z": z, "W2": self.W2, "W2_masked": W2}
+        W2_masked = self.W2_dense if self.W2_dense is not None else self._densify_w2(masked=True)
+        return {"out": self._layer2(z), "z": z, "W2": self.W2, "W2_masked": W2_masked}
 
     __call__ = forward
 
@@ -388,8 +444,13 @@ class CorrectivesMLP(eqx.Module):
         if vertex_mask.shape != (self.n_vertices,):
             raise ValueError(
                 f"vertex_mask must have shape ({self.n_vertices},), got {vertex_mask.shape}")
-        mask = jnp.repeat(vertex_mask.astype(self.W2.dtype), 3)[None]
-        return eqx.tree_at(lambda m: m.W2, self, self.W2 * mask)
+        vertex_mask = vertex_mask.astype(jnp.float32)
+        if self.W2_dense is not None:
+            mask = jnp.repeat(vertex_mask, 3)[None]
+            return eqx.tree_at(lambda m: m.W2_dense, self, self.W2_dense * mask)
+        return eqx.tree_at(lambda m: m.W2_blocks, self, tuple(
+            blk * vertex_mask[verts][None, :, None]
+            for blk, verts in zip(self.W2_blocks, self.W2_block_verts)))
 
     def save_checkpoint(self, path: str, *, native_unit: Unit = Unit.CENTIMETERS,
                         optimizer=None, scheduler=None, meta=None,
@@ -448,9 +509,9 @@ class CorrectivesMLP(eqx.Module):
         """Load a corrective checkpoint (upstream ``load_checkpoint``).
 
         Accepts upstream's ``correctives_model.pt`` directly (read with
-        :func:`load_correctives_pt`, which needs ``torch``), or an ``.npz``
+        :func:`load_correctives_pt`; no ``torch`` needed), or an ``.npz``
         written by ``tools/convert/convert_correctives_pt_to_npz.py`` /
-        :py:meth:`save_checkpoint` (no ``torch``).
+        :py:meth:`save_checkpoint`.
 
         Args:
             path: checkpoint path.
@@ -534,6 +595,106 @@ class CorrectivesMLP(eqx.Module):
         )
 
 
+def _w2_blocks(W2, m2: np.ndarray, C: int):
+    """Split dense (J*C, 3V) ``W2`` into per-joint blocks over each joint's
+    M2-mask support: ``(blocks, mask values, vertex ids)``, one entry per joint."""
+    J, V = m2.shape
+    W = np.asarray(W2, dtype=np.float32).reshape(J, C, V, 3)
+    blocks, values, verts = [], [], []
+    for j in range(J):
+        ids = np.nonzero(m2[j])[0].astype(np.int32)
+        blocks.append(jnp.asarray(W[j][:, ids, :]))
+        values.append(jnp.asarray(m2[j, ids]))
+        verts.append(jnp.asarray(ids))
+    return tuple(blocks), tuple(values), tuple(verts)
+
+
+#: ``torch`` storage class -> NumPy dtype, for :func:`read_torch_checkpoint`.
+_TORCH_STORAGE_DTYPES = {
+    "FloatStorage": "f4", "DoubleStorage": "f8", "HalfStorage": "f2",
+    "LongStorage": "i8", "IntStorage": "i4", "ShortStorage": "i2",
+    "CharStorage": "i1", "ByteStorage": "u1", "BoolStorage": "?",
+}
+
+
+def read_torch_checkpoint(path) -> dict:
+    """Read a ``torch.save`` checkpoint of plain values and tensors with NumPy.
+
+    SOMA-JAX extra, so a torch-free install loads upstream's corrective
+    checkpoint as upstream's default layer does. Handles the zip format
+    ``torch.save`` has written since PyTorch 1.6: dense tensors
+    (``_rebuild_tensor_v2``) and sparse COO tensors
+    (``_rebuild_sparse_tensor``, densified) in nested dicts / lists of plain
+    values. Like ``torch.load(weights_only=True)`` it unpickles nothing else —
+    any other global raises ``pickle.UnpicklingError`` — so it cannot run code
+    from the file.
+
+    Returns:
+        The checkpoint with every tensor as a NumPy array.
+    """
+    import collections
+    import io
+    import pickle
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        pkl = next((n for n in names if n == "data.pkl" or n.endswith("/data.pkl")), None)
+        if pkl is None:
+            raise pickle.UnpicklingError(f"{path}: not a torch zip checkpoint")
+        prefix = pkl[: -len("data.pkl")]
+        order = "little"
+        if prefix + "byteorder" in names:
+            order = zf.read(prefix + "byteorder").decode().strip()
+        endian = "<" if order == "little" else ">"
+
+        class _StorageType:
+            def __init__(self, name):
+                self.dtype = np.dtype(endian + _TORCH_STORAGE_DTYPES[name])
+
+        def rebuild_tensor(storage, offset, size, stride, *_unused):
+            if len(size) == 0:
+                return storage[offset].copy()
+            strides = tuple(int(s) * storage.itemsize for s in stride)
+            return np.lib.stride_tricks.as_strided(
+                storage[offset:], shape=tuple(size), strides=strides).copy()
+
+        def rebuild_sparse(layout, data):
+            if layout != "torch.sparse_coo":
+                raise pickle.UnpicklingError(f"{path}: unsupported sparse layout {layout}")
+            indices, values, size = data[0], data[1], tuple(data[2])
+            dense = np.zeros(size, values.dtype)
+            np.add.at(dense, tuple(np.asarray(indices, np.int64)), values)
+            return dense
+
+        allowed = {
+            ("collections", "OrderedDict"): collections.OrderedDict,
+            ("torch._utils", "_rebuild_tensor_v2"): rebuild_tensor,
+            ("torch._utils", "_rebuild_sparse_tensor"): rebuild_sparse,
+            ("torch.serialization", "_get_layout"): str,
+            ("torch", "Size"): tuple,
+        }
+
+        class _Unpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if module == "torch" and name in _TORCH_STORAGE_DTYPES:
+                    return _StorageType(name)
+                try:
+                    return allowed[(module, name)]
+                except KeyError:
+                    raise pickle.UnpicklingError(
+                        f"{path}: {module}.{name} is not a tensor or plain value") from None
+
+            def persistent_load(self, pid):
+                kind, storage_type, key, _location, numel = pid
+                if kind != "storage":
+                    raise pickle.UnpicklingError(f"{path}: unknown persistent id {kind!r}")
+                return np.frombuffer(zf.read(f"{prefix}data/{key}"),
+                                     dtype=storage_type.dtype, count=int(numel))
+
+        return _Unpickler(io.BytesIO(zf.read(pkl))).load()
+
+
 def load_correctives_pt(path) -> dict:
     """Read upstream's ``.pt`` corrective checkpoint into plain arrays.
 
@@ -542,10 +703,12 @@ def load_correctives_pt(path) -> dict:
     it by ``native_unit.meters_per_unit / output_unit.meters_per_unit`` at load
     time; SOMA-JAX works in metres, so the scale is applied here once.
 
-    Needs ``torch`` (imported lazily; only for this call). Mirrors upstream's
-    SOMA-X v0.3.3 loading guard: before PyTorch 2.8 sparse validation pins
-    memory and re-initializes CUDA inside forked DataLoader workers
-    (pytorch/pytorch#153143), so the validator is bypassed only there.
+    Reads the file with :func:`read_torch_checkpoint`, so ``torch`` is not
+    needed; a checkpoint outside what that reader handles falls back to
+    ``torch.load(weights_only=True)`` where torch is installed, with upstream's
+    SOMA-X v0.3.3 guard: before PyTorch 2.8 sparse validation pins memory and
+    re-initializes CUDA inside forked DataLoader workers (pytorch/pytorch#153143),
+    so the validator is bypassed only there.
 
     Args:
         path: the ``.pt`` checkpoint.
@@ -554,25 +717,35 @@ def load_correctives_pt(path) -> dict:
         ``C_max``, ``use_tanh``, ``bindpose``, ``W1``, ``W2`` and, when present,
         ``M1_mask``, ``M2_mask``, ``joint_indices``, ``source_num_joints``.
     """
-    import torch
+    import pickle
 
-    # weights_only=True, as upstream: the checkpoint is tensors plus a meta
-    # dict of plain values, and nothing else is ever unpickled.
-    if torch.__version__ < "2.8" and torch.cuda._is_in_bad_fork():
-        orig = torch._utils._validate_loaded_sparse_tensors
-        torch._utils._validate_loaded_sparse_tensors = lambda: None
+    try:
+        ck = read_torch_checkpoint(path)
+    except (pickle.UnpicklingError, KeyError, ValueError) as err:
         try:
+            import torch
+        except ImportError:
+            raise RuntimeError(
+                f"{path}: cannot read this checkpoint without torch ({err})") from err
+        # weights_only=True, as upstream: the checkpoint is tensors plus a meta
+        # dict of plain values, and nothing else is ever unpickled.
+        if torch.__version__ < "2.8" and torch.cuda._is_in_bad_fork():
+            orig = torch._utils._validate_loaded_sparse_tensors
+            torch._utils._validate_loaded_sparse_tensors = lambda: None
+            try:
+                ck = torch.load(path, map_location="cpu", weights_only=True)
+            finally:
+                torch._utils._validate_loaded_sparse_tensors = orig
+                torch._utils._sparse_tensors_to_validate.clear()
+        else:
             ck = torch.load(path, map_location="cpu", weights_only=True)
-        finally:
-            torch._utils._validate_loaded_sparse_tensors = orig
-            torch._utils._sparse_tensors_to_validate.clear()
-    else:
-        ck = torch.load(path, map_location="cpu", weights_only=True)
 
     def dense(t):
-        if torch.is_tensor(t) and t.is_sparse:
+        if hasattr(t, "is_sparse") and t.is_sparse:          # a torch tensor
             t = t.to_dense()
-        return np.asarray(t, dtype=np.float32) if torch.is_tensor(t) else np.asarray(t)
+        if hasattr(t, "numpy"):
+            return np.asarray(t.numpy(), dtype=np.float32)
+        return np.asarray(t, dtype=np.float32)
 
     native = str(ck.get("unit", "centimeters")).lower()
     scale = {"centimeters": 0.01, "millimeters": 0.001, "meters": 1.0}.get(native, 0.01)
@@ -587,7 +760,9 @@ def load_correctives_pt(path) -> dict:
         if key in ck:
             out[key] = dense(ck[key])
     if "joint_indices" in ck:
-        out["joint_indices"] = np.asarray(ck["joint_indices"], dtype=np.int64)
+        idx = ck["joint_indices"]
+        out["joint_indices"] = np.asarray(idx.numpy() if hasattr(idx, "numpy") else idx,
+                                          dtype=np.int64)
     if "source_num_joints" in ck:
         out["source_num_joints"] = np.int32(int(ck["source_num_joints"]))
     return out

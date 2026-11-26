@@ -278,12 +278,12 @@ def pose_soma_identity_sequence(soma_path, identity_type, identity_path, soma_po
     if correctives is not None:
         import correctives_jax as cj
         if rest_verts is None:
-            rest_verts, rest_joints = layer.prepare_identity(id_coeffs[None], repose_to_bind_pose=False, skeleton_fit="linear")
+            rest_verts, rest_joints = layer.prepare_identity_arrays(id_coeffs[None], repose_to_bind_pose=False, skeleton_fit="linear")
             rest_verts, rest_joints = rest_verts[0], rest_joints[0]
         for i in range(T):
             R = jax.vmap(axis_angle_to_rotmat)(jnp.asarray(soma_poses[i]))   # (J,3,3)
             offset = cj.corrective_offsets(R, correctives)                   # (V,3)
-            out = layer.pose(R[None], jnp.asarray(transl_arr[i:i+1]),
+            out = layer.pose_arrays(R[None], jnp.asarray(transl_arr[i:i+1]),
                              (rest_verts + offset)[None], rest_joints[None])
             verts.append(np.array(out.vertices[0]))
             joints.append(np.array(out.joints[0]))
@@ -295,7 +295,7 @@ def pose_soma_identity_sequence(soma_path, identity_type, identity_path, soma_po
     for i in range(T):
         if rest_verts is not None:
             R = jax.vmap(axis_angle_to_rotmat)(jnp.asarray(soma_poses[i]))
-            out = layer.pose(R[None], jnp.asarray(transl_arr[i:i+1]),
+            out = layer.pose_arrays(R[None], jnp.asarray(transl_arr[i:i+1]),
                              rest_verts[None], rest_joints[None])
             verts.append(np.array(out.vertices[0]))
             joints.append(np.array(out.joints[0]))
@@ -661,14 +661,14 @@ def main():
 
     # 1. Rest mesh (zero shape)
     zero_identity = jnp.asarray(fit_identity_coeffs(None, layer))
-    rest_verts, _ = layer.prepare_identity(zero_identity, repose_to_bind_pose=False, skeleton_fit="linear")
+    rest_verts, _ = layer.prepare_identity_arrays(zero_identity, repose_to_bind_pose=False, skeleton_fit="linear")
     verts_rest = np.array(rest_verts[0])
     print("\n[1/3] Computed rest mesh (zero shape)")
 
     # 2. Custom shape
     rng = np.random.default_rng(0)
     coeffs = jnp.asarray(fit_identity_coeffs(rng.standard_normal((1, 10)) * 0.5, layer))
-    custom_verts, _ = layer.prepare_identity(coeffs, repose_to_bind_pose=False, skeleton_fit="linear")
+    custom_verts, _ = layer.prepare_identity_arrays(coeffs, repose_to_bind_pose=False, skeleton_fit="linear")
     verts_custom = np.array(custom_verts[0])
     print("[2/3] Computed mesh with custom shape coefficients")
 
@@ -1030,7 +1030,7 @@ def main():
                             # via soma_jax's identity model (one-shot, neutral coeffs).
                             tmp = load_layer(args.soma_model, identity_model_type=id_type,
                                                  identity_model_path=id_path)
-                            rv, _ = tmp.prepare_identity(jnp.asarray(fit_identity_coeffs(None, tmp)),
+                            rv, _ = tmp.prepare_identity_arrays(jnp.asarray(fit_identity_coeffs(None, tmp)),
                                                          repose_to_bind_pose=False, skeleton_fit="linear")
                             bs = np.asarray(rv[0]).astype(np.float32)
                         # Anchor each identity's feet to Y=0 so the regressor-fit joints

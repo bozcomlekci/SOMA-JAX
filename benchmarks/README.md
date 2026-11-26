@@ -3,7 +3,10 @@
 Reproducing (and extending) the SOMA paper's **Table 4 (Runtime performance)**
 ([arXiv:2603.16858](https://arxiv.org/abs/2603.16858) — the paper is not
 distributed with this repo) against SOMA-X v0.3.3 on a single NVIDIA
-**RTX 5080 (16 GB)** in the `body` conda env. Two experiments:
+**RTX 5080 (16 GB)** in the `body` conda env. The port now tracks v0.3.6;
+v0.3.4–v0.3.6 changed the corrective weights and added the USD animation API,
+none of which these LBS-only timings run, so they were not re-measured. Two
+experiments:
 
 * **Runtime** — forward-pass time & throughput vs batch size.
 * **Memory** — peak GPU memory vs batch size.
