@@ -1,21 +1,31 @@
-"""A real walk on the SOMA rig: CMU motion capture -> SOMA-JAX -> render.
+"""Real motion capture on the SOMA rig: CMU mocap -> SOMA-JAX -> render.
 
-Fetches a walking trial from the CMU Graphics Lab Motion Capture Database
-(mocap.cs.cmu.edu: an ASF skeleton and an AMC motion, captured at 120 fps),
-retargets it onto the SOMA skeleton, poses the SOMA body with SOMA-JAX and
-renders it headless::
+Fetches a trial from the CMU Graphics Lab Motion Capture Database
+(mocap.cs.cmu.edu: an ASF skeleton and an AMC motion), retargets it onto the
+SOMA skeleton, poses the SOMA body with SOMA-JAX and renders it headless::
 
-    python tools/pipeline/demo_motion.py                    # trial 35_08, "walk"
-    python tools/pipeline/demo_motion.py --trial 07_01 --width 1280 --height 720
-    python tools/pipeline/demo_motion.py --skeleton         # SOMA skeleton in a see-through body
+    python tools/pipeline/demo_motion.py                     # a walk (CMU 35_08)
+    python tools/pipeline/demo_motion.py --motion cartwheel  # an example; --list shows them
+    python tools/pipeline/demo_motion.py --gallery           # every example, and a gallery
+    python tools/pipeline/demo_motion.py --trial 14_01 --start 5 --seconds 4   # any trial
+    python tools/pipeline/demo_motion.py --skeleton          # SOMA skeleton in a see-through body
     python tools/pipeline/demo_motion.py --identity-model garment_measurement \\
         --identity-path assets/identity/identity_garment.npz --identity-coeffs 1.5 -1 0.5
 
-Writes to ``--output-dir`` (default ``demo_renders/walk``): ``walk.gif``,
-``walk.mp4`` (when imageio-ffmpeg is installed), ``walk_strip.png`` (a pose
-every ``--strip-every`` seconds in one picture) and ``walk.soma.npz``, the
+A motion writes to ``demo_renders/<name>`` (or ``--output-dir``): ``<name>.gif``,
+``<name>.mp4`` (when imageio-ffmpeg is installed), ``<name>_strip.png`` (a pose
+every ``--strip-every`` seconds in one picture) and ``<name>.soma.npz``, the
 retargeted motion in SOMA's NPZ format, which the other tools replay
 (``tools/vis/vis_pyrender.py --animation demo_renders/walk/walk.soma.npz``).
+``--gallery`` renders every example that way and then ``demo_renders/gallery``:
+``gallery.gif`` (and ``.mp4``) plays them side by side, ``gallery.png`` holds
+their strips.
+
+Staging. A motion that travels (the hips end over a metre from where they
+start) is turned to travel along X, front rather than back to the camera
+(a cartwheel faces it), and the camera follows; a motion in place is turned
+three-quarters to a camera that holds still. Grounding puts the feet on the
+floor in all but the lowest 5% of frames.
 
 Retargeting. The ASF skeleton rests in a T-pose facing +Z with its left side
 on +X, as SOMA's does, and every ASF rest frame is world-aligned, so a bone's
@@ -38,7 +48,7 @@ Data: "The data used in this project was obtained from mocap.cs.cmu.edu. The
 database was created with funding from NSF EIA-0196217." The clips may be used
 freely, in commercial products too, but not resold; they are downloaded on
 first use into ``assets/third_party/cmu_mocap`` and are not part of this
-repository.
+repository. Most were captured at 120 fps; the subjects in ``CMU_60FPS`` at 60.
 """
 from __future__ import annotations
 
@@ -59,7 +69,32 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 CMU_URL = "http://mocap.cs.cmu.edu/subjects/{subject}/{name}"
 CMU_FPS = 120.0
-DEFAULT_TRIAL = "35_08"            # subject 35, trial 8: "walk"
+#: Subjects (and the one trial) the CMU motion index lists at 60 fps, not 120.
+CMU_60FPS = {33, 34, 42, 60, 61, 62, 74, 75, 77, 79, 80, 87, 88, 89, "136_19"}
+
+#: Example motions: name -> (CMU trial, start (s), length (s) or None for the
+#: rest of the trial, caption).
+EXAMPLES = {
+    "walk": ("35_08", 0.0, None, "walk"),
+    "run": ("16_55", 0.0, None, "run"),
+    "jump": ("13_11", 0.8, 2.2, "forward jump"),
+    "cartwheel": ("90_02", 2.6, 2.6, "cartwheel"),
+    "backflip": ("87_03", 1.6, 2.4, "backflip"),
+    "charleston": ("93_03", 0.0, None, "Charleston"),
+    "ballet": ("05_17", 3.2, 4.2, "ballet: grand jete"),
+    "boxing": ("13_17", 7.3, 4.0, "boxing"),
+    "kick": ("135_07", 3.0, 4.0, "karate: roundhouse kick"),
+    "basketball": ("124_05", 2.0, 3.0, "basketball: jump shot"),
+    "jumping-jacks": ("13_29", 0.0, 4.0, "jumping jacks"),
+    "pitch": ("124_01", 1.6, 3.6, "baseball pitch"),
+}
+
+
+def cmu_fps(trial: str) -> float:
+    """Capture rate of a CMU trial such as ``"35_08"`` (see :data:`CMU_60FPS`)."""
+    subject = trial.split("_")[0]
+    slow = trial in CMU_60FPS or (subject.isdigit() and int(subject) in CMU_60FPS)
+    return 60.0 if slow else CMU_FPS
 
 #: SOMA joint -> (CMU bone whose world rotation drives it, SOMA child joint that
 #: ends the joint's bone). ``None``: the pelvis, which has no single bone
@@ -269,12 +304,38 @@ def retarget_to_soma(asf: dict, W: dict, end: dict, joint_names, parents, tpose_
     return local, end["root"] * scale, scale
 
 
-def heading_yaw(path: np.ndarray) -> np.ndarray:
-    """Rotation about +Y that turns the start-to-end walking direction to +X."""
-    d = path[-1] - path[0]
-    a = np.arctan2(d[2], d[0])
-    c, s = np.cos(a), np.sin(a)
+def yaw_matrix(angle: float) -> np.ndarray:
+    """Rotation by ``angle`` radians about +Y (positive turns +Z towards +X)."""
+    c, s = np.cos(angle), np.sin(angle)
     return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+def heading_yaw(path: np.ndarray) -> np.ndarray:
+    """Rotation about +Y that turns the start-to-end direction of travel to +X."""
+    d = path[-1] - path[0]
+    return yaw_matrix(np.arctan2(d[2], d[0]))
+
+
+def stage_yaw(path, root_rot, azimuth_deg: float = 15.0, travel: float = 1.0):
+    """Rotation about +Y that stages a motion for a camera ``azimuth_deg`` round
+    from +Z towards +X.
+
+    A motion whose ``path`` (T, 3) ends more than ``travel`` metres from where it
+    starts turns to travel along +X, or -X where +X would show the camera the
+    performer's back; one in place turns to face 35 degrees past the camera.
+    ``root_rot`` (T, 3, 3) are the pelvis's world rotations away from rest,
+    which faces +Z. Returns ``(G, travels)``.
+    """
+    face = root_rot @ np.array([0.0, 0.0, 1.0])
+    upright = (root_rot @ np.array([0.0, 1.0, 0.0]))[:, 1] > 0.5   # not mid-flip
+    face = (face[upright] if upright.any() else face).mean(0) * [1.0, 0.0, 1.0]
+    d = path[-1] - path[0]
+    if np.hypot(d[0], d[2]) > travel:
+        G = heading_yaw(path)
+        if (G @ face)[2] < -0.3 * np.linalg.norm(face):
+            G = yaw_matrix(np.pi) @ G
+        return G, True
+    return yaw_matrix(np.radians(azimuth_deg + 35.0) - np.arctan2(face[0], face[2])), False
 
 
 def bone_direction_error(joints_soma, asf, W, G, joint_names, tpose_joints, frames=slice(None)):
@@ -308,16 +369,16 @@ def look_at(eye, target, up=(0.0, 1.0, 0.0)) -> np.ndarray:
     return pose
 
 
-def fit_camera(box_min, box_max, width: int, height: int, azimuth_deg: float = 15.0,
+def fit_camera(points, width: int, height: int, azimuth_deg: float = 15.0,
                elevation_deg: float = 8.0, yfov: float = np.pi / 3.0,
-               fill: float = 0.9) -> np.ndarray:
-    """Camera in front of a box (a walk along X), turned ``azimuth_deg`` towards
-    +X and raised ``elevation_deg``, pulled back until every corner of the box
-    projects inside ``fill`` of the frame."""
-    box_min, box_max = np.asarray(box_min, np.float64), np.asarray(box_max, np.float64)
-    corners = np.stack(np.meshgrid(*zip(box_min, box_max, strict=True), indexing="ij"),
-                        -1).reshape(-1, 3)
-    target = (box_min + box_max) / 2
+               fill: float = 0.85) -> np.ndarray:
+    """Camera on the +Z side of ``points`` (..., 3), turned ``azimuth_deg``
+    towards +X and raised ``elevation_deg``, aimed at the middle of their
+    bounding box and pulled back until every point projects inside ``fill`` of
+    the frame (pass a subsample of the vertices: that frames the body itself,
+    which a box round it would not)."""
+    corners = np.asarray(points, np.float64).reshape(-1, 3)
+    target = (corners.min(0) + corners.max(0)) / 2
     a, e = np.radians(azimuth_deg), np.radians(elevation_deg)
     view = np.array([np.sin(a) * np.cos(e), np.sin(e), np.cos(a) * np.cos(e)])
     tan_y = np.tan(yfov / 2)
@@ -361,14 +422,271 @@ def checker_floor(x_range, z_range, tile: float = 0.5):
     return meshes
 
 
+BODY_COLOR = (0.55, 0.7, 0.9)
+
+
+def save_gif(images, path, fps: float):
+    """Frames (arrays or PIL images) -> looping GIF that plays in real time:
+    GIF delays are whole centiseconds, so 33.3 ms frames go out as 30/40/30 ms
+    rather than all 30 ms, which would run 10% fast."""
+    from PIL import Image
+    frames = [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
+    ticks = np.round(np.arange(len(frames) + 1) * 100.0 / fps).astype(int)
+    frames[0].save(path, save_all=True, append_images=frames[1:],
+                   duration=[int(d) * 10 for d in np.diff(ticks)], loop=0, optimize=True)
+
+
+def save_mp4(images, path, fps: float) -> bool:
+    """Frames -> MP4 when imageio and imageio-ffmpeg are installed (else False)."""
+    try:
+        import imageio.v2 as imageio
+        import imageio_ffmpeg  # noqa: F401
+    except ImportError:
+        return False
+    # imageio-ffmpeg runs os.setpgrp in the forked child before it starts ffmpeg
+    # unless told not to; Python running between fork and exec can deadlock a
+    # process that has JAX's threads (JAX warns as much), a plain fork-exec not.
+    os.environ.setdefault("IMAGEIO_FFMPEG_NO_PREVENT_SIGINT", "1")
+    imageio.mimsave(path, [np.asarray(im) for im in images], fps=fps, quality=8,
+                    macro_block_size=2)
+    return True
+
+
+def load_clip(asf_path, amc_path, source_fps: float, fps: float, start: float = 0.0,
+              seconds: float | None = None):
+    """Parse an ASF/AMC pair, keep ``seconds`` from ``start`` (the rest of the
+    trial when None) and resample to about ``fps``.
+
+    Returns ``(asf, W, end, fps)``: :func:`cmu_forward_kinematics` of the clip
+    and the frame rate it ends up at.
+    """
+    asf = parse_asf(Path(asf_path).read_text())
+    frames = parse_amc(Path(amc_path).read_text())
+    first = int(round(start * source_fps))
+    last = len(frames) if seconds is None else first + int(round(seconds * source_fps))
+    clip = frames[first:last]
+    if len(clip) < 2:
+        sys.exit(f"{amc_path}: {len(frames) / source_fps:.1f} s long, nothing left "
+                 f"from {start:g} s")
+    stride = max(1, int(round(source_fps / fps)))
+    W, end = cmu_forward_kinematics(asf, clip[::stride])
+    return asf, W, end, source_fps / stride
+
+
+def pose_clip(layer, coeffs, asf, W, end, tpose, azimuth_deg: float) -> dict:
+    """Retarget a clip onto SOMA, stage it for the camera (:func:`stage_yaw`),
+    pose the body in one jitted batch and stand it on y = 0.
+
+    Returns a dict: ``local`` (T, J, 3, 3) pose input, ``hips`` (T, 3) path,
+    posed ``verts`` and ``joints``, whether it ``travels``, the stride
+    ``scale`` and ``err``, the largest :func:`bone_direction_error` (degrees).
+    """
+    import equinox as eqx
+    import jax.numpy as jnp
+
+    from soma_jax import SOMAParams
+    names, parents = list(layer.public_joint_names), layer.parents
+    local, hips, scale = retarget_to_soma(asf, W, end, names, parents, tpose)
+    G, travels = stage_yaw(hips, W["root"], azimuth_deg)
+    hip = names.index("Hips")
+    local[:, hip] = G @ local[:, hip]
+    hips = hips @ G.T
+    hips[:, [0, 2]] -= hips[:, [0, 2]].mean(0)
+    T = local.shape[0]
+    out = eqx.filter_jit(layer)(SOMAParams(
+        poses=jnp.asarray(local, jnp.float32), transl=jnp.asarray(hips, jnp.float32),
+        identity_coeffs=jnp.broadcast_to(jnp.asarray(coeffs), (T, len(coeffs)))))
+    verts, joints = np.array(out.vertices), np.array(out.joints)      # writable copies
+    ground = float(np.percentile(verts[..., 1].min(axis=1), 5))      # feet on y = 0
+    verts[..., 1] -= ground
+    joints[..., 1] -= ground
+    hips[:, 1] -= ground
+    err = bone_direction_error(joints.astype(np.float64), asf, W, G, names, tpose)
+    return {"local": local, "hips": hips, "verts": verts, "joints": joints,
+            "travels": travels, "scale": scale, "err": err}
+
+
+def _floor_for(lo_x: float, hi_x: float, cameras):
+    """Tiled floor wide enough for the motion, ending behind the nearest camera."""
+    near = max(float(c[2, 3]) for c in cameras) + 2.0
+    return checker_floor((lo_x - 12.0, hi_x + 12.0), (-40.0, near))
+
+
+def render_clip(verts, faces, hips, fps: float, camera: str, width: int, height: int,
+                azimuth_deg: float, joints=None, parents=None):
+    """Render every frame. ``camera``: "follow" frames the performer at one
+    distance and slides along X with the hips' path, averaged over ~1 s (odd
+    reflection at the ends keeps a steady motion centred there too), so the
+    shot neither zooms nor jerks; "fixed" holds the whole motion."""
+    from demo_soma_vis import _make_ground_and_shadow, render_mesh_png
+    T = len(verts)
+    lo, hi = verts.reshape(-1, 3).min(0), verts.reshape(-1, 3).max(0)
+    every = max(1, T // 300)                  # every frame of a clip, every 20th vertex:
+    sample = verts[::every, ::20].copy()      # enough to frame the body at its extremes
+    cams = [fit_camera(sample, width, height, azimuth_deg)] * T
+    if camera == "follow":
+        k = max(1, min(int(round(fps / 2)), T - 1))
+        padded = np.pad(hips[:, 0], k, mode="reflect", reflect_type="odd")
+        track = np.convolve(padded, np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
+        sample[..., 0] -= track[::every, None]              # the body relative to the track
+        window = fit_camera(sample, width, height, azimuth_deg)
+        cams = []
+        for t in range(T):
+            cams.append(window.copy())
+            cams[-1][0, 3] += track[t]
+    floor = _floor_for(lo[0], hi[0], cams)
+    images = []
+    for t in range(T):
+        skel = ({} if joints is None else
+                {"joints": joints[t], "parents": np.asarray(parents), "body_alpha": 0.45})
+        shadow = _make_ground_and_shadow(verts[t], faces)[1]
+        images.append(render_mesh_png(verts[t], faces, None, width, height, color=BODY_COLOR,
+                                      camera_pose=cams[t], extra_meshes=floor + [shadow],
+                                      **skel))
+    return images
+
+
+def strip_offsets(x, widths, factor: float = 0.8) -> np.ndarray:
+    """Shifts along X that keep poses at path positions ``x`` in order, each at
+    least ``factor`` times the median body width past the one before (so a
+    motion in place lines up evenly). Returns one shift per pose."""
+    x = np.asarray(x, np.float64)
+    way = 1.0 if x[-1] >= x[0] else -1.0
+    step = factor * float(np.median(widths))
+    shift = np.zeros(len(x))
+    for k in range(1, len(x)):
+        shift[k] = shift[k - 1] + max(0.0, step - way * (x[k] - x[k - 1]))
+    return way * shift
+
+
+def render_strip(verts, faces, hips, picks, width: int, height: int, azimuth_deg: float,
+                 path):
+    """The poses ``picks`` in one picture, spaced by :func:`strip_offsets`."""
+    from demo_soma_vis import _make_ground_and_shadow, render_mesh_png
+    poses = [verts[t].copy() for t in picks]
+    for v, dx in zip(poses, strip_offsets(hips[picks, 0], [np.ptp(v[:, 0]) for v in poses]),
+                     strict=True):
+        v[:, 0] += dx
+    strip_v = np.concatenate(poses)
+    strip_f = np.concatenate([faces + k * verts.shape[1] for k in range(len(poses))])
+    cam = fit_camera(strip_v[::10], width, height, azimuth_deg)
+    floor = _floor_for(strip_v[:, 0].min(), strip_v[:, 0].max(), [cam])
+    return render_mesh_png(strip_v, strip_f, str(path), width, height, color=BODY_COLOR,
+                           camera_pose=cam,
+                           extra_meshes=floor + [_make_ground_and_shadow(strip_v, strip_f)[1]])
+
+
+def run_motion(layer, coeffs, tpose, name: str, caption: str, asf_path, amc_path,
+               source_fps: float, args, start: float = 0.0, seconds: float | None = None,
+               out_dir=None):
+    """Load, retarget, pose and render one clip into ``out_dir`` (default
+    ``demo_renders/<name>``). Returns ``(frames, fps, strip)``."""
+    import jax.numpy as jnp
+    from _common import ensure_headless_gl
+
+    from soma_jax import save_soma_npz
+    from soma_jax.geometry.transforms import rotmat_to_axis_angle
+    out_dir = Path(out_dir or REPO / "demo_renders" / name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    asf, W, end, fps = load_clip(asf_path, amc_path, source_fps, args.fps, start, seconds)
+    T, source = W["root"].shape[0], f"CMU {Path(amc_path).stem}"
+    print(f"{caption} ({source}, {start:g} s in): {T} frames at {fps:g} fps ({T / fps:.1f} s)")
+    m = pose_clip(layer, coeffs, asf, W, end, tpose, args.azimuth)
+    hips = m["hips"]
+    moved = float(np.linalg.norm(hips[-1, [0, 2]] - hips[0, [0, 2]]))
+    print(f"  retargeted: stride scale {m['scale']:.3f}, " + (
+        f"travels {moved:.2f} m ({moved / (T / fps):.2f} m/s)" if m["travels"] else "in place"))
+    print(f"  posed {m['verts'].shape[1]} vertices x {T} frames; posed bones turn with the "
+          f"captured ones to {m['err']:.2g} deg")
+    save_soma_npz(str(out_dir / f"{name}.soma.npz"), np.asarray(rotmat_to_axis_angle(
+        jnp.asarray(m["local"], jnp.float32))), hips, list(layer.public_joint_names),
+        args.identity_model, np.asarray(coeffs)[None], absolute_pose=False,
+        extra_arrays={"fps": np.asarray(fps), "source": np.asarray(source)})
+
+    ensure_headless_gl()                 # before the first pyrender import
+    camera = args.camera if args.camera != "auto" else ("follow" if m["travels"] else "fixed")
+    faces = np.asarray(layer.faces)
+    t0 = time.time()
+    images = render_clip(m["verts"], faces, hips, fps, camera, args.width, args.height,
+                         args.azimuth, *((m["joints"], layer.parents) if args.skeleton else ()))
+    print(f"  rendered {T} frames ({camera} camera) in {time.time() - t0:.1f} s")
+    save_gif(images, out_dir / f"{name}.gif", fps)
+    print(f"  wrote {out_dir / f'{name}.gif'}")
+    if save_mp4(images, out_dir / f"{name}.mp4", fps):
+        print(f"  wrote {out_dir / f'{name}.mp4'}")
+    else:
+        print(f"  ({name}.mp4 needs imageio and imageio-ffmpeg: "
+              "pip install imageio imageio-ffmpeg)")
+
+    # One pose every --strip-every seconds; at most 10 along a path, 8 in place.
+    every = max(1, int(round(args.strip_every * fps)), -(-T // (10 if m["travels"] else 8)))
+    picks = list(range(0, T, every))
+    strip = render_strip(m["verts"], faces, hips, picks, args.width, args.height,
+                         args.azimuth, out_dir / f"{name}_strip.png")
+    print(f"  wrote {out_dir / f'{name}_strip.png'} ({len(picks)} poses)")
+    return images, fps, strip
+
+
+def compose_gallery(clips, out_dir, cols: int = 4, tile=(384, 216), fps: float = 15.0):
+    """Lay out ``clips`` [(caption, frames, fps, strip), ...]: ``gallery.gif``
+    (and ``.mp4``) plays them side by side, each looping, at ``fps``, and
+    ``gallery.png`` holds their strips. Returns the paths written."""
+    from PIL import Image, ImageDraw, ImageFont
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        font = ImageFont.load_default(size=max(10, tile[1] // 14))
+    except TypeError:                                # Pillow < 10.1: fixed size
+        font = ImageFont.load_default()
+    rows = -(-len(clips) // cols)
+    tw, th = tile
+
+    def sheet(images, captions, size):
+        out = Image.new("RGB", (cols * size[0], rows * size[1]), "white")
+        draw = ImageDraw.Draw(out)
+        for i, (im, text) in enumerate(zip(images, captions, strict=True)):
+            x, y = (i % cols) * size[0], (i // cols) * size[1]
+            if not isinstance(im, Image.Image):
+                im = Image.fromarray(np.asarray(im))
+            out.paste(im if im.size == size else im.resize(size, Image.LANCZOS), (x, y))
+            draw.text((x + 8, y + 6), text, fill=(25, 25, 25), font=font)
+        return out
+
+    captions = [c[0] for c in clips]
+    shrunk = [[f if isinstance(f, Image.Image) and f.size == tile
+               else Image.fromarray(np.asarray(f)).resize(tile, Image.LANCZOS) for f in c[1]]
+              for c in clips]
+    seconds = max(len(c[1]) / c[2] for c in clips)
+    frames = [sheet([s[int(k * c[2] / fps) % len(s)] for s, c in zip(shrunk, clips, strict=True)],
+                    captions, tile) for k in range(max(1, int(round(seconds * fps))))]
+    written = [out_dir / "gallery.gif"]
+    save_gif(frames, written[0], fps)
+    if save_mp4(frames, out_dir / "gallery.mp4", fps):
+        written.append(out_dir / "gallery.mp4")
+    sheet([c[3] for c in clips], captions, (2 * tw, 2 * th)).save(out_dir / "gallery.png")
+    return written + [out_dir / "gallery.png"]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--trial", default=DEFAULT_TRIAL,
-                   help="CMU trial id, subject_trial (default 35_08; 07_01-07_12, 08_01-08_10 "
-                        "and 35_01-35_16 are walks)")
+    p.add_argument("--motion", default="walk", choices=list(EXAMPLES),
+                   help="an example motion (default walk; --list describes them)")
+    p.add_argument("--list", action="store_true", help="list the example motions and exit")
+    p.add_argument("--gallery", action="store_true",
+                   help="render every example (or --motions) and a gallery of them")
+    p.add_argument("--motions", nargs="+", choices=list(EXAMPLES), default=None,
+                   help="the examples --gallery renders (default: all)")
+    p.add_argument("--trial", default=None,
+                   help="any CMU trial instead of an example: subject_trial, e.g. 49_06")
     p.add_argument("--asf", default=None, help="local ASF file instead of downloading")
     p.add_argument("--amc", default=None, help="local AMC file instead of downloading")
+    p.add_argument("--start", type=float, default=None,
+                   help="seconds into the trial to start (default: the example's, else 0)")
+    p.add_argument("--seconds", type=float, default=None,
+                   help="length of the clip (default: the example's, else the whole trial)")
+    p.add_argument("--source-fps", type=float, default=None,
+                   help="capture rate of the AMC (default: CMU's for the trial, 120 or 60)")
     p.add_argument("--soma-model", default=None,
                    help="SOMA asset: NVIDIA's SOMA_neutral.npz or a SOMA-JAX archive "
                         "(default: build from the resolved upstream assets)")
@@ -379,142 +697,72 @@ def main():
     p.add_argument("--fps", type=float, default=30.0, help="output frame rate")
     p.add_argument("--width", type=int, default=960)
     p.add_argument("--height", type=int, default=540)
-    p.add_argument("--camera", choices=["follow", "fixed"], default="follow",
-                   help="follow: track the walker (default); fixed: one shot holding the "
-                        "whole walk, as walk_strip.png uses")
+    p.add_argument("--camera", choices=["auto", "follow", "fixed"], default="auto",
+                   help="follow the performer, or fixed: one shot holding the whole motion "
+                        "(default auto: follow a motion that travels)")
     p.add_argument("--azimuth", type=float, default=15.0,
                    help="degrees the camera is turned from a pure side view")
     p.add_argument("--skeleton", action="store_true",
                    help="draw the SOMA skeleton inside a see-through body")
     p.add_argument("--strip-every", type=float, default=0.4,
-                   help="seconds between the poses of walk_strip.png")
-    p.add_argument("--output-dir", default=str(REPO / "demo_renders" / "walk"))
+                   help="seconds between the poses of <name>_strip.png")
+    p.add_argument("--output-dir", default=None,
+                   help="output folder (default demo_renders/<name>; for --gallery the "
+                        "gallery's, default demo_renders/gallery)")
     args = p.parse_args()
 
-    import equinox as eqx
+    if args.list:
+        for name, (trial, start, seconds, caption) in EXAMPLES.items():
+            span = f"{start:g}-{start + seconds:g} s" if seconds else f"{start:g} s-end"
+            print(f"{name:14s} CMU {trial:7s} {span:11s} {caption}")
+        return
+
     import jax.numpy as jnp
-    from _common import ensure_headless_gl, load_layer
+    from _common import load_layer
 
-    from soma_jax import SOMAParams, save_soma_npz
-    from soma_jax.geometry.transforms import rotmat_to_axis_angle
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. The capture.
-    if args.asf and args.amc:
-        asf_path, amc_path = Path(args.asf), Path(args.amc)
-    else:
-        asf_path, amc_path = fetch_cmu_trial(args.trial, REPO / "assets" / "third_party"
-                                             / "cmu_mocap")
-    asf = parse_asf(asf_path.read_text())
-    frames = parse_amc(amc_path.read_text())
-    stride = max(1, int(round(CMU_FPS / args.fps)))
-    frames = frames[::stride]
-    fps = CMU_FPS / stride
-    W, end = cmu_forward_kinematics(asf, frames)
-    print(f"CMU {amc_path.stem}: {len(frames)} frames at {fps:g} fps "
-          f"({len(frames) / fps:.1f} s)")
-
-    # 2. The SOMA body, and its joints in the T-pose its pose input is relative to.
+    from soma_jax import SOMAParams
+    # The SOMA body, and its joints in the T-pose its pose input is relative to.
     layer = load_layer(args.soma_model, identity_model_type=args.identity_model,
                        identity_model_path=args.identity_path)
     n_coeffs = int(getattr(layer.identity_model, "n_betas", 128))
     coeffs = np.zeros(n_coeffs, np.float32)
     coeffs[:len(args.identity_coeffs)] = args.identity_coeffs[:n_coeffs]
-    names, parents = list(layer.public_joint_names), layer.parents
-    J = len(names)
+    J = len(layer.public_joint_names)
     zero = layer(SOMAParams(poses=jnp.zeros((1, J, 3)), transl=jnp.zeros((1, 3)),
                             identity_coeffs=jnp.asarray(coeffs)[None]), fk_only=True)
     tpose = np.asarray(zero.joints[0], np.float64)
+    cache = REPO / "assets" / "third_party" / "cmu_mocap"
 
-    # 3. Retarget, walk along +X, centred on the origin.
-    local, hips, scale = retarget_to_soma(asf, W, end, names, parents, tpose)
-    G = heading_yaw(hips)
-    local[:, names.index("Hips")] = G @ local[:, names.index("Hips")]
-    hips = hips @ G.T
-    hips[:, [0, 2]] -= hips[:, [0, 2]].mean(0)
-    walked = float(np.linalg.norm(hips[-1, [0, 2]] - hips[0, [0, 2]]))
-    print(f"  retargeted: stride scale {scale:.3f}, {walked:.2f} m walked "
-          f"({walked / (len(frames) / fps):.2f} m/s)")
+    if args.gallery:
+        from PIL import Image
+        clips = []
+        for name in args.motions or EXAMPLES:
+            trial, start, seconds, caption = EXAMPLES[name]
+            images, fps, strip = run_motion(layer, coeffs, tpose, name, caption,
+                                            *fetch_cmu_trial(trial, cache), cmu_fps(trial),
+                                            args, start, seconds)
+            clips.append((caption, [Image.fromarray(im).resize((384, 216), Image.LANCZOS)
+                                    for im in images], fps, strip))
+        for path in compose_gallery(clips, args.output_dir or REPO / "demo_renders" / "gallery"):
+            print(f"wrote {path}")
+        return
 
-    # 4. Pose the body with SOMA-JAX (one batched, jitted forward).
-    T = local.shape[0]
-    out = eqx.filter_jit(layer)(SOMAParams(
-        poses=jnp.asarray(local, jnp.float32), transl=jnp.asarray(hips, jnp.float32),
-        identity_coeffs=jnp.broadcast_to(jnp.asarray(coeffs), (T, n_coeffs))))
-    verts, joints = np.array(out.vertices), np.array(out.joints)      # writable copies
-    ground = float(np.percentile(verts[..., 1].min(axis=1), 5))   # feet on y = 0
-    verts[..., 1] -= ground
-    joints[..., 1] -= ground
-    hips[:, 1] -= ground
-    err = bone_direction_error(joints.astype(np.float64), asf, W, G, names, tpose)
-    print(f"  posed {verts.shape[1]} vertices x {T} frames; posed bones turn with the "
-          f"captured ones to {err:.2g} deg")
-
-    save_soma_npz(str(out_dir / "walk.soma.npz"), np.asarray(rotmat_to_axis_angle(
-        jnp.asarray(local, jnp.float32))), hips, names, args.identity_model,
-        coeffs[None], absolute_pose=False,
-        extra_arrays={"fps": np.asarray(fps), "source": np.asarray(f"CMU {amc_path.stem}")})
-
-    # 5. Render.
-    ensure_headless_gl()
-    from demo_soma_vis import _make_ground_and_shadow, render_mesh_png
-    faces = np.asarray(layer.faces)
-    lo, hi = verts.reshape(-1, 3).min(0), verts.reshape(-1, 3).max(0)
-    floor = checker_floor((lo[0] - 12.0, hi[0] + 12.0), (-40.0, 6.0))
-    fixed = fit_camera(lo, hi, args.width, args.height, args.azimuth)
-    # The follow shot frames a 2 m window round the walker at one distance and
-    # slides it along the hips' path, averaged over ~1 s (odd reflection at the
-    # ends keeps a steady walk centred there too), so it neither zooms nor jerks.
-    window = fit_camera([-1.0, 0.0, lo[2]], [1.0, hi[1], hi[2]], args.width, args.height,
-                        args.azimuth)
-    k = max(1, min(int(round(fps / 2)), T - 1))
-    padded = np.pad(hips[:, 0], k, mode="reflect", reflect_type="odd")
-    track = np.convolve(padded, np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
-    t0 = time.time()
-    images = []
-    for t in range(T):
-        cam = fixed
-        if args.camera == "follow":
-            cam = window.copy()
-            cam[0, 3] += track[t]
-        skel = (dict(joints=joints[t], parents=np.asarray(parents), body_alpha=0.45)
-                if args.skeleton else {})
-        shadow = _make_ground_and_shadow(verts[t], faces)[1]
-        images.append(render_mesh_png(verts[t], faces, None, args.width, args.height,
-                                      color=(0.55, 0.7, 0.9), camera_pose=cam,
-                                      extra_meshes=floor + [shadow], **skel))
-    print(f"  rendered {T} frames ({args.camera} camera) in {time.time() - t0:.1f} s")
-
-    from PIL import Image
-    # GIF delays are whole centiseconds: spread them so the clip plays in real
-    # time (33.3 ms frames as 30/40/30 ms, not all 30 ms, which runs 10% fast).
-    ticks = np.round(np.arange(T + 1) * 100.0 / fps).astype(int)
-    gif = out_dir / "walk.gif"
-    Image.fromarray(images[0]).save(
-        gif, save_all=True, append_images=[Image.fromarray(im) for im in images[1:]],
-        duration=[int(d) * 10 for d in np.diff(ticks)], loop=0, optimize=True)
-    print(f"  wrote {gif}")
-    try:                                         # optional: imageio + imageio-ffmpeg
-        import imageio.v2 as imageio
-        import imageio_ffmpeg  # noqa: F401
-    except ImportError:
-        print("  (walk.mp4 needs imageio and imageio-ffmpeg: pip install imageio imageio-ffmpeg)")
+    if args.asf and args.amc:
+        asf_path, amc_path = Path(args.asf), Path(args.amc)
+        name = caption = trial = amc_path.stem
+        start, seconds = args.start or 0.0, args.seconds
+    elif args.trial:
+        name = caption = trial = args.trial
+        asf_path, amc_path = fetch_cmu_trial(trial, cache)
+        start, seconds = args.start or 0.0, args.seconds
     else:
-        imageio.mimsave(out_dir / "walk.mp4", images, fps=fps, quality=8)
-        print(f"  wrote {out_dir / 'walk.mp4'}")
-
-    every = max(1, int(round(args.strip_every * fps)))
-    picks = list(range(0, T, every))
-    strip_v = np.concatenate([verts[t] for t in picks])
-    strip_f = np.concatenate([faces + k * verts.shape[1] for k in range(len(picks))])
-    strip = render_mesh_png(strip_v, strip_f, str(out_dir / "walk_strip.png"),
-                            args.width, args.height, color=(0.55, 0.7, 0.9),
-                            camera_pose=fixed, extra_meshes=floor + [
-                                _make_ground_and_shadow(strip_v, strip_f)[1]])
-    print(f"  wrote {out_dir / 'walk_strip.png'} ({len(picks)} poses, "
-          f"{strip.shape[1]}x{strip.shape[0]})")
+        name = args.motion
+        trial, start, seconds, caption = EXAMPLES[name]
+        asf_path, amc_path = fetch_cmu_trial(trial, cache)
+        start = start if args.start is None else args.start
+        seconds = seconds if args.seconds is None else args.seconds
+    run_motion(layer, coeffs, tpose, name, caption, asf_path, amc_path,
+               args.source_fps or cmu_fps(trial), args, start, seconds, args.output_dir)
 
 
 if __name__ == "__main__":

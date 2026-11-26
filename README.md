@@ -78,11 +78,13 @@ inv.prepare_identity(identity_coeffs)
 result = inv.fit(posed_vertices)    # .rotations, .root_translation, .per_vertex_error
 ```
 
-Render a real walk — a CMU motion-capture trial retargeted onto the SOMA
-skeleton and posed with SOMA-JAX (the clip downloads on first use):
+Render real motion capture — CMU trials retargeted onto the SOMA skeleton and
+posed with SOMA-JAX (the clips download on first use):
 
 ```bash
-python tools/pipeline/demo_motion.py    # -> demo_renders/walk/walk.gif, walk_strip.png
+python tools/pipeline/demo_motion.py                     # -> demo_renders/walk/walk.gif, walk_strip.png
+python tools/pipeline/demo_motion.py --motion cartwheel  # or run, jump, backflip, ballet, boxing, ... (--list)
+python tools/pipeline/demo_motion.py --gallery           # all 12 -> demo_renders/gallery/gallery.gif
 ```
 
 ## Identity models

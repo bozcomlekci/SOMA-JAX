@@ -1,5 +1,6 @@
-"""tools/pipeline/demo_motion.py: Acclaim ASF/AMC kinematics and the CMU -> SOMA
-retarget, without the network (the demo itself downloads a CMU trial)."""
+"""tools/pipeline/demo_motion.py: Acclaim ASF/AMC kinematics, clips, the CMU ->
+SOMA retarget, staging and the gallery, without the network (the demo itself
+downloads CMU trials)."""
 from __future__ import annotations
 
 import importlib.util
@@ -70,6 +71,98 @@ def _demo():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_examples_and_capture_rates():
+    """Every example names a CMU trial and a sensible window; trials of the
+    subjects CMU captured at 60 fps (and trial 136_19) read at 60, the rest at 120."""
+    dw = _demo()
+    assert "walk" in dw.EXAMPLES and len(dw.EXAMPLES) >= 10
+    for name, (trial, start, seconds, caption) in dw.EXAMPLES.items():
+        subject, number = trial.split("_")
+        assert subject.isdigit() and number.isdigit(), name
+        assert start >= 0 and (seconds is None or seconds > 0) and caption, name
+    assert dw.cmu_fps("35_08") == 120 and dw.cmu_fps("87_03") == 60
+    assert dw.cmu_fps("136_19") == 60 and dw.cmu_fps("136_18") == 120
+    assert dw.cmu_fps("my_walk") == 120
+
+
+def test_load_clip_cuts_and_resamples(tmp_path):
+    """--start / --seconds cut the trial at its capture rate, then the clip is
+    resampled to the output rate (every 4th frame of 120 fps, every 2nd of 60)."""
+    dw = _demo()
+    (tmp_path / "leg.asf").write_text(ASF)
+    lines = [":FULLY-SPECIFIED", ":DEGREES"]
+    for i in range(240):                          # root x counts frames
+        lines += [str(i + 1), f"root {i} 0 0 0 0 0", "lfemur 0 0 0", "ltibia 0"]
+    (tmp_path / "leg.amc").write_text("\n".join(lines) + "\n")
+    s = 0.0254 / 0.45
+    asf, W, end, fps = dw.load_clip(tmp_path / "leg.asf", tmp_path / "leg.amc", 120.0, 30.0,
+                                    start=0.5, seconds=1.0)
+    assert fps == 30 and W["lfemur"].shape == (30, 3, 3)
+    np.testing.assert_allclose(end["root"][:, 0] / s, np.arange(60, 180, 4))
+    _, W, end, fps = dw.load_clip(tmp_path / "leg.asf", tmp_path / "leg.amc", 60.0, 30.0)
+    assert fps == 30 and len(end["root"]) == 120
+    with pytest.raises(SystemExit):
+        dw.load_clip(tmp_path / "leg.asf", tmp_path / "leg.amc", 120.0, 30.0, start=5.0)
+
+
+def test_stage_yaw():
+    """A motion that travels turns to run along X, front rather than back to
+    the camera; one in place turns to face 35 degrees past the camera, judged
+    from the frames where the pelvis is upright (not mid-flip)."""
+    from scipy.spatial.transform import Rotation
+    dw = _demo()
+    T, z = 20, np.array([0.0, 0.0, 1.0])
+
+    def yaw(a):
+        return Rotation.from_euler("y", a, degrees=True).as_matrix()
+
+    path = np.linspace([0, 0.9, 0], [2.0, 0.9, -3.0], T)        # travels 3.6 m
+    for facing, expect_x in ((np.degrees(np.arctan2(2.0, -3.0)), 1),   # walks forwards
+                             (np.degrees(np.arctan2(2.0, -3.0)) + 90, None),  # sideways
+                             (np.degrees(np.arctan2(2.0, -3.0)) - 90, None)):
+        root = np.broadcast_to(yaw(facing), (T, 3, 3))
+        G, travels = dw.stage_yaw(path, root, azimuth_deg=15.0)
+        d = G @ (path[-1] - path[0])
+        assert travels and abs(d[2]) < 1e-9 and abs(abs(d[0]) - np.hypot(2, 3)) < 1e-9
+        if expect_x:
+            assert d[0] > 0                                       # left to right
+        assert (G @ root[0] @ z)[2] > -1e-9                       # never its back
+    still = np.zeros((T, 3))
+    root = np.broadcast_to(yaw(-120.0), (T, 3, 3)).copy()
+    root[::3] = Rotation.from_euler("x", 180, degrees=True).as_matrix()   # upside down
+    G, travels = dw.stage_yaw(still, root, azimuth_deg=15.0)
+    face = G @ root[1] @ z
+    assert not travels and np.degrees(np.arctan2(face[0], face[2])) == pytest.approx(50.0)
+
+
+def test_strip_offsets():
+    """Strip poses keep their order along the path, at least 0.8 median body
+    widths apart: a motion in place lines up evenly, a fast one is left alone,
+    and one travelling to -X spreads towards -X."""
+    dw = _demo()
+    np.testing.assert_allclose(dw.strip_offsets(np.zeros(5), np.ones(5)), [0, 0.8, 1.6, 2.4, 3.2])
+    np.testing.assert_allclose(dw.strip_offsets([0.0, 1.0, 2.0], [0.5] * 3), [0, 0, 0])
+    x = np.array([0.0, -0.1, -0.2])
+    moved = x + dw.strip_offsets(x, [1.0] * 3)
+    np.testing.assert_allclose(moved, [0.0, -0.8, -1.6])
+
+
+def test_compose_gallery(tmp_path):
+    """Clips of different lengths and rates loop side by side in gallery.gif,
+    at the gallery's rate, for as long as the longest; gallery.png holds the strips."""
+    Image = need_module("PIL.Image")
+    dw = _demo()
+    rng = np.random.default_rng(0)
+    clips = [(f"clip {k}", [rng.integers(0, 255, (18, 32, 3), np.uint8) for _ in range(n)],
+              rate, rng.integers(0, 255, (36, 64, 3), np.uint8))
+             for k, (n, rate) in enumerate(((4, 10.0), (9, 30.0), (12, 20.0)))]
+    written = dw.compose_gallery(clips, tmp_path, cols=2, tile=(32, 18), fps=10.0)
+    assert {p.name for p in written} >= {"gallery.gif", "gallery.png"}
+    gif = Image.open(tmp_path / "gallery.gif")
+    assert gif.size == (64, 36) and gif.n_frames == 6          # 12 frames at 20 fps = 0.6 s
+    assert Image.open(tmp_path / "gallery.png").size == (128, 72)
 
 
 def test_asf_amc_forward_kinematics():
