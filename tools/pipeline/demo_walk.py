@@ -22,12 +22,17 @@ on +X, as SOMA's does, and every ASF rest frame is world-aligned, so a bone's
 world rotation is its rotation away from rest. SOMA's pose input is relative
 to its own T-pose too: for world-aligned deltas ``D`` (a joint's world rotation
 times its T-pose orientation transposed), the local input is
-``R_j = D_parent^T @ D_j``. Each SOMA joint therefore takes the world rotation
-of the matching CMU bone, preceded by the fixed rotation that turns SOMA's rest
-bone direction into CMU's (CMU's thighs, for one, rest 20 degrees apart), so the
-posed bone directions follow the capture. Joints CMU does not track (fingers,
-eyes, jaw) follow their parent, and the root path is scaled by the ratio of leg
-lengths so the stride fits SOMA's legs.
+``R_j = D_parent^T @ D_j``. The two rest poses are the same posture (upright,
+arms out, head level, feet flat) except for the legs, which CMU rests 20
+degrees apart, so each SOMA joint takes the world rotation of the matching CMU
+bone as it is, and only the thighs and shins first turn from SOMA's rest
+direction onto CMU's; the posed legs then follow the captured ones exactly.
+Matching the rest directions of the other bones too would bend SOMA into CMU's
+proportions, as the skeletons place the neck, clavicle and foot joints
+differently: CMU's neck rises nearly upright where SOMA's leans forward like a
+real one, and tipping SOMA's back to match pressed the chin into the throat.
+Joints CMU does not track (fingers, eyes, jaw) follow their parent, and the
+root path is scaled by the ratio of leg lengths so the stride fits SOMA's legs.
 
 Data: "The data used in this project was obtained from mocap.cs.cmu.edu. The
 database was created with funding from NSF EIA-0196217." The clips may be used
@@ -57,8 +62,8 @@ CMU_FPS = 120.0
 DEFAULT_TRIAL = "35_08"            # subject 35, trial 8: "walk"
 
 #: SOMA joint -> (CMU bone whose world rotation drives it, SOMA child joint that
-#: gives the joint's bone direction). ``None`` takes the full orientation (the
-#: pelvis); unlisted joints follow their parent.
+#: ends the joint's bone). ``None``: the pelvis, which has no single bone
+#: direction. Unlisted joints follow their parent.
 SOMA_FROM_CMU = {
     "Hips": ("root", None),
     "Spine1": ("lowerback", "Spine2"),
@@ -76,6 +81,11 @@ for _side, _s in (("Left", "l"), ("Right", "r")):
         ("Foot", "foot", "ToeBase"), ("ToeBase", "toes", "ToeEnd"),
     ):
         SOMA_FROM_CMU[_side + _joint] = (_s + _bone, _side + _child)
+
+#: Joints whose rest pose differs between the two skeletons: every CMU skeleton
+#: rests its thighs and shins 20 degrees apart, along (+-0.342, -0.940, 0), while
+#: SOMA's hang straight down. These first turn SOMA's rest bone onto CMU's.
+REST_ALIGNED = ("LeftLeg", "LeftShin", "RightLeg", "RightShin")
 
 
 # --------------------------------------------------------------------------- ASF / AMC
@@ -240,12 +250,10 @@ def retarget_to_soma(asf: dict, W: dict, end: dict, joint_names, parents, tpose_
         p = int(parents[j])
         if name in SOMA_FROM_CMU:
             bone, child = SOMA_FROM_CMU[name]
-            if child is None:
-                D[:, j] = W[bone]
-            else:
-                rest = _rotation_between(tpose_joints[index[child]] - tpose_joints[j],
-                                         asf["bones"][bone]["direction"])
-                D[:, j] = W[bone] @ rest
+            D[:, j] = W[bone]
+            if name in REST_ALIGNED:
+                D[:, j] = D[:, j] @ _rotation_between(
+                    tpose_joints[index[child]] - tpose_joints[j], asf["bones"][bone]["direction"])
         elif p != j:
             D[:, j] = D[:, p]
     parent_idx = np.where(np.asarray(parents) == np.arange(J), 0, np.asarray(parents))
@@ -269,15 +277,19 @@ def heading_yaw(path: np.ndarray) -> np.ndarray:
     return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
 
 
-def bone_direction_error(joints_soma, asf, end, G, joint_names, frames=slice(None)):
-    """Largest angle (degrees) between posed SOMA bones and the captured bones."""
+def bone_direction_error(joints_soma, asf, W, G, joint_names, tpose_joints, frames=slice(None)):
+    """Largest angle (degrees) between a posed SOMA bone and where the capture
+    turns it: along the captured bone for the legs (:data:`REST_ALIGNED`), and
+    elsewhere SOMA's T-pose bone turned as its CMU bone turned from rest."""
     index = {n: i for i, n in enumerate(joint_names)}
     worst = 0.0
     for name, (bone, child) in SOMA_FROM_CMU.items():
         if child is None:
             continue
+        rest = (asf["bones"][bone]["direction"] if name in REST_ALIGNED
+                else tpose_joints[index[child]] - tpose_joints[index[name]])
         a = joints_soma[:, index[child]] - joints_soma[:, index[name]]
-        b = (end[bone] - end[asf["parent"][bone]])[frames] @ G.T
+        b = (W[bone][frames] @ rest) @ G.T
         cos = np.sum(a * b, -1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
         worst = max(worst, float(np.degrees(np.arccos(np.clip(cos, -1, 1))).max()))
     return worst
@@ -379,9 +391,10 @@ def main():
     p.add_argument("--output-dir", default=str(REPO / "demo_renders" / "walk"))
     args = p.parse_args()
 
-    import jax.numpy as jnp
     import equinox as eqx
+    import jax.numpy as jnp
     from _common import ensure_headless_gl, load_layer
+
     from soma_jax import SOMAParams, save_soma_npz
     from soma_jax.geometry.transforms import rotmat_to_axis_angle
 
@@ -435,9 +448,9 @@ def main():
     verts[..., 1] -= ground
     joints[..., 1] -= ground
     hips[:, 1] -= ground
-    err = bone_direction_error(joints.astype(np.float64), asf, end, G, names)
-    print(f"  posed {verts.shape[1]} vertices x {T} frames; posed bones follow the "
-          f"capture to {err:.2g} deg")
+    err = bone_direction_error(joints.astype(np.float64), asf, W, G, names, tpose)
+    print(f"  posed {verts.shape[1]} vertices x {T} frames; posed bones turn with the "
+          f"captured ones to {err:.2g} deg")
 
     save_soma_npz(str(out_dir / "walk.soma.npz"), np.asarray(rotmat_to_axis_angle(
         jnp.asarray(local, jnp.float32))), hips, names, args.identity_model,

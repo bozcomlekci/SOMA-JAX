@@ -100,18 +100,22 @@ def test_asf_amc_forward_kinematics():
 
 @pytest.mark.assets
 @pytest.mark.slow
-def test_retarget_follows_the_captured_bones(layer_procedural):
-    """Posed SOMA bones point where the captured bones do, although the source
-    rests differently (each rest direction here is tilted up to 25 degrees, as
-    CMU's thighs rest 20 degrees apart) and every bone turns at random."""
+def test_retarget_turns_bones_with_the_capture(layer_procedural):
+    """Every captured bone turns at random and rests up to 25 degrees off
+    SOMA's bone here. Each posed SOMA bone turns from its T-pose as its CMU
+    bone turns from rest, and the legs, whose rest poses differ (CMU's rest 20
+    degrees apart), point along the captured bones. At the capture's rest pose
+    SOMA keeps its T-pose outside the legs: matching every rest bone instead
+    tipped its neck back and pressed the chin into the throat."""
     need_module("pxr")
     need_assets(*UPSTREAM_ASSETS)
     import jax.numpy as jnp
-    from soma_jax import SOMAParams
     from scipy.spatial.transform import Rotation
+
+    from soma_jax import SOMAParams
     dw = _demo()
     layer = layer_procedural
-    names, parents = list(layer.public_joint_names), layer.parents
+    names, parents = list(layer.public_joint_names), np.asarray(layer.parents)
     J, T = len(names), 3
     zero = layer(SOMAParams(poses=jnp.zeros((1, J, 3)), transl=jnp.zeros((1, 3)),
                             identity_coeffs=jnp.zeros((1, 128))), fk_only=True)
@@ -131,10 +135,21 @@ def test_retarget_follows_the_captured_bones(layer_procedural):
         asf["bones"][bone] = {"direction": direction, "length": 0.4}
         asf["parent"][bone] = "root"
         W[bone] = Rotation.random(T, random_state=10 + k).as_matrix()
-        end[bone] = end["root"] + W[bone] @ direction
+    for bone in W:                      # frame 0: the capture at rest, at the origin
+        W[bone][0] = np.eye(3)
+    end["root"][0] = 0.0
     local, hips, _ = dw.retarget_to_soma(asf, W, end, names, parents, tpose)
     out = layer(SOMAParams(poses=jnp.asarray(local, jnp.float32),
                            transl=jnp.asarray(hips, jnp.float32),
                            identity_coeffs=jnp.zeros((T, 128))), fk_only=True)
-    err = dw.bone_direction_error(np.asarray(out.joints, np.float64), asf, end, np.eye(3), names)
+    joints = np.asarray(out.joints, np.float64)
+    err = dw.bone_direction_error(joints, asf, W, np.eye(3), names, tpose)
     assert err < 0.05, f"posed bones off the capture by {err:.3f} degrees"
+
+    legs = set()                        # the thighs and everything below them
+    for j in range(J):
+        if names[j] in ("LeftLeg", "RightLeg") or (parents[j] != j and parents[j] in legs):
+            legs.add(j)
+    rest_of_body = [j for j in range(J) if j not in legs]
+    assert {"Neck2", "Head", "HeadEnd", "LeftArm"} <= {names[j] for j in rest_of_body}
+    np.testing.assert_allclose(joints[0, rest_of_body], tpose[rest_of_body], atol=1e-5)
