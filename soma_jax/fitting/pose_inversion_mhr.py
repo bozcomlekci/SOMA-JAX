@@ -1,6 +1,6 @@
 """Native-MHR pose inversion: recover MHR pose/model parameters from MHR vertices.
 
-Upstream: ``soma/fitting/pose_inversion_mhr.py`` (SOMA-X v0.3.3), exported as
+Upstream: ``soma/fitting/pose_inversion_mhr.py`` (SOMA-X v0.3.6), exported as
 ``soma.fitting.MHRPoseInversion``. Upstream calls the module private: it keeps
 the MHR-specific DOF handling, the co-located ankle split and the
 parameter-matrix projection apart from the public SOMA conversion code.

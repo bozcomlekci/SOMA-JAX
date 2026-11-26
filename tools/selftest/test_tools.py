@@ -44,7 +44,7 @@ def _gl_works() -> str | None:
 def test_download_assets_check_minimal():
     need_assets(*UPSTREAM_ASSETS)
     out = _run(REPO / "tools" / "download_assets.py", "--check", "--minimal")
-    assert "all required assets present and verified" in out
+    assert "all assets present and verified" in out
 
 
 def test_vis_mesh_export(tmp_path):

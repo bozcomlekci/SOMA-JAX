@@ -1,6 +1,6 @@
 """SMPL-family pose transfer helpers.
 
-Upstream: ``soma/smpl/transfer.py`` (SOMA-X v0.3.3). The source rig is posed,
+Upstream: ``soma/smpl/transfer.py`` (SOMA-X v0.3.6). The source rig is posed,
 its mesh bridged onto the target topology, and :class:`SOMAPoseInversion`
 recovers the target layer's absolute local rotations and root translation.
 

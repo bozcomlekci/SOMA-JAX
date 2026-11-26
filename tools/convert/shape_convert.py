@@ -1,13 +1,13 @@
 """MHR shape to SMPL shape converter.
 
-Upstream: ``tools/shape_convert.py`` (SOMA-X v0.3.3). :class:`ShapeTransfer`
+Upstream: ``tools/shape_convert.py`` (SOMA-X v0.3.6). :class:`ShapeTransfer`
 converts MHR shape parameters to SMPL betas through SOMA: the MHR rest shape
 (SOMA topology) is skeleton-fitted, posed into the SMPL template's T-pose,
 carried onto SMPL topology through the SMPL ``SOMA_wrap``, and the betas are
 solved by least squares against the SMPL shape basis. The script renders random
 smooth MHR identities next to their SMPL conversions.
 
-Upstream v0.3.3 raises in :meth:`ShapeTransfer.forward` with its default
+Upstream (v0.3.6) raises in :meth:`ShapeTransfer.forward` with its default
 procedural layer: the pose-into-SMPL step builds a ``BatchedSkinning`` from the
 layer's ``joint_parent_ids`` / ``skinning_weights`` (the 110-joint twist rig)
 around the 78-joint ``skeleton_transfer.fit`` binds. The port skins on the

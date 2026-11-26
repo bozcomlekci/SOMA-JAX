@@ -1,6 +1,6 @@
 """Fitting algorithms: pose inversion from posed vertices and post-fit smoothing.
 
-Upstream: ``soma/fitting/`` (SOMA-X v0.3.3). These invert the SOMA body and hand
+Upstream: ``soma/fitting/`` (SOMA-X v0.3.6). These invert the SOMA body and hand
 layers (recover skeleton rotations from vertices) and regularize the resulting
 pose trajectories. They are shared by the body and hand packages and by the
 conversion tools.

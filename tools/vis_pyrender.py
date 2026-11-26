@@ -3,7 +3,7 @@
 
 """PyRender helpers shared by the SOMA-JAX tools (meshes, skeleton overlays, videos).
 
-Vendored unchanged from SOMA-X v0.3.3 ``tools/vis_pyrender.py`` (Apache-2.0,
+Vendored unchanged from SOMA-X v0.3.6 ``tools/vis_pyrender.py`` (Apache-2.0,
 NVIDIA — header above): it is pure NumPy / pyrender / trimesh, with no model
 code to port, and the ported tools (``tools/hand/*``, ``tools/convert/*2soma.py``,
 ``tools/make_teaser.py``) call it exactly as upstream's do.

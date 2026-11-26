@@ -1,6 +1,6 @@
 """Rig a custom SOMA body template mesh and export as a UsdSkel USD file.
 
-Upstream: ``tools/rig_soma_body_mesh.py`` (SOMA-X v0.3.3).
+Upstream: ``tools/rig_soma_body_mesh.py`` (SOMA-X v0.3.6).
 
 The input mesh MUST share the exact topology of the SOMA body template mesh
 (``c_skin_mid``): 18 056 vertices with the same vertex ordering and
@@ -10,7 +10,7 @@ ordering will produce incorrect deformation.
 
 Supported input formats: OBJ, USD/USDA/USDC.
 
-Upstream v0.3.3 raises before writing anything with its default procedural
+Upstream (v0.3.6) raises before writing anything with its default procedural
 layer: the 78-joint ``skeleton_transfer.fit`` bind is converted to local with
 the 110-joint twist-rig ``joint_parent_ids``. The tool's logic predates the twist
 rig (unchanged since v0.2.0), so the port writes the public 78-joint rig the

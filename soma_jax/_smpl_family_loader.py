@@ -1,6 +1,6 @@
 """SMPL-family asset loading helpers.
 
-Upstream: ``soma/_smpl_family_loader.py`` (SOMA-X v0.3.3).
+Upstream: ``soma/_smpl_family_loader.py`` (SOMA-X v0.3.6).
 
 ``load_smpl_family_model`` (ported in :mod:`soma_jax.smpl.layers`) reads
 SMPL / SMPL-H / SMPL-X files into plain NumPy arrays, and

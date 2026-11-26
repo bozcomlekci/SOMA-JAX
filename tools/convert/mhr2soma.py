@@ -1,6 +1,6 @@
 """MHR to SOMA pose converter.
 
-Upstream: ``tools/mhr2soma.py`` (SOMA-X v0.3.3). Reads SAM 3D Body parquet files
+Upstream: ``tools/mhr2soma.py`` (SOMA-X v0.3.6). Reads SAM 3D Body parquet files
 holding MHR parameters (``shape_params``, ``model_params``) and converts them to
 SOMA skeleton parameters with pose inversion, with upstream's arguments,
 diagnostics and outputs — including v0.3's ``--smooth`` SO(3) RTS smoothing.
@@ -17,22 +17,21 @@ built in centimetres like upstream's (``output_unit=CENTIMETERS``), and the
 refit runs on a low-LOD layer SOMA-JAX builds itself (upstream's
 ``PoseInversion(low_lod=True)`` builds it internally).
 
-Upstream v0.3.3 fails on several of these paths with its own procedural
+Upstream (v0.3.6) still fails on two of these paths with its own procedural
 (twist-joint) layer; the port implements what the code intends instead:
 
-* the internal low-LOD layer import (``from .body import SOMALayer`` inside
-  ``soma/fitting``) raises ``ModuleNotFoundError``;
-* ``--output-npz`` raises in ``export_soma_npz``, which removes the 110-joint
-  twist-rig orient from the 78 public rotations — the port uses the public one;
 * rendering raises in ``batched_skinning.pose``, which takes the 110-joint rig's
   rotations — the port renders the layer's own pose (public FK, twist
   expansion, LBS, no correctives);
-* ``--autograd-iters`` >= 2 raises "backward through the graph a second time":
-  the MHR TorchScript parameters require grad, so the prepared identity carries
-  graph history — the port's identity is a constant, as intended;
 * the drift summary labels joints from the 110-joint ``rig_data`` list, which
   mislabels every public joint from ``RightShoulder`` on — the port uses the
   public names.
+
+v0.3.6 fixed the three others v0.3.3 failed on, which the port already did
+right: the internal low-LOD layer import in ``soma/fitting``, ``--output-npz``
+(the public rig's orient, now ``conversion_utils.resolve_joint_orient``) and
+``--autograd-iters`` >= 2 (upstream now prepares the identity under
+``no_grad``; the port's identity is a constant).
 
 The first chunk's (and a ragged last chunk's) timing includes XLA compilation.
 

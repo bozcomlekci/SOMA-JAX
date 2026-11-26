@@ -1,11 +1,12 @@
 """SOMA pyrender demo: every identity backend posed with the same motion.
 
-Upstream: ``tools/demo_soma_vis.py`` (SOMA-X v0.3.3). Builds one SOMA layer per
+Upstream: ``tools/demo_soma_vis.py`` (SOMA-X v0.3.6). Builds one SOMA layer per
 identity backend (``soma``, ``mhr``, ``anny``, ``smpl``, ``smplx``, ``garment``)
 — optionally with and without the procedural twist rig — poses them all with
-``example_animation.npy`` (or a spinning T-pose) and renders one video per
-model, with optional random shapes, animated SOMA bone scales, LOD choice,
-correctives and a skeleton overlay.
+the USD ``example_animation.usd``, read through :meth:`SOMALayer.load_motion`
+(or a spinning T-pose), and renders one video per model at the animation's
+frame rate, with optional random shapes, animated SOMA bone scales, LOD
+choice, correctives and a skeleton overlay.
 
 JAX port: SOMA-JAX layers return the prepared identity instead of caching it,
 so each pose batch runs the layer's forward with the same identity arguments
@@ -39,52 +40,6 @@ from logging_utils import add_logging_args, configure_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------------
-# Joint Names & Mapping
-# --------------------------------------------------------------------------------
-# fmt: off
-nvskel93_name = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye", "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "LeftForeArmTwist1", "LeftForeArmTwist2", "LeftArmTwist1", "LeftArmTwist2",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "RightForeArmTwist1", "RightForeArmTwist2", "RightArmTwist1", "RightArmTwist2",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "LeftShinTwist1", "LeftShinTwist2", "LeftLegTwist1", "LeftLegTwist2",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-    "RightShinTwist1", "RightShinTwist2", "RightLegTwist1", "RightLegTwist2",
-]
-
-nvskel77_name = [
-    "Hips", "Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw",
-    "LeftEye", "RightEye",
-    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
-    "LeftHandThumb1", "LeftHandThumb2", "LeftHandThumb3", "LeftHandThumbEnd",
-    "LeftHandIndex1", "LeftHandIndex2", "LeftHandIndex3", "LeftHandIndex4", "LeftHandIndexEnd",
-    "LeftHandMiddle1", "LeftHandMiddle2", "LeftHandMiddle3", "LeftHandMiddle4", "LeftHandMiddleEnd",
-    "LeftHandRing1", "LeftHandRing2", "LeftHandRing3", "LeftHandRing4", "LeftHandRingEnd",
-    "LeftHandPinky1", "LeftHandPinky2", "LeftHandPinky3", "LeftHandPinky4", "LeftHandPinkyEnd",
-    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
-    "RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumbEnd",
-    "RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4", "RightHandIndexEnd",
-    "RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4", "RightHandMiddleEnd",
-    "RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4", "RightHandRingEnd",
-    "RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4", "RightHandPinkyEnd",
-    "LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "LeftToeEnd",
-    "RightLeg", "RightShin", "RightFoot", "RightToeBase", "RightToeEnd",
-]
-# fmt: on
-nvskel93to77_idx = [nvskel93_name.index(name) for name in nvskel77_name]
 
 color_map = {
     "soma": (0.4, 0.8, 0.4, 1.0),  # light green
@@ -160,8 +115,9 @@ def main():
     parser.add_argument("--data-root", default=None,
                         help="Path to SOMA assets (default: soma_jax.assets)")
     parser.add_argument("--motion-file", default=None,
-                        help="Path to motion file (.npy); default <data-root>/example_animation.npy. "
-                             "If missing, uses a dummy motion.")
+                        help="Path to a SOMA USD animation; default "
+                             "<data-root>/example_animation.usd. An empty string uses a dummy "
+                             "motion.")
     parser.add_argument("--device", default="cuda:0",
                         help="Accepted for upstream CLI compatibility; JAX uses its default "
                              "device (set JAX_PLATFORMS to choose).")
@@ -236,7 +192,6 @@ def main():
 
     from soma_jax import SOMALayer
     from soma_jax.assets import data_root as default_data_root
-    from soma_jax.geometry.rig_utils import joint_local_to_world, joint_world_to_local
     from soma_jax.types import SOMAParams
     from vis_pyrender import MeshRenderer, look_at, set_pyopengl_platform
 
@@ -244,7 +199,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     data_root = Path(args.data_root) if args.data_root else default_data_root()
     motion_file = (args.motion_file if args.motion_file is not None
-                   else str(data_root / "example_animation.npy"))
+                   else str(data_root / "example_animation.usd"))
     rng = np.random.default_rng(args.seed)
 
     procedural_variants = ([False, True] if args.procedural_transforms == "both"
@@ -272,48 +227,27 @@ def main():
 
     reference_model = models[model_specs[0][0]]
 
-    if motion_file and os.path.exists(motion_file):
+    fps = 30.0
+    if motion_file:
         logger.info(f"Loading motion from {motion_file}...")
-        motion_full = np.load(motion_file).astype(np.float32)
-        joint_rot_mats_local = motion_full[..., :3, :3]
-        root_trans = motion_full[..., 1, :3, 3]
+        pose, root_trans, fps = reference_model.load_motion(motion_file)
     else:
-        logger.info("No motion file provided or file not found. Using dummy motion "
-                    "(T-pose rotation).")
+        logger.info("No motion file provided. Using dummy motion (T-pose rotation).")
         T = 30
-        joint_rot_mats_local = np.tile(np.eye(3, dtype=np.float32), (T, 78, 1, 1))
+        pose = np.tile(np.eye(3, dtype=np.float32), (T, 77, 1, 1))
         angle = np.linspace(0, 2 * np.pi, T, dtype=np.float32)
         cos, sin = np.cos(angle), np.sin(angle)
         zeros, ones = np.zeros_like(angle), np.ones_like(angle)
-        rot_y = np.stack([np.stack([cos, zeros, sin], axis=-1),
-                          np.stack([zeros, ones, zeros], axis=-1),
-                          np.stack([-sin, zeros, cos], axis=-1)], axis=-2)   # (T, 3, 3)
-        joint_rot_mats_local[:, 1] = rot_y  # Rotate Hips
+        pose[:, 0] = np.stack([np.stack([cos, zeros, sin], axis=-1),
+                               np.stack([zeros, ones, zeros], axis=-1),
+                               np.stack([-sin, zeros, cos], axis=-1)], axis=-2)
         root_trans = np.zeros((T, 3), np.float32)
 
-    if joint_rot_mats_local.shape[1] == 94:
-        subset_idx = [0] + [i + 1 for i in nvskel93to77_idx]
-        joint_rot_mats_local = joint_rot_mats_local[:, subset_idx]
     if args.max_frames > 0:
-        joint_rot_mats_local = joint_rot_mats_local[: args.max_frames]
+        pose = pose[: args.max_frames]
         root_trans = root_trans[: args.max_frames]
-
-    # Absolute local rotations -> relative to the public T-pose orient.
-    reference_transform_joint_indices = getattr(
-        reference_model, "public_transform_joint_indices",
-        np.arange(np.asarray(reference_model.t_pose_world).shape[0]))
-    reference_parent_ids = np.asarray(getattr(
-        reference_model, "public_joint_parent_ids", reference_model.joint_parent_ids))
-    reference_t_pose_world = np.asarray(reference_model.t_pose_world)[
-        np.asarray(reference_transform_joint_indices)]
-    correction = np.swapaxes(reference_t_pose_world[:, :3, :3], -2, -1)
-    joint_rot_mats_world = joint_local_to_world(jnp.asarray(joint_rot_mats_local),
-                                                reference_parent_ids)
-    joint_rot_mats_world = joint_rot_mats_world @ jnp.asarray(correction)
-    joint_rot_mats_local = joint_world_to_local(joint_rot_mats_world, reference_parent_ids)
-
-    T = joint_rot_mats_local.shape[0]
-    pose = joint_rot_mats_local[:T, 1:]  # (T, 77, 3, 3): Hips (global orient) + body
+    pose = jnp.asarray(pose)
+    T = pose.shape[0]
 
     # Identity parameters.
     identity_coeffs_map = {}
@@ -415,7 +349,7 @@ def main():
                 renderer.setup_skeleton(skel_parents, color=skel_color)
             else:
                 renderer.setup_skeleton(skel_parents)
-        writer = imageio.get_writer(out_path, fps=30)
+        writer = imageio.get_writer(out_path, fps=fps)
         for t in tqdm(range(T), desc=model_type):
             verts = outputs[model_type]["vertices"][t]
             joints = None

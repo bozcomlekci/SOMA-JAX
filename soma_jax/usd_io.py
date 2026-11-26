@@ -329,6 +329,196 @@ def load_usd_animation(usd_file_path):
     return rot_mats, translations
 
 
+class AnimationUSDData(dict):
+    """Sampled joint animation returned by :func:`load_usd_animation_sequence`.
+
+    Upstream ``soma.io.AnimationUSDData`` (v0.3.4). Supports both dictionary and
+    attribute access. Transforms use column vectors in the source stage's units
+    and axis convention; joint paths retain their authored order. No skeleton,
+    mesh, or SOMA joint layout is required.
+
+    Keys: ``joint_paths``, ``local_transforms``, ``scales``, ``time_codes``,
+    ``time_codes_per_second``, ``meters_per_unit``, ``up_axis``.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+
+def load_usd_animation_sequence(
+    usd_file_path,
+    *,
+    animation_prim_path: Optional[str] = None,
+    time_codes: Optional[Sequence[float]] = None,
+) -> AnimationUSDData:
+    """Read a UsdSkel joint animation without requiring a skeleton or mesh.
+
+    Upstream ``soma.io.load_usd_animation_sequence`` (v0.3.4), same sampling
+    rules, checks and messages.
+
+    Args:
+        usd_file_path: Path to the USD file.
+        animation_prim_path: Select a SkelAnimation prim explicitly. If omitted,
+            the stage must contain exactly one SkelAnimation.
+        time_codes: Times to evaluate using USD interpolation and held values.
+            By default, sample at one-time-code intervals across the inclusive
+            stage playback range, without exceeding its end. If no playback
+            range is authored, use the transform attributes' sample range,
+            or time zero for a static animation.
+
+    Returns:
+        :class:`AnimationUSDData` with ``joint_paths`` in authored order,
+        ``local_transforms`` of shape ``(T, J, 4, 4)`` (float32, column-vector
+        convention), ``scales`` of shape ``(T, J, 3)``, and the sampled
+        ``time_codes``. Translations remain in source-stage units. Metadata
+        includes ``meters_per_unit``, ``up_axis``, and ``time_codes_per_second``;
+        elapsed seconds are time-code differences divided by the latter.
+        Joint names, units, axes, and scale are not restricted to SOMA.
+
+    Unlike :func:`load_usd_animation`, which reads the default pose, this
+    function reads a time sequence and returns its joint paths and metadata.
+    """
+    _, _, _, UsdGeom, UsdSkel, _ = _pxr()
+
+    stage = _open_usd_stage(usd_file_path)
+    if animation_prim_path is None:
+        prims = [p for p in stage.Traverse() if p.IsA(UsdSkel.Animation)]
+        if len(prims) != 1:
+            raise ValueError(
+                f"Expected one SkelAnimation in '{usd_file_path}', found {len(prims)}; "
+                "select one with animation_prim_path.")
+        prim = prims[0]
+    else:
+        prim = stage.GetPrimAtPath(animation_prim_path)
+        if not prim or not prim.IsA(UsdSkel.Animation):
+            raise ValueError(f"No SkelAnimation at '{animation_prim_path}' in '{usd_file_path}'")
+    animation = UsdSkel.Animation(prim)
+    joint_paths = list(animation.GetJointsAttr().Get() or [])
+    if not joint_paths:
+        raise ValueError(f"Animation has no joint paths: {prim.GetPath()}")
+    attributes = (
+        animation.GetTranslationsAttr(),
+        animation.GetRotationsAttr(),
+        animation.GetScalesAttr(),
+    )
+    if time_codes is None:
+        if stage.HasAuthoredTimeCodeRange():
+            start, end = stage.GetStartTimeCode(), stage.GetEndTimeCode()
+        else:
+            samples = [t for attribute in attributes for t in attribute.GetTimeSamples()]
+            start, end = (min(samples), max(samples)) if samples else (0.0, 0.0)
+        if end < start:
+            raise ValueError(f"Animation playback range ends before it starts: {usd_file_path}")
+        times = start + np.arange(np.floor(end - start) + 1, dtype=np.float64)
+    else:
+        times = np.asarray(time_codes, dtype=np.float64)
+    if times.ndim != 1 or times.size == 0 or not np.isfinite(times).all():
+        raise ValueError("time_codes must be a non-empty, finite one-dimensional sequence")
+
+    transforms = []
+    sampled_scales = []
+    for time in times:
+        translations, rotations, scales = [attribute.Get(float(time)) for attribute in attributes]
+        if any(value is None or len(value) != len(joint_paths)
+               for value in (translations, rotations, scales)):
+            raise ValueError(f"Incomplete animation transforms at time {time} in '{usd_file_path}'")
+        # Transpose USD's row-vector matrices to column-vector convention.
+        transforms.append(
+            np.asarray(UsdSkel.MakeTransforms(translations, rotations, scales), dtype=np.float32)
+            .swapaxes(-1, -2).copy())
+        sampled_scales.append(np.asarray(scales, dtype=np.float32))
+    local_transforms = np.stack(transforms)
+    if not np.isfinite(local_transforms).all():
+        raise ValueError(f"Animation contains non-finite transforms: {usd_file_path}")
+    return AnimationUSDData(
+        joint_paths=joint_paths,
+        local_transforms=local_transforms,
+        scales=np.stack(sampled_scales),
+        time_codes=times,
+        time_codes_per_second=float(stage.GetTimeCodesPerSecond()),
+        meters_per_unit=UsdGeom.GetStageMetersPerUnit(stage),
+        up_axis=str(UsdGeom.GetStageUpAxis(stage)),
+    )
+
+
+def load_soma_animation(path, joint_names: Sequence[str], *,
+                        world_space: bool = False) -> tuple[np.ndarray, float]:
+    """Load a USD animation in the requested SOMA joint order and meter units.
+
+    Upstream ``soma.io.load_soma_animation`` (v0.3.4). USD animation is sampled
+    once per time code over the stage playback range, including frames without
+    authored keys. Joint paths determine the mapping; stage metadata determines
+    translation units and playback speed.
+
+    Args:
+        path: USD animation file. Legacy NPY motion files are unsupported.
+        joint_names: Target joint leaf names in the desired output order.
+        world_space: Compose authored joint-path ancestors before selecting
+            joints. Output is in the animation's coordinate frame, without
+            scene prim transforms. Missing leading path prefixes are allowed
+            for animation roots; gaps between authored ancestors are rejected.
+
+    Returns:
+        ``(transforms, fps)`` with float32 transforms of shape
+        ``(T, J, 4, 4)`` in column-vector convention and translations in meters.
+        Requires Y-up animation, unambiguous joint leaf names, and unit scale.
+        Use :func:`load_usd_animation_sequence` to read other USD conventions.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".npy":
+        raise ValueError("Legacy .npy animations are no longer supported; use a USD animation.")
+
+    animation = load_usd_animation_sequence(path)
+    if animation.up_axis != "Y":
+        raise ValueError(f"SOMA animation must use Y-up coordinates: {path}")
+    names = [name.rsplit("/", 1)[-1] for name in animation.joint_paths]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Animation joint names are ambiguous: {path}")
+    missing = [name for name in joint_names if name not in names]
+    if missing:
+        raise ValueError(f"Animation is missing SOMA joints: {', '.join(missing)}")
+    indices = [names.index(str(name)) for name in joint_names]
+
+    required = set(indices)
+    parents = {}
+    if world_space:
+        path_indices = {str(joint_path): i for i, joint_path in enumerate(animation.joint_paths)}
+        pending = list(indices)
+        while pending:
+            index = pending.pop()
+            parent_path = str(animation.joint_paths[index]).rpartition("/")[0]
+            if parent_path in path_indices:
+                parent = path_indices[parent_path]
+                parents[index] = parent
+                if parent not in required:
+                    required.add(parent)
+                    pending.append(parent)
+            else:
+                # A hand-only animation may retain a common body path prefix.
+                ancestor = parent_path.rpartition("/")[0]
+                while ancestor:
+                    if ancestor in path_indices:
+                        raise ValueError(
+                            f"Animation is missing ancestor joint '{parent_path}': {path}")
+                    ancestor = ancestor.rpartition("/")[0]
+                parents[index] = None
+
+    if not np.allclose(animation.scales[:, sorted(required)], 1.0, atol=1e-5):
+        raise ValueError(f"SOMA pose animation does not support joint scaling: {path}")
+    transforms = animation.local_transforms.copy()
+    transforms[..., :3, 3] *= animation.meters_per_unit
+    if world_space:
+        # Path depth, rather than authored array order, determines FK order.
+        for index in sorted(required, key=lambda i: str(animation.joint_paths[i]).count("/")):
+            parent = parents[index]
+            if parent is not None:
+                transforms[:, index] = transforms[:, parent] @ transforms[:, index]
+    return transforms[:, indices], animation.time_codes_per_second
+
+
 def load_usd_skinning(usd_file_path, mesh_prim_path: Optional[str] = None):
     """Extract dense skinning weights from a skinned mesh.
 

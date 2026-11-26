@@ -28,7 +28,7 @@ Example::
     # output.joints:   (1, 78, 3)             # Root included; forward() returns upstream's 77
 
 Upstream: ``soma/__init__.py``
-    Public re-export surface, tracking SOMA-X v0.3.3: everything upstream's
+    Public re-export surface, tracking SOMA-X v0.3.6: everything upstream's
     ``soma`` exports except ``setup_warp_for_ddp`` (Warp/torch-distributed
     plumbing), plus the ``soma_jax.body`` / ``soma_jax.fitting`` /
     ``soma_jax.hand`` namespaces. ``SOMAOutput`` (what ``SOMALayer.__call__``
@@ -70,6 +70,9 @@ from .usd_io import (
     load_usd_mesh,
     load_usd_skeleton,
     load_usd_animation,
+    load_usd_animation_sequence,
+    load_soma_animation,
+    AnimationUSDData,
     load_usd_skinning,
     list_usd_meshes,
     write_usd_mesh,
@@ -187,6 +190,9 @@ __all__ = [
     "load_usd_mesh",
     "load_usd_skeleton",
     "load_usd_animation",
+    "load_usd_animation_sequence",
+    "load_soma_animation",
+    "AnimationUSDData",
     "load_usd_skinning",
     "list_usd_meshes",
     "write_usd_mesh",

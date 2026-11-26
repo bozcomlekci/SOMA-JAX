@@ -1,6 +1,6 @@
 """Convert pose parameters into native SMPL-family pose parameters.
 
-Upstream: ``tools/pose_converter.py`` (SOMA-X v0.3.3). The source is a SOMA
+Upstream: ``tools/pose_converter.py`` (SOMA-X v0.3.6). The source is a SOMA
 ``.npz`` (``--source soma`` / ``soma-procedural``) or an AMASS-style SMPL /
 SMPL-X ``.npz``; the target is an SMPL or SMPL-X rig. The source rig is posed,
 its mesh bridged onto the target topology, and pose inversion recovers the

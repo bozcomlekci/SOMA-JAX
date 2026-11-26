@@ -136,7 +136,8 @@ def parse_args():
                    help="fetch only what SOMALayer.from_upstream_assets() needs "
                         f"({', '.join(MINIMAL_FILES)})")
     p.add_argument("--hand", action="store_true",
-                   help="include the SOMA Hand layer's files (SOMAHand.npz, MANO packs)")
+                   help="with --minimal: also the SOMA Hand layer's files (SOMAHand.npz, "
+                        "MANO packs), which the default run already includes")
     p.add_argument("--extras", action="store_true",
                    help="fetch only the files the submodule does not ship "
                         "(GarmentMeasurements/point.npz)")
@@ -145,7 +146,7 @@ def parse_args():
     p.add_argument("--only", nargs="+", metavar="FILE", default=None,
                    help="fetch (or --check) just these relative paths, e.g. "
                         "Anny/base_body.obj — any required asset or any file of the "
-                        "pinned submodule, such as SOMA_example_animation.usda")
+                        "pinned submodule, such as example_animation.usd")
     p.add_argument("--print-table", nargs="?", const="HEAD", metavar="COMMIT",
                    help="maintainers: print soma_jax/assets.py's SOMA_X_COMMIT and "
                         "SOMA_X_ASSET_FILES for a submodule commit (default: the "
@@ -376,7 +377,7 @@ def check(files) -> int:
     if roots:
         print(f"${A.ASSETS_ENV_VAR}: " + os.pathsep.join(str(r) for r in roots))
 
-    print("required assets:")
+    print("assets:")
     for rel in files:
         state, path = _status(rel)
         if state == "lfs-stub":
@@ -413,7 +414,7 @@ def check(files) -> int:
     if corrupt:
         print("\n  -> python tools/download_assets.py --force   (re-download corrupt files)")
     if not (missing or corrupt or stubs):
-        print("\nall required assets present and verified.")
+        print("\nall assets present and verified.")
     return 1 if (missing or corrupt or stubs) else 0
 
 
@@ -437,9 +438,14 @@ def main():
     elif args.extras:
         files = hf_names
     else:
-        files = MINIMAL_FILES if args.minimal else A.REQUIRED_FILES
+        # Default: everything the package and the ported tools read — the
+        # body's data_root contract, the hand layer's files and the example
+        # clips (the USD demo motion, the SMPL clip smpl2soma converts).
+        files = (MINIMAL_FILES if args.minimal else
+                 A.REQUIRED_FILES + A.HAND_REQUIRED_FILES + A.EXAMPLE_FILES)
         if args.hand:
-            files = tuple(dict.fromkeys(files + A.HAND_REQUIRED_FILES))
+            files = files + A.HAND_REQUIRED_FILES
+        files = tuple(dict.fromkeys(files))
     if args.check:
         sys.exit(check(files))
 

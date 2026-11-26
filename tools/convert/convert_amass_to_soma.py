@@ -1,6 +1,6 @@
 """Convert the AMASS dataset to SOMA format.
 
-Upstream: ``tools/convert_amass_to_soma.py`` (SOMA-X v0.3.3). AMASS
+Upstream: ``tools/convert_amass_to_soma.py`` (SOMA-X v0.3.6). AMASS
 (https://amass.is.tue.mpg.de/) holds motion capture in SMPL-H format; this
 converts sequences to SOMA pose parameters with the same analytical
 inverse-LBS pipeline as ``smpl2soma.py`` — single files, or a whole dataset
@@ -25,13 +25,12 @@ builds it internally). The SMPL model file is licensed separately: by default
 ``<data-root>/SMPL/SMPL_NEUTRAL.{pkl,npz}``, or ``--smpl-model-path``
 (SOMA-JAX extra).
 
-Upstream v0.3.3 cannot save or render with its procedural (twist-joint) layer —
-``_save_conversion`` removes the 110-joint twist-rig orient from the 78 public
-rotations and records the 110 twist-rig names, and the render calls
-``batched_skinning.pose`` with public rotations — so every file of a batch run
-fails. The port saves the public rig (as ``conversion_utils.export_soma_npz``)
-and renders the layer's own pose (public FK, twist expansion, LBS, no
-correctives).
+``_save_conversion`` saves the public rig through
+``conversion_utils.resolve_joint_orient``, as upstream does since v0.3.6
+(v0.3.3 applied the 110-joint twist-rig orient to the 78 public rotations).
+Upstream's render still calls ``batched_skinning.pose`` with public rotations,
+which fails on its procedural layer; the port renders the layer's own pose
+(public FK, twist expansion, LBS, no correctives).
 
 Usage::
 

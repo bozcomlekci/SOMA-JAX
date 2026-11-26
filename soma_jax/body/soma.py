@@ -56,6 +56,7 @@ from ..geometry.lbs import (
 from ..geometry.rig_utils import (
     apply_joint_orient_local,
     joint_world_to_local as _joint_world_to_local,
+    precompute_joint_orient as _precompute_joint_orient,
     remove_joint_orient_local as _remove_joint_orient_local,
 )
 from ..correctives_model import _DEFAULT_CORRECTIVES_MODEL_PATH, CorrectivesMLP
@@ -1407,6 +1408,27 @@ class SOMALayer(eqx.Module):
         """
         return tuple(self._public_names)
 
+    def public_joint_orient(self) -> tuple:
+        """Joint-orient arrays for the public joints returned by :meth:`pose`.
+
+        Upstream ``SOMALayer.public_joint_orient`` (v0.3.6). Procedural layers
+        keep an expanded target skeleton (110 joints with twist helpers) for
+        skinning, so the target rig's T-pose orient is sized to that skeleton,
+        while the rotations :meth:`pose`, ``PoseInversion.fit`` and the
+        conversion tools produce are sized to the public one (78 joints). Use
+        this to convert those rotations between absolute and T-pose-relative
+        conventions.
+
+        Returns:
+            ``(orient, orient_parent_T)`` as produced by
+            :func:`~soma_jax.geometry.rig_utils.precompute_joint_orient`, both
+            ``(J_public, 3, 3)``.
+        """
+        if self.t_pose_world is None:
+            raise ValueError("This layer has no T-pose reference; joint orient is unavailable.")
+        t_pose_world = jnp.asarray(self.t_pose_world)[self.public_transform_joint_indices]
+        return _precompute_joint_orient(t_pose_world, self.public_joint_parent_ids)
+
     def public_skinning_weights(self) -> jnp.ndarray:
         """Skinning weights folded onto the public SOMA hierarchy.
 
@@ -1591,6 +1613,49 @@ class SOMALayer(eqx.Module):
             reference_pose = self.get_reference_pose(**reference_pose)
         rot = validate_reference_pose(reference_pose, len(self.public_joint_names))
         return jnp.asarray(rot, dtype=jnp.float32)
+
+    def load_motion(self, path, *, absolute_pose: bool = False, reference_pose=None) -> tuple:
+        """Load USD motion for :meth:`pose`, without preparing an identity.
+
+        Upstream ``SOMALayer.load_motion`` (v0.3.4).
+
+        Args:
+            path: USD animation with all public SOMA joints.
+            absolute_pose: Return absolute local rotations instead of rotations
+                relative to a reference pose. Bypasses the constructor default.
+            reference_pose: Same array or :meth:`get_reference_pose` lookup
+                dictionary as :meth:`pose`. ``None`` uses the constructor
+                default, or the template T-pose if none was set. Cannot be
+                combined with ``absolute_pose=True``.
+
+        Returns:
+            ``(poses, translation, fps)``: rotation matrices of shape
+            ``(T, 77, 3, 3)`` without the virtual Root, root translations of
+            shape ``(T, 3)`` in this layer's output units, and the animation
+            sample rate. Pass them to :meth:`pose` with ``pose2rot=False``,
+            ``transl=translation``, and the same ``absolute_pose`` /
+            ``reference_pose`` arguments.
+        """
+        from ..usd_io import load_soma_animation
+
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if reference_pose is not None:
+            reference_pose = self._resolve_reference_pose(reference_pose)
+
+        transforms, fps = load_soma_animation(path, self.public_joint_names)
+        motion = jnp.asarray(transforms, dtype=jnp.float32)
+        rotations = motion[..., :3, :3]
+        if not absolute_pose:
+            if reference_pose is None:
+                reference_pose = jnp.asarray(self.t_pose_world)[self.public_transform_joint_indices]
+            orient, orient_parent_T = _precompute_joint_orient(
+                jnp.asarray(reference_pose, dtype=motion.dtype), self.public_joint_parent_ids)
+            rotations = _remove_joint_orient_local(rotations, orient, orient_parent_T)
+        translation = motion[:, self.root_joint_idx, :3, 3] / self.output_unit.meters_per_unit
+        return rotations[:, 1:], translation, fps
 
     @classmethod
     def load(

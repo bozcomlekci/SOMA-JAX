@@ -1,6 +1,6 @@
 """Identity-model base class and coordinate conventions.
 
-Upstream: ``soma/identity_model.py`` (SOMA-X v0.3.3).
+Upstream: ``soma/identity_model.py`` (SOMA-X v0.3.6).
     :class:`CoordAxis` and :class:`BaseIdentityModel` — native units inside,
     ``output_unit`` out — which the data-root backends in
     :mod:`soma_jax.body.identity_model` build on. As upstream, the body

@@ -9,19 +9,17 @@ typography and alignment stay consistent across both sections (see issue
 #95). Rows are stacked vertically on a shared-width canvas; every panel is
 scaled and center-cropped, so figures in both rows are center-aligned.
 
-Example (after rendering with demo_soma_vis.py / demo_soma_hand_vis.py):
+Example (after rendering without correctives into out/teaser/no_correctives):
 
-    python tools/make_teaser.py \\
-        --body-videos out/teaser/body/soma_fixed_shape_skel.mp4,... \\
-        --body-labels "SOMA native,MHR,SMPL-X,Anny,GM" \\
-        --hand-videos out/teaser/hand/hand_right_soma_..._skel.mp4,... \\
-        --hand-labels "SOMA native,MHR,MANO" \\
-        --output out/teaser/soma-in-action.gif
+    python tools/make_teaser.py --fps 12
+
+Use --apply-correctives to select pre-rendered videos in out/teaser/correctives.
+The compositor does not calculate corrective offsets.
 
 Requires pillow (bundled with the imageio dependency stack) and ffmpeg for the
 palette-optimized GIF encode.
 
-Vendored from SOMA-X v0.3.3 ``tools/make_teaser.py`` (Apache-2.0, NVIDIA): it
+Vendored from SOMA-X v0.3.6 ``tools/make_teaser.py`` (Apache-2.0, NVIDIA): it
 composites already-rendered videos and has no model code to port. The only
 change is the ``logging_utils`` import path.
 """
@@ -137,11 +135,36 @@ def _title_bar(title: str, canvas_w: int, font: ImageFont.FreeTypeFont) -> Image
 
 def main():
     parser = argparse.ArgumentParser(description="Compose the combined SOMA README teaser GIF")
-    parser.add_argument("--body-videos", required=True, help="Comma-separated body demo videos")
-    parser.add_argument("--body-labels", required=True, help="Comma-separated body panel labels")
-    parser.add_argument("--hand-videos", required=True, help="Comma-separated hand demo videos")
-    parser.add_argument("--hand-labels", required=True, help="Comma-separated hand panel labels")
-    parser.add_argument("--output", required=True, help="Output GIF path")
+    parser.add_argument(
+        "--render-dir",
+        default="out/teaser",
+        help="Root containing the pre-rendered mode directories",
+    )
+    parser.add_argument(
+        "--apply-correctives",
+        action="store_true",
+        help="Select pre-rendered correctives inputs instead of no_correctives (default). "
+        "Does not calculate corrective offsets or change explicitly supplied videos.",
+    )
+    parser.add_argument(
+        "--body-videos", help="Comma-separated body demo videos (overrides defaults)"
+    )
+    parser.add_argument(
+        "--body-labels",
+        default="SOMA native,MHR,SMPL-X,Anny,GM",
+        help="Comma-separated body panel labels",
+    )
+    parser.add_argument(
+        "--hand-videos", help="Comma-separated hand demo videos (overrides defaults)"
+    )
+    parser.add_argument(
+        "--hand-labels", default="SOMA native,MHR,MANO", help="Comma-separated hand panel labels"
+    )
+    parser.add_argument(
+        "--output",
+        default="assets/images/soma-in-action.gif",
+        help="Output GIF path (default: assets/images/soma-in-action.gif)",
+    )
     parser.add_argument("--canvas-width", type=int, default=720)
     parser.add_argument("--row-height", type=int, default=200)
     parser.add_argument("--body-title", default="SOMA Body")
@@ -159,12 +182,12 @@ def main():
         default=28,
         help="Blank pixels between the body labels and the hand title.",
     )
-    parser.add_argument("--fps", type=float, default=12.5, help="Output GIF frame rate")
+    parser.add_argument("--fps", type=float, default=12, help="Output GIF frame rate")
     parser.add_argument(
         "--body-stride",
         type=int,
         default=2,
-        help="Keep every Nth body frame (body demos render at 30 fps)",
+        help="Keep every Nth body frame (USD demos use the motion's frame rate)",
     )
     parser.add_argument(
         "--hand-stride", type=int, default=2, help="Keep every Nth hand frame; shorter rows loop"
@@ -173,8 +196,26 @@ def main():
     args = parser.parse_args()
     configure_logging(args)
 
-    body = [_load_frames(p, args.body_stride) for p in args.body_videos.split(",")]
-    hand = [_load_frames(p, args.hand_stride) for p in args.hand_videos.split(",")]
+    mode = "correctives" if args.apply_correctives else "no_correctives"
+    render_dir = Path(args.render_dir) / mode
+    body_videos = (
+        args.body_videos.split(",")
+        if args.body_videos
+        else [
+            str(render_dir / "body" / f"{backend}_fixed_shape_procedural_skel.mp4")
+            for backend in ("soma", "mhr", "smplx", "anny", "garment")
+        ]
+    )
+    hand_videos = (
+        args.hand_videos.split(",")
+        if args.hand_videos
+        else [
+            str(render_dir / "hand" / f"hand_right_{backend}_{mode}_fixed_shape_skel.mp4")
+            for backend in ("soma", "mhr", "mano")
+        ]
+    )
+    body = [_load_frames(p, args.body_stride) for p in body_videos]
+    hand = [_load_frames(p, args.hand_stride) for p in hand_videos]
     body_labels = [s.strip() for s in args.body_labels.split(",")]
     hand_labels = [s.strip() for s in args.hand_labels.split(",")]
     if len(body_labels) != len(body) or len(hand_labels) != len(hand):

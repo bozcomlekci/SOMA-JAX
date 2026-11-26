@@ -4,7 +4,7 @@ Upstream: ``soma/assets.py``
     Same role — locate the model data the layer needs — but resolved locally
     rather than via a HuggingFace snapshot. Upstream's ``get_assets_dir()``
     downloads the ``nvidia/soma-x`` HF repo at the immutable tag matching the
-    package release (``revision="v0.3.3"``); that tag's file set is exactly the
+    package release (``revision="v0.3.6"``); that tag's file set is exactly the
     vendored submodule's ``assets/`` directory (upstream
     ``tools/ci/hf_assets_v0.3.json``), so the submodule *is* that snapshot.
 
@@ -85,7 +85,7 @@ REPO_ID = "nvidia/soma-x"
 HF_REPO_ID = REPO_ID
 #: Upstream's default ``get_assets_dir(revision=...)``: the immutable asset tag
 #: matching the package release. Kept in step with the submodule's version.
-UPSTREAM_ASSET_REVISION = "v0.3.3"
+UPSTREAM_ASSET_REVISION = "v0.3.6"
 #: Older immutable HF revision used ONLY by ``tools/download_assets.py`` as a
 #: convenience fallback for ``GarmentMeasurements/point.npz``, which upstream
 #: v0.3 no longer ships (it asks users to convert it locally). SOMA-JAX extra.
@@ -103,7 +103,7 @@ FROM_SUBMODULE = (
     "SOMA_procedural_transforms.json",
     "SOMAHand.npz",
     "correctives_model.pt",
-    "example_animation.npy",
+    "example_animation.usd",
     "MHR",
     "Anny",
     "MANO",
@@ -147,13 +147,13 @@ REQUIRED_FILES = (
     "GarmentMeasurements/point.npz",
 )
 
-#: The ``third_party/SOMA-X`` commit the superproject pins (upstream v0.3.3).
+#: The ``third_party/SOMA-X`` commit the superproject pins (upstream v0.3.6).
 #: ``SOMA_X_ASSET_FILES`` maps each of its ``assets/`` files to
 #: ``(sha256, size in bytes, stored in Git LFS)``. Lets ``tools/download_assets.py``
 #: fetch and verify them without git-lfs — or without the submodule at all,
 #: e.g. from a GitHub "Download ZIP" checkout. Regenerate both with
 #: ``python tools/download_assets.py --print-table`` when the gitlink moves.
-SOMA_X_COMMIT = "d6aa640f7787498009c4e3d57fcc14a243905d10"
+SOMA_X_COMMIT = "d7bac2a1e17f971910d96c4c22cc95035a34286d"
 SOMA_X_ASSET_FILES = {
     "Anny/SOMA_wrap.obj": (
         "15e1500a13d3fac2db17b622ab54292cfb2e58d9efaa1e86cc11e46071bffb2e", 2613343, True),
@@ -200,9 +200,9 @@ SOMA_X_ASSET_FILES = {
     "SOMA_template_rig.usda": (
         "a952cb7bdf4ccd801e355d53122d395b985b69d0d9181439edad5081bb171856", 28306038, True),
     "correctives_model.pt": (
-        "411d061a651051a7a4ec941543495d35eac21e5a7a69c8ce042b89cd12772a43", 70549157, True),
-    "example_animation.npy": (
-        "f424385dae3128278e74e81e0789ee4048753199d04fef77c27ba5457bd3819d", 5601024, True),
+        "95d61f4b35cfc287b2288c67349aa2128b710680e8fea333b04c42c95b98af31", 63090117, True),
+    "example_animation.usd": (
+        "c09372492aaacdca3ca7ec5d737263d8e6042b66fdd29318d91848427fa40695", 6437887, True),
 }
 
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/"
@@ -259,11 +259,12 @@ HAND_REQUIRED_FILES = (
 )
 
 #: Example inputs that ship with the assets and that upstream's tools read from
-#: ``data_root``: the demo motion (``tools/hand/demo_soma_hand_vis.py``) and the
-#: SMPL clip ``tools/convert/smpl2soma.py`` converts. Linked by :func:`data_root`,
+#: ``data_root``: the USD demo motion (``tools/demo_soma_vis.py``,
+#: ``tools/hand/demo_soma_hand_vis.py``; an NPY clip before v0.3.4) and the SMPL
+#: clip ``tools/convert/smpl2soma.py`` converts. Linked by :func:`data_root`,
 #: never required.
 EXAMPLE_FILES = (
-    "example_animation.npy",
+    "example_animation.usd",
     "SMPL/smpl_anim.npy",
 )
 

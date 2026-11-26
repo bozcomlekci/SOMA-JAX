@@ -76,7 +76,7 @@ def test_download_assets_check_runs_without_jax(tmp_path):
         env={**__import__("os").environ, "PYTHONPATH": str(tmp_path)},
     )
     assert "jax must not be imported" not in proc.stdout + proc.stderr
-    assert "required assets:" in proc.stdout
+    assert "assets:" in proc.stdout
     assert proc.returncode in (0, 1), proc.stderr
 
 

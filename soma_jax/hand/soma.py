@@ -58,6 +58,11 @@ from ..correctives_model import (
 from ..geometry.barycentric_interp import barycentric_interpolate, compute_barycentric_coords
 from ..geometry.batched_skinning import pose_from_bind, topk_skinning
 from ..geometry.lbs import batch_rodrigues, compute_skeleton_levels
+from ..geometry.rig_utils import (
+    joint_world_to_local,
+    precompute_joint_orient,
+    remove_joint_orient_local,
+)
 from ..geometry.skeleton_transfer import SkeletonTransfer
 from ..reference_poses import (
     ReferencePoseHistory,
@@ -558,6 +563,58 @@ class SOMAHandLayer:
         return convert_reference_rotations(rotations, from_ref, to_ref, self.joint_parent_ids,
                                            virtual_root=False)
 
+    def load_motion(self, path, *, absolute_pose: bool = False, reference_pose=None) -> tuple:
+        """Load full-body or hand-only USD motion for :meth:`pose`.
+
+        Upstream ``SOMAHandLayer.load_motion`` (v0.3.4). No prepared identity is
+        needed. Joint leaf names must identify this hand's 25 joints; authored
+        paths define the source hierarchy. Full-body wrist ancestors are
+        composed before extracting the hand. A hand-only animation's wrist root
+        already supplies its world transform.
+
+        Args:
+            path: USD animation containing this hand's joints and any animated
+                ancestors. Translations are converted to this layer's output units.
+            absolute_pose: Return absolute rotations: world rotation for the
+                wrist, parent-local rotations for fingers. Bypasses the
+                constructor's default reference pose.
+            reference_pose: Same array or :meth:`get_reference_pose` lookup
+                dictionary as :meth:`pose`. ``None`` uses the constructor
+                default, or the template T-pose if none was set. Cannot be
+                combined with ``absolute_pose=True``.
+
+        Returns:
+            ``(poses, translation, fps)``: rotation matrices of shape
+            ``(T, 25, 3, 3)``, wrist world translations of shape ``(T, 3)``, and
+            the animation sample rate. Pass them to :meth:`pose` with
+            ``pose2rot=False``, ``global_translation=translation``, and the same
+            ``absolute_pose`` / ``reference_pose`` arguments. Do not apply a
+            separate wrist transform.
+        """
+        from ..usd_io import load_soma_animation
+
+        if reference_pose is not None and absolute_pose:
+            raise ValueError("reference_pose cannot be combined with absolute_pose=True.")
+        if reference_pose is None and not absolute_pose:
+            reference_pose = self._default_reference_pose
+        if isinstance(reference_pose, dict):
+            reference_pose = self.get_reference_pose(**reference_pose)
+        if reference_pose is not None:
+            reference_pose = validate_reference_pose(
+                reference_pose, len(self.joint_parent_ids), require_identity_root=False)
+
+        transforms, fps = load_soma_animation(path, self.rig_data["joint_names"], world_space=True)
+        world = jnp.asarray(transforms, dtype=jnp.float32)
+        rotations = joint_world_to_local(world[..., :3, :3], self.joint_parent_ids)
+        if not absolute_pose:
+            if reference_pose is None:
+                reference_pose = self.t_pose_world
+            orient, orient_parent_T = precompute_joint_orient(
+                jnp.asarray(reference_pose, dtype=world.dtype), self.joint_parent_ids)
+            rotations = remove_joint_orient_local(rotations, orient, orient_parent_T)
+        translation = world[:, 0, :3, 3] / self.output_unit.meters_per_unit
+        return rotations, translation, fps
+
     # ---- identity ---------------------------------------------------------
     def _apply_lod_transfer(self, mid_rest_shape: jnp.ndarray) -> jnp.ndarray:
         if self.identity_lod_mid_ids is not None:
@@ -688,7 +745,10 @@ class SOMAHandLayer:
                 raise RuntimeError(
                     "apply_correctives=True but no corrective model is loaded. Construct with "
                     "a valid correctives_model_path or pass apply_correctives=False.")
-            out = self.correctives_model.offsets(rotations_abs)          # body frame
+            # The standalone wrist is a global rigid rotation, not articulation
+            # (upstream v0.3.6): the correctives see an identity wrist.
+            correctives_input = rotations_abs.at[:, 0].set(jnp.eye(3, dtype=rotations_abs.dtype))
+            out = self.correctives_model.offsets(correctives_input)      # body frame
             out = jnp.einsum("ij,bvj->bvi", self._correctives_to_hand_frame, out)
             gs = identity.global_scale
             if isinstance(gs, (jnp.ndarray, np.ndarray)):

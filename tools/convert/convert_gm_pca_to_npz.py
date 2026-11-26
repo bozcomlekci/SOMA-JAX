@@ -1,6 +1,6 @@
 """Minimal script to convert GarmentMeasurements point.pca to point.npz format.
 
-Upstream: ``tools/convert_gm_pca_to_npz.py`` (SOMA-X v0.3.3), unchanged apart from
+Upstream: ``tools/convert_gm_pca_to_npz.py`` (SOMA-X v0.3.6), unchanged apart from
 the import path. The ``point.npz`` it writes is what the ``garment`` identity
 backend reads (``<data-root>/GarmentMeasurements/point.npz``).
 

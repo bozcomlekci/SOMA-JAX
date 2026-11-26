@@ -4,10 +4,9 @@ Upstream: ``tools/conversion_utils.py`` (SOMA-X). Same argument sets and the
 same layer-oriented NPZ export (absolute rotations -> joint orient removed ->
 axis-angle -> ``save_soma_npz``), over SOMA-JAX layers.
 
-One deliberate difference: rotations are converted with
-:func:`soma_jax.geometry.transforms.rotmat_to_axis_angle`, whose small-angle
-branch returns the correct vector; upstream's ``matrix_to_rotvec`` doubles
-rotations below 1e-3 rad (see docs/FAITHFULNESS.md).
+Includes v0.3.6's :func:`resolve_joint_orient`, which sizes the joint orient
+and names to the rotations being exported (the public rig on a procedural
+layer), and its corrected ``matrix_to_rotvec``.
 """
 from __future__ import annotations
 
@@ -72,32 +71,30 @@ def add_hand_inversion_args(parser, *, bcd_iters=1, lie_iters=3, lie_lambda=1e-1
                         help="Upstream-layout asset directory (default: soma_jax.assets).")
 
 
-def _joint_orient_pair(layer):
-    """Upstream ``layer._t_pose_orient`` / ``_t_pose_orient_parent_T``, on the public rig.
+def resolve_joint_orient(soma, num_joints):
+    """Joint-orient arrays matching ``num_joints`` rotations from ``soma``.
 
-    Upstream's body layer computes that pair on its skinning rig — 110 joints
-    on the default twist rig — which the 78 public rotations it is applied to
-    cannot use; the SOMA body layer here supplies its public joints' orient.
+    Upstream ``tools/conversion_utils.resolve_joint_orient`` (v0.3.6).
+    Procedural layers skin an expanded target skeleton (110 joints) while
+    ``PoseInversion.fit`` and ``SOMALayer.pose`` operate on the public skeleton
+    (78 joints), so the skinning rig's orient cannot be applied to public
+    rotations.
+
+    Returns:
+        ``(orient, orient_parent_T, joint_names)`` sized to ``num_joints``.
     """
-    from soma_jax.reference_poses import _orient_pair
-    if hasattr(layer, "_t_pose_orient"):          # the hand layer keeps the pair
-        return layer._t_pose_orient, layer._t_pose_orient_parent_T
-    if hasattr(layer, "public_transform_joint_indices"):
-        t_pose = np.asarray(layer.t_pose_world)[np.asarray(layer.public_transform_joint_indices)]
-        return _orient_pair(t_pose, np.asarray(layer.public_joint_parent_ids))
-    return _orient_pair(layer.t_pose_world, np.asarray(layer.joint_parent_ids))
-
-
-def _joint_names(layer) -> list[str]:
-    # The SOMA body layer's rotations cover its public joints; upstream labels
-    # them with `rig_data["joint_names"]`, the 110 skinning joints on a twist rig.
-    public = getattr(layer, "public_joint_names", None)
-    if public is not None:
-        return [str(n) for n in public]
-    rig = getattr(layer, "rig_data", None)
-    if rig is not None:
-        return [str(n) for n in rig["joint_names"]]
-    return [str(n) for n in layer.joint_names]
+    orient = getattr(soma, "_t_pose_orient", None)
+    if orient is not None and orient.shape[0] == num_joints:
+        return orient, soma._t_pose_orient_parent_T, [str(n) for n in soma.rig_data["joint_names"]]
+    public_names = [str(n) for n in getattr(soma, "public_joint_names", ())]
+    if len(public_names) == num_joints and hasattr(soma, "public_joint_orient"):
+        orient, orient_parent_T = soma.public_joint_orient()
+        return orient, orient_parent_T, public_names
+    raise ValueError(
+        "Cannot resolve joint orient for rotations with "
+        f"{num_joints} joints: layer target skeleton has "
+        f"{None if orient is None else orient.shape[0]} joints and public skeleton has "
+        f"{len(public_names)}.")
 
 
 def export_soma_npz(output_path, rotations, root_transl, soma, *, output_unit, keep_root=False,
@@ -121,15 +118,17 @@ def export_soma_npz(output_path, rotations, root_transl, soma, *, output_unit, k
     """
     import jax.numpy as jnp
 
-    from soma_jax.geometry.transforms import rotmat_to_axis_angle
+    from soma_jax.geometry.rig_utils import remove_joint_orient_local
+    from soma_jax.geometry.transforms import matrix_to_rotvec
     from soma_jax.io import save_soma_npz
-    from soma_jax.reference_poses import _remove_orient
     from soma_jax.units import Unit
 
     rotations = jnp.asarray(rotations)
-    orient, orient_parent_T = _joint_orient_pair(soma)
-    rel = _remove_orient(rotations, jnp.asarray(orient), jnp.asarray(orient_parent_T))
-    poses_rotvec = np.asarray(rotmat_to_axis_angle(rel.reshape(-1, 3, 3))).reshape(
+    orient, orient_parent_T, joint_names = resolve_joint_orient(soma, rotations.shape[1])
+    orient = jnp.asarray(orient, rotations.dtype)
+    orient_parent_T = jnp.asarray(orient_parent_T, rotations.dtype)
+    rel = remove_joint_orient_local(rotations, orient, orient_parent_T)
+    poses_rotvec = np.asarray(matrix_to_rotvec(rel.reshape(-1, 3, 3))).reshape(
         rotations.shape[0], rotations.shape[1], 3)
 
     layer_unit = getattr(soma, "output_unit", Unit.METERS)
@@ -138,7 +137,7 @@ def export_soma_npz(output_path, rotations, root_transl, soma, *, output_unit, k
 
     save_soma_npz(
         str(output_path), poses_rotvec.astype(np.float32), save_transl,
-        joint_names=_joint_names(soma),
+        joint_names=joint_names,
         identity_model_type=soma.identity_model_type,
         identity_coeffs=identity_coeffs,
         scale_params=scale_params,

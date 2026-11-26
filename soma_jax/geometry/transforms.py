@@ -83,8 +83,9 @@ def axis_angle_to_rotmat(aa: jnp.ndarray) -> jnp.ndarray:
 def rotmat_to_axis_angle(R: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     """Rotation matrices -> axis-angle (rotation) vectors, robust everywhere.
 
-    Port of upstream ``soma.geometry.transforms.matrix_to_rotvec``. Three
-    regimes, selected per element:
+    Port of upstream ``soma.geometry.transforms.matrix_to_rotvec`` (v0.3.6,
+    which fixed the earlier releases' small-angle branch: it returned twice the
+    rotation vector below 1e-3 rad). Three regimes, selected per element:
 
     * **small** (theta <= 1e-3) — series expansion ``0.5 + theta^2/12``; the
       generic formula divides by ``sin(theta) -> 0``.
@@ -108,25 +109,17 @@ def rotmat_to_axis_angle(R: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     cos_theta = jnp.clip((tr - 1.0) * 0.5, -1.0, 1.0)
     theta = jnp.arccos(cos_theta)
 
+    # v = 2 sin(theta) * axis, from the antisymmetric part S = R - R^T.
     S = R - jnp.swapaxes(R, -2, -1)
-    v = jnp.stack([S[..., 2, 1] - S[..., 1, 2],
-                   S[..., 0, 2] - S[..., 2, 0],
-                   S[..., 1, 0] - S[..., 0, 1]], axis=-1)
-    sin_theta = 0.5 * jnp.linalg.norm(v, axis=-1)
+    v = jnp.stack([S[..., 2, 1], S[..., 0, 2], S[..., 1, 0]], axis=-1)
+    sin_theta = 0.5 * _vector_norm(v)
 
     small = theta <= 1e-3
     near_pi = theta >= (jnp.pi - 1e-3)
 
-    # Small-angle series. NOTE: this deliberately DIVERGES from upstream.
-    # `v` is built from S = R - R^T and differenced again, so it is *twice* the
-    # usual antisymmetric vector w = (R21-R12, R02-R20, R10-R01). The generic
-    # branch cancels that (it divides by 2 sin(theta)), but upstream's small
-    # branch applies w's factor (0.5 + theta^2/12) directly to v and therefore
-    # returns 2x the true rotation vector for theta < 1e-3 — verified against
-    # `soma.geometry.transforms.matrix_to_rotvec`, which has the same defect.
-    # Using v's own factor, rotvec = v * (0.25 + theta^2/24), restores it.
-    theta2 = jnp.maximum(3.0 - tr, 0.0)
-    w_small = v * (0.25 + theta2 / 24.0)[..., None]
+    # Small-angle series.
+    theta2_approx = jnp.maximum(3.0 - tr, 0.0)
+    w_small = v * (0.5 + theta2_approx / 12.0)[..., None]
 
     # Generic.
     denom = jnp.where(sin_theta < eps, eps, 2.0 * sin_theta)
@@ -141,7 +134,7 @@ def rotmat_to_axis_angle(R: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     ], axis=-1)
     sign = jnp.where(jnp.sign(v) == 0, 1.0, jnp.sign(v))
     u = u * sign
-    u_norm = jnp.linalg.norm(u, axis=-1, keepdims=True)
+    u_norm = _vector_norm(u, keepdims=True)
     w_pi = u / jnp.where(u_norm < eps, eps, u_norm) * theta[..., None]
 
     return jnp.where(near_pi[..., None], w_pi,
@@ -993,10 +986,8 @@ quaternion_xyzw_to_matrix = quaternion_xyzw_to_rotmat
 def matrix_to_rotvec(R: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     """(..., 3, 3) rotation matrices -> (..., 3) rotation vectors (axis * angle).
 
-    Upstream ``matrix_to_rotvec``, robust for small angles and near pi. Its
-    small-angle branch (theta <= 1e-3) returns twice the rotation vector;
-    this is :func:`rotmat_to_axis_angle`, which returns the true one there
-    (see its notes).
+    Upstream ``matrix_to_rotvec``, robust for small angles and near pi; the
+    same function as :func:`rotmat_to_axis_angle`.
     """
     return rotmat_to_axis_angle(R, eps=eps)
 
@@ -1004,32 +995,33 @@ def matrix_to_rotvec(R: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
 def rotvec_to_matrix(rotvec: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
     """(..., 3) rotation vectors -> (..., 3, 3) rotation matrices, robust near zero.
 
-    Upstream ``rotvec_to_matrix`` (unused upstream) builds ``K`` from the
-    *unit* axis but applies the ``sin(theta)/theta`` and
-    ``(1 - cos(theta))/theta^2`` coefficients meant for the unnormalized
-    vector, so it returns non-rotations for every angle other than about 1
-    radian (e.g. det 0.76 at pi/2). This returns the Rodrigues rotation its
-    docstring describes, switching to the first-order ``I + [rotvec]_x``
-    below ``1e-6`` as upstream switches to ``I + K``.
+    Port of upstream ``rotvec_to_matrix`` as of v0.3.6, which builds ``K`` from
+    the unnormalized vector, so the ``sin(theta)/theta`` and
+    ``(1 - cos(theta))/theta^2`` coefficients apply as Rodrigues' formula
+    intends (earlier releases normalized ``K`` first and returned
+    non-rotations), and switches to the first-order ``I + K`` below ``1e-6``,
+    whose derivative at the zero rotation is the skew map.
     """
     if rotvec.shape[-1] != 3:
         raise ValueError(f"Expected (...,3), got {rotvec.shape}")
 
-    def skew(v):
-        zero = jnp.zeros_like(v[..., 0])
-        return jnp.stack([
-            zero, -v[..., 2], v[..., 1],
-            v[..., 2], zero, -v[..., 0],
-            -v[..., 1], v[..., 0], zero,
-        ], axis=-1).reshape(v.shape[:-1] + (3, 3))
-
     theta = _vector_norm(rotvec)   # torch's zero gradient at the zero vector
-    K = skew(rotvec / jnp.where(theta < eps, eps, theta)[..., None])
+
+    # The coefficients below use the skew matrix of the unnormalized vector.
+    zero = jnp.zeros_like(rotvec[..., 0])
+    K = jnp.stack([
+        zero, -rotvec[..., 2], rotvec[..., 1],
+        rotvec[..., 2], zero, -rotvec[..., 0],
+        -rotvec[..., 1], rotvec[..., 0], zero,
+    ], axis=-1).reshape(rotvec.shape[:-1] + (3, 3))
     eye = jnp.eye(3, dtype=rotvec.dtype)
-    R = (eye + jnp.sin(theta)[..., None, None] * K
-         + (1.0 - jnp.cos(theta))[..., None, None] * (K @ K))
+
+    A = jnp.sin(theta) / jnp.where(theta < eps, 1.0, theta)
+    B = (1.0 - jnp.cos(theta)) / jnp.where(theta < eps, 1.0, theta * theta)
+    R = eye + A[..., None, None] * K + B[..., None, None] * (K @ K)
+
     small = theta < 1e-6
-    return jnp.where(small[..., None, None], eye + skew(rotvec), R)
+    return jnp.where(small[..., None, None], eye + K, R)
 
 
 def _normalize(x: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
