@@ -1,4 +1,4 @@
-"""tools/pipeline/demo_walk.py: Acclaim ASF/AMC kinematics and the CMU -> SOMA
+"""tools/pipeline/demo_motion.py: Acclaim ASF/AMC kinematics and the CMU -> SOMA
 retarget, without the network (the demo itself downloads a CMU trial)."""
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ ltibia 70\r
 def _demo():
     from soma_jax.assets import REPO_ROOT
     spec = importlib.util.spec_from_file_location(
-        "_demo_walk", REPO_ROOT / "tools" / "pipeline" / "demo_walk.py")
+        "_demo_motion", REPO_ROOT / "tools" / "pipeline" / "demo_motion.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

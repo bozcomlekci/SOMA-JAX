@@ -5,10 +5,10 @@ Fetches a walking trial from the CMU Graphics Lab Motion Capture Database
 retargets it onto the SOMA skeleton, poses the SOMA body with SOMA-JAX and
 renders it headless::
 
-    python tools/pipeline/demo_walk.py                    # trial 35_08, "walk"
-    python tools/pipeline/demo_walk.py --trial 07_01 --width 1280 --height 720
-    python tools/pipeline/demo_walk.py --skeleton         # SOMA skeleton in a see-through body
-    python tools/pipeline/demo_walk.py --identity-model garment_measurement \\
+    python tools/pipeline/demo_motion.py                    # trial 35_08, "walk"
+    python tools/pipeline/demo_motion.py --trial 07_01 --width 1280 --height 720
+    python tools/pipeline/demo_motion.py --skeleton         # SOMA skeleton in a see-through body
+    python tools/pipeline/demo_motion.py --identity-model garment_measurement \\
         --identity-path assets/identity/identity_garment.npz --identity-coeffs 1.5 -1 0.5
 
 Writes to ``--output-dir`` (default ``demo_renders/walk``): ``walk.gif``,
