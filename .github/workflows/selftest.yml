@@ -9,6 +9,9 @@
 #   library only, run before anything is installed), then the full self-test.
 # * lowest  — the dependency floors in pyproject.toml, resolved with
 #   `uv --resolution lowest-direct`, full self-test.
+# * parity  — Linux with CPU torch + warp-lang: the full self-test, whose
+#   tools/selftest/test_upstream_parity.py then runs SOMA-JAX against upstream
+#   SOMA-X from the pinned submodule on identical inputs.
 name: selftest
 
 on:
@@ -75,12 +78,17 @@ jobs:
         with:
           path: assets/third_party
           key: soma-assets-v2-${{ runner.os }}-${{ hashFiles('soma_jax/assets.py', 'tools/download_assets.py') }}
-      # What from_upstream_assets() needs plus the Anny / GarmentMeasurements
-      # packs the identity-backend tests use — not the 696 MB MHR model.
+      # What from_upstream_assets() needs (the corrective checkpoint included),
+      # the USD example motion, the hand layer's files and the Anny /
+      # GarmentMeasurements packs the identity-backend tests use — not the
+      # 696 MB MHR model.
       - name: Fetch assets (stdlib only, before any install)
         run: >-
           python tools/download_assets.py --only SOMA_neutral.npz SOMA_template_rig.usda
-          SOMA_procedural_transforms.json Anny/base_body.obj Anny/SOMA_wrap.obj
+          SOMA_procedural_transforms.json correctives_model.pt example_animation.usd
+          SOMAHand.npz MANO/base_hand_left.obj MANO/base_hand_right.obj
+          MANO/SOMA_wrap_left.obj MANO/SOMA_wrap_right.obj
+          Anny/base_body.obj Anny/SOMA_wrap.obj
           GarmentMeasurements/mean.obj GarmentMeasurements/SOMA_wrap.obj
           GarmentMeasurements/point.npz
       - name: Headless OpenGL (Linux)
@@ -109,7 +117,10 @@ jobs:
       - name: Fetch assets
         run: >-
           python tools/download_assets.py --only SOMA_neutral.npz SOMA_template_rig.usda
-          SOMA_procedural_transforms.json Anny/base_body.obj Anny/SOMA_wrap.obj
+          SOMA_procedural_transforms.json correctives_model.pt example_animation.usd
+          SOMAHand.npz MANO/base_hand_left.obj MANO/base_hand_right.obj
+          MANO/SOMA_wrap_left.obj MANO/SOMA_wrap_right.obj
+          Anny/base_body.obj Anny/SOMA_wrap.obj
           GarmentMeasurements/mean.obj GarmentMeasurements/SOMA_wrap.obj
           GarmentMeasurements/point.npz
       - name: Install the dependency floors
@@ -119,3 +130,41 @@ jobs:
           python -c "import jax, numpy, scipy, equinox, optax; print('jax', jax.__version__, 'numpy', numpy.__version__, 'scipy', scipy.__version__, 'equinox', equinox.__version__, 'optax', optax.__version__)"
       - name: Self-test (full)
         run: python -m pytest tools/selftest -q -rs -p no:cacheprovider
+
+  parity:
+    name: upstream parity · ubuntu · py3.12 · torch CPU + warp
+    needs: install
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: assets/third_party
+          key: soma-assets-v2-${{ runner.os }}-${{ hashFiles('soma_jax/assets.py', 'tools/download_assets.py') }}
+      - name: Fetch assets
+        run: >-
+          python tools/download_assets.py --only SOMA_neutral.npz SOMA_template_rig.usda
+          SOMA_procedural_transforms.json correctives_model.pt example_animation.usd
+          SOMAHand.npz MANO/base_hand_left.obj MANO/base_hand_right.obj
+          MANO/SOMA_wrap_left.obj MANO/SOMA_wrap_right.obj
+          Anny/base_body.obj Anny/SOMA_wrap.obj
+          GarmentMeasurements/mean.obj GarmentMeasurements/SOMA_wrap.obj
+          GarmentMeasurements/point.npz
+      - name: Headless OpenGL
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libegl1 libegl-mesa0
+      - name: Install SOMA-JAX and upstream's runtime (CPU torch, warp-lang)
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev,vis,usd]" warp-lang
+      - name: Self-test, upstream parity included
+        env:
+          SOMA_JAX_REQUIRE_PARITY: "1"   # a skipped parity test fails the job
+        run: >-
+          python -m pytest tools/selftest -q -rs -p no:cacheprovider --durations=15

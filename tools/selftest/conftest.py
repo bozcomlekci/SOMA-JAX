@@ -46,6 +46,8 @@ jax.config.update("jax_default_matmul_precision", "highest")
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: builds the full layer or runs a tool")
     config.addinivalue_line("markers", "assets: needs the SOMA model assets")
+    config.addinivalue_line(
+        "markers", "xdist_group(name): keep on one pytest-xdist worker (--dist loadgroup)")
 
 
 def pytest_report_header(config):
