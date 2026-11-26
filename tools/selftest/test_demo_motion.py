@@ -162,6 +162,11 @@ def test_compose_gallery(tmp_path):
     assert {p.name for p in written} >= {"gallery.gif", "gallery.png"}
     gif = Image.open(tmp_path / "gallery.gif")
     assert gif.size == (64, 36) and gif.n_frames == 6          # 12 frames at 20 fps = 0.6 s
+    seen = set()
+    for k in range(gif.n_frames):                  # one shared palette, 128 colours
+        gif.seek(k)
+        seen.update(c for _, c in gif.convert("RGB").getcolors(1 << 16))
+    assert len(seen) <= 128
     assert Image.open(tmp_path / "gallery.png").size == (128, 72)
 
 

@@ -425,12 +425,26 @@ def checker_floor(x_range, z_range, tile: float = 0.5):
 BODY_COLOR = (0.55, 0.7, 0.9)
 
 
-def save_gif(images, path, fps: float):
+def save_gif(images, path, fps: float, colors: int | None = None):
     """Frames (arrays or PIL images) -> looping GIF that plays in real time:
     GIF delays are whole centiseconds, so 33.3 ms frames go out as 30/40/30 ms
-    rather than all 30 ms, which would run 10% fast."""
+    rather than all 30 ms, which would run 10% fast.
+
+    ``colors``: map every frame onto one shared palette of that many colours,
+    undithered, rather than a palette per frame: the file comes out about half
+    the size and nothing flickers between frames.
+    """
     from PIL import Image
     frames = [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
+    if colors:
+        sample = [f.convert("RGB") for f in frames[::max(1, len(frames) // 16)]]
+        montage = Image.new("RGB", (sample[0].width, sample[0].height * len(sample)))
+        for k, f in enumerate(sample):
+            montage.paste(f, (0, k * f.height))
+        palette = montage.quantize(colors, method=getattr(Image, "Quantize", Image).MEDIANCUT)
+        frames = [f.convert("RGB").quantize(palette=palette,
+                                            dither=getattr(Image, "Dither", Image).NONE)
+                  for f in frames]
     ticks = np.round(np.arange(len(frames) + 1) * 100.0 / fps).astype(int)
     frames[0].save(path, save_all=True, append_images=frames[1:],
                    duration=[int(d) * 10 for d in np.diff(ticks)], loop=0, optimize=True)
@@ -627,10 +641,12 @@ def run_motion(layer, coeffs, tpose, name: str, caption: str, asf_path, amc_path
     return images, fps, strip
 
 
-def compose_gallery(clips, out_dir, cols: int = 4, tile=(384, 216), fps: float = 15.0):
+def compose_gallery(clips, out_dir, cols: int = 4, tile=(384, 216), fps: float = 15.0,
+                    colors: int | None = 128):
     """Lay out ``clips`` [(caption, frames, fps, strip), ...]: ``gallery.gif``
-    (and ``.mp4``) plays them side by side, each looping, at ``fps``, and
-    ``gallery.png`` holds their strips. Returns the paths written."""
+    (and ``.mp4``) plays them side by side, each looping, at ``fps``, with
+    ``colors`` shared colours (see :func:`save_gif`), and ``gallery.png`` holds
+    their strips. Returns the paths written."""
     from PIL import Image, ImageDraw, ImageFont
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -660,7 +676,7 @@ def compose_gallery(clips, out_dir, cols: int = 4, tile=(384, 216), fps: float =
     frames = [sheet([s[int(k * c[2] / fps) % len(s)] for s, c in zip(shrunk, clips, strict=True)],
                     captions, tile) for k in range(max(1, int(round(seconds * fps))))]
     written = [out_dir / "gallery.gif"]
-    save_gif(frames, written[0], fps)
+    save_gif(frames, written[0], fps, colors)
     if save_mp4(frames, out_dir / "gallery.mp4", fps):
         written.append(out_dir / "gallery.mp4")
     sheet([c[3] for c in clips], captions, (2 * tw, 2 * th)).save(out_dir / "gallery.png")
@@ -677,6 +693,9 @@ def main():
                    help="render every example (or --motions) and a gallery of them")
     p.add_argument("--motions", nargs="+", choices=list(EXAMPLES), default=None,
                    help="the examples --gallery renders (default: all)")
+    p.add_argument("--gallery-width", type=int, default=1536,
+                   help="width of gallery.gif in pixels, four clips across (default 1536; "
+                        "the README's assets/media/mocap_gallery.gif is 1024)")
     p.add_argument("--trial", default=None,
                    help="any CMU trial instead of an example: subject_trial, e.g. 49_06")
     p.add_argument("--asf", default=None, help="local ASF file instead of downloading")
@@ -735,15 +754,18 @@ def main():
 
     if args.gallery:
         from PIL import Image
+        tw = args.gallery_width // 4
+        tile = (tw, int(round(tw * args.height / args.width)))
         clips = []
         for name in args.motions or EXAMPLES:
             trial, start, seconds, caption = EXAMPLES[name]
             images, fps, strip = run_motion(layer, coeffs, tpose, name, caption,
                                             *fetch_cmu_trial(trial, cache), cmu_fps(trial),
                                             args, start, seconds)
-            clips.append((caption, [Image.fromarray(im).resize((384, 216), Image.LANCZOS)
+            clips.append((caption, [Image.fromarray(im).resize(tile, Image.LANCZOS)
                                     for im in images], fps, strip))
-        for path in compose_gallery(clips, args.output_dir or REPO / "demo_renders" / "gallery"):
+        for path in compose_gallery(clips, args.output_dir or REPO / "demo_renders" / "gallery",
+                                    tile=tile):
             print(f"wrote {path}")
         return
 

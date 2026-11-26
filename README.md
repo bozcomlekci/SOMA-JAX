@@ -87,6 +87,10 @@ python tools/pipeline/demo_motion.py --motion cartwheel  # or run, jump, backfli
 python tools/pipeline/demo_motion.py --gallery           # all 12 -> demo_renders/gallery/gallery.gif
 ```
 
+![Twelve CMU motion-capture clips on the SOMA body](assets/media/mocap_gallery.gif)
+
+<sub>Twelve real captures, from a walk to a backflip, retargeted onto the SOMA skeleton and posed with SOMA-JAX (`--gallery --gallery-width 1024`). Motion data: CMU Graphics Lab Motion Capture Database, mocap.cs.cmu.edu.</sub>
+
 ## Identity models
 
 Swap the identity source without touching the pose data — every model below is

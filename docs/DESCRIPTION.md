@@ -275,6 +275,7 @@ python tools/pipeline/demo_motion.py                     # a walk: demo_renders/
 python tools/pipeline/demo_motion.py --list              # the 12 examples
 python tools/pipeline/demo_motion.py --motion backflip   # one of them
 python tools/pipeline/demo_motion.py --gallery           # all, plus demo_renders/gallery/
+python tools/pipeline/demo_motion.py --gallery --gallery-width 1024   # README's mocap_gallery.gif
 python tools/pipeline/demo_motion.py --trial 14_01 --start 5 --seconds 4   # any CMU trial
 
 # Demo: every identity model on one SOMA skeleton and motion, skeleton drawn
