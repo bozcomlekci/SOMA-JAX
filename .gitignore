@@ -82,7 +82,14 @@ temp/
 assets/third_party/
 # generated symlink view assembled by soma_jax.assets.data_root()
 assets/data_root/
-demo_renders/
+# dev branch only: the rendered demo media are tracked here (viewable media
+# only: GIF, MP4, PNG strips); motion NPZs stay ignored. main ignores
+# demo_renders/ entirely.
+demo_renders/**
+!demo_renders/**/
+!demo_renders/**/*.gif
+!demo_renders/**/*.mp4
+!demo_renders/**/*.png
 keys/
 /data
 data/
