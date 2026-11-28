@@ -97,9 +97,9 @@ data/
 datasets/
 
 # Benchmark intermediates — run_runtime.sh writes one JSON per backend then
-# merges into results/runtime.json. Only the merged file (+ figures) is committed.
-benchmarks/results/_soma_x.json
-benchmarks/results/_soma_jax.json
+# merges into results/runtime.json (or $OUTPUT). Only merged files (+ figures)
+# are committed.
+benchmarks/results/_*.json
 # Public media (teaser, README figures) — re-included despite *.gif etc. above.
 # Lives under assets/ but is repo-owned, unlike assets/third_party/.
 !assets/media/

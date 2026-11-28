@@ -27,6 +27,9 @@ the *same, real* work on each side, so the numbers are comparable:
 
     python benchmarks/somax_reference.py     # torch side -> results/_somax_reference.npz
     python benchmarks/verify_fairness.py     # JAX side: all four checks
+
+Without a GPU, pass ``--device cpu`` to ``somax_reference.py``; check 3 needs
+the CUDA-only hybrid and is skipped, the others run as on the GPU.
 """
 from __future__ import annotations
 import sys
@@ -245,9 +248,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__ or "SOMA-JAX fairness checks")
     ap.add_argument("--align-only", action="store_true",
                     help="run only the pure-JAX vs upstream align_vectors probe "
-                         "(the numbers docs/FAITHFULNESS.md quotes). Needs no GPU; "
-                         "the rest of this script does, because the Warp kernels "
-                         "register an XLA FFI handler for CUDA only.")
+                         "(the numbers docs/FAITHFULNESS.md quotes). The full run "
+                         "works on CPU too, minus the Warp-hybrid checks: Warp's "
+                         "kernels register an XLA FFI handler for CUDA only.")
     args = ap.parse_args()
 
     import jax, jax.numpy as jnp
@@ -279,6 +282,12 @@ def main():
 
     results, pipelines = {}, {}
     for backend in ["jax", "warp"]:
+        if backend == "warp":
+            # The hybrid fails only once it runs off a CUDA GPU, so ask first.
+            from soma_jax.geometry.warp_kabsch import is_available, unavailable_reason
+            if not is_available():
+                print(f"[warp] pipeline unavailable: {unavailable_reason()}")
+                continue
         try:
             fwd, (V, J, K) = _build_fair_pipeline(hf, backend)
         except Exception as e:

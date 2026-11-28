@@ -143,7 +143,12 @@ blend → skeleton fit → FK + LBS) on the same rig, matched float32.
 
 The pure-JAX path reproduces SOMA-X's posed meshes to 0.0027 mm; the hybrid's
 plain-Kabsch rotation step departs from upstream's on ill-conditioned joints
-(0.69 mm max). On peak GPU memory SOMA-JAX starts slightly heavier (1.08 vs
+(0.69 mm max). These GPU figures come from the v0.3.3 port. A CPU re-run on
+v0.3.6 times the v0.3.3 code alongside and finds no change on either side.
+Without a GPU the comparison also differs: on a 4-core CPU, pure JAX is 1.8×
+faster at B=1 but 2.3–3.6× slower from B=4 on. Its top-8 skinning gather is
+memory-bound on XLA:CPU
+([CPU results](benchmarks/README.md#cpu-section)). On peak GPU memory SOMA-JAX starts slightly heavier (1.08 vs
 1.01 GiB at B=1), crosses SOMA-X between B=32 and B=64, and grows 3.5× more
 slowly with batch: at B=4096 it needs 3.58 GiB to SOMA-X's 9.88, and SOMA-X
 runs out of the 16 GB card at B=8192.

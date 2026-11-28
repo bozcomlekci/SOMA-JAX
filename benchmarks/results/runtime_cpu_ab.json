@@ -1,0 +1,264 @@
+{
+  "description": "CPU before/after: the code the RTX 5080 tables were measured on (SOMA-JAX 4f3cf6b, SOMA-X v0.3.3) against v0.3.6 (SOMA-JAX main, SOMA-X v0.3.6), same machine, same assets, same harness settings. Runs alternate new, old, new, old; ratio = new / old median ms.",
+  "harness": "benchmarks/bench_forward_pass.py --device cpu, default sampling (min 30 samples, as the old harness); SOMA-X mode='warp', SOMA-JAX pure-JAX full fit; the same asset files for every run (sha256-identical)",
+  "sides": {
+    "soma_x": {
+      "code": {
+        "new": "SOMA-X v0.3.6 (the submodule, d7bac2a)",
+        "old": "SOMA-X v0.3.3 (its soma/ package via git archive, selected with PYTHONPATH)"
+      },
+      "order": [
+        "new (x_new_1.json)",
+        "old (x_old_1.json)",
+        "new (x_new_2.json)",
+        "old (x_old_2.json)",
+        "new (x_new_3.json)",
+        "old (x_old_3.json)"
+      ],
+      "env_new": {
+        "device": "cpu",
+        "python": "3.12.3",
+        "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+        "cpu_count": 4,
+        "jax": "0.12.0.1",
+        "jaxlib": "0.12.0.1",
+        "torch": "2.10.0+cpu",
+        "warp-lang": "1.11.1",
+        "numpy": "2.5.4",
+        "jax_backend": "cpu",
+        "torch_threads": 4,
+        "soma_x_version": "0.3.6",
+        "soma_x_git": "v0.3.6",
+        "soma_jax_git": "60a89958122e"
+      },
+      "env_old": {
+        "device": "cpu",
+        "python": "3.12.3",
+        "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+        "cpu_count": 4,
+        "jax": "0.12.0.1",
+        "jaxlib": "0.12.0.1",
+        "torch": "2.10.0+cpu",
+        "warp-lang": "1.11.1",
+        "numpy": "2.5.4",
+        "jax_backend": "cpu",
+        "torch_threads": 4,
+        "soma_x_version": "0.3.3",
+        "soma_x_git": null,
+        "soma_jax_git": "60a89958122e"
+      },
+      "batches": {
+        "1": {
+          "new_total_ms": [
+            5.711633000146321,
+            5.998299499879067,
+            5.656529000134469
+          ],
+          "old_total_ms": [
+            5.6394949999685196,
+            7.056580999915241,
+            5.920268999943801
+          ],
+          "new_skel_ms": [
+            3.2927604999031246,
+            3.3202240001628525,
+            3.3103319999554515
+          ],
+          "old_skel_ms": [
+            3.3994804999792905,
+            3.395623499955036,
+            3.7484504998701595
+          ],
+          "ratio_new_over_old": [
+            1.0127915709080697,
+            0.8500291430015634,
+            0.9554513486107076
+          ],
+          "ratio_mean": 0.9394240208401136,
+          "repeat_spread_new": 0.05903974734429096,
+          "repeat_spread_old": 0.2283615822482631
+        },
+        "32": {
+          "new_total_ms": [
+            53.5471209999514,
+            60.65147650019753,
+            61.04966249995414
+          ],
+          "old_total_ms": [
+            61.89200350002011,
+            61.85026299976926,
+            60.46878550000656
+          ],
+          "new_skel_ms": [
+            24.955230999921696,
+            26.11111650003295,
+            31.76727599975493
+          ],
+          "old_skel_ms": [
+            31.103607999966698,
+            31.958005499973297,
+            27.121310999973502
+          ],
+          "ratio_new_over_old": [
+            0.865170263876399,
+            0.9806179239759062,
+            1.009606228984829
+          ],
+          "ratio_mean": 0.9517981389457114,
+          "repeat_spread_new": 0.12843279870507682,
+          "repeat_spread_old": 0.023178055570983742
+        },
+        "256": {
+          "new_total_ms": [
+            556.0569224999199,
+            565.448651999759,
+            573.4617830003117
+          ],
+          "old_total_ms": [
+            565.6249405000153,
+            583.1984129997636,
+            561.1393545000283
+          ],
+          "new_skel_ms": [
+            320.34086999999545,
+            320.6742249999479,
+            338.1007734999457
+          ],
+          "old_skel_ms": [
+            315.9965685000543,
+            329.8524605002058,
+            336.7584044999603
+          ],
+          "ratio_new_over_old": [
+            0.9830841652922213,
+            0.9695647988671536,
+            1.0219596583299038
+          ],
+          "ratio_mean": 0.9915362074964262,
+          "repeat_spread_new": 0.03080565609133019,
+          "repeat_spread_old": 0.038700946628605334
+        }
+      }
+    },
+    "soma_jax_st": {
+      "code": {
+        "new": "SOMA-JAX 60a8995 (soma_jax/ unchanged since)",
+        "old": "SOMA-JAX 4f3cf6b, the commit the RTX 5080 tables were measured on (git archive; run through its own benchmarks/bench_forward_pass.py)"
+      },
+      "order": [
+        "new (jax_new_1.json)",
+        "old (jax_old_1.json)",
+        "new (jax_new_2.json)",
+        "old (jax_old_2.json)",
+        "new (jax_new_3.json)",
+        "old (jax_old_3.json)"
+      ],
+      "env_new": {
+        "device": "cpu",
+        "python": "3.12.3",
+        "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+        "cpu_count": 4,
+        "jax": "0.12.0.1",
+        "jaxlib": "0.12.0.1",
+        "torch": "2.10.0+cpu",
+        "warp-lang": "1.11.1",
+        "numpy": "2.5.4",
+        "jax_backend": "cpu",
+        "soma_jax_git": "60a89958122e"
+      },
+      "env_old": null,
+      "batches": {
+        "1": {
+          "new_total_ms": [
+            3.7122804999398795,
+            3.6861035000583797,
+            3.651712500186477
+          ],
+          "old_total_ms": [
+            3.811909999967611,
+            3.568187499922715,
+            3.769252999973105
+          ],
+          "new_skel_ms": [
+            1.895213499892634,
+            1.81743349980934,
+            2.1860855001705204
+          ],
+          "old_skel_ms": [
+            1.9020920001366903,
+            1.8866044999867881,
+            2.153836999923442
+          ],
+          "ratio_new_over_old": [
+            0.9738636274128776,
+            1.033046469709963,
+            0.96881596969281
+          ],
+          "ratio_mean": 0.9919086889385502,
+          "repeat_spread_new": 0.01644365723477346,
+          "repeat_spread_old": 0.06557938062344032
+        },
+        "32": {
+          "new_total_ms": [
+            194.455754000046,
+            230.36347549987113,
+            208.63960750011756
+          ],
+          "old_total_ms": [
+            207.9071344996919,
+            206.13612650004143,
+            210.4616490000808
+          ],
+          "new_skel_ms": [
+            15.599830499922973,
+            19.567347500014876,
+            16.867077999904723
+          ],
+          "old_skel_ms": [
+            17.922022999755427,
+            17.33345000002373,
+            21.124888000031206
+          ],
+          "ratio_new_over_old": [
+            0.9353010153691199,
+            1.1175308249513694,
+            0.9913426436188261
+          ],
+          "ratio_mean": 1.0147248279797718,
+          "repeat_spread_new": 0.17005550827838478,
+          "repeat_spread_old": 0.02077896793497103
+        },
+        "256": {
+          "new_total_ms": [
+            1730.85284449985,
+            1534.7038155000519,
+            1526.0638064999057
+          ],
+          "old_total_ms": [
+            1652.4674139998297,
+            1634.7147264998512,
+            1563.9893640000082
+          ],
+          "new_skel_ms": [
+            150.20751649990416,
+            166.7986045001726,
+            196.76809499992487
+          ],
+          "old_skel_ms": [
+            177.3953954998433,
+            159.74269299999833,
+            161.4583505001974
+          ],
+          "ratio_new_over_old": [
+            1.0474353865231671,
+            0.9388205725570623,
+            0.9757507574072593
+          ],
+          "ratio_mean": 0.9873355721624962,
+          "repeat_spread_new": 0.12821698176955518,
+          "repeat_spread_old": 0.05471547434537446
+        }
+      }
+    }
+  }
+}
