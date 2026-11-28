@@ -10,6 +10,7 @@ pipelines and compares meshes.
 Usage::
 
     python benchmarks/somax_reference.py          # -> benchmarks/results/_somax_reference.npz
+    python benchmarks/somax_reference.py --device cpu   # no GPU: Warp runs its CPU kernels
 """
 from __future__ import annotations
 
@@ -42,6 +43,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--asset-dir", default=None, help="upstream-layout assets (default: data_root)")
     p.add_argument("--out", default=str(REPO / "benchmarks" / "results" / "_somax_reference.npz"))
+    p.add_argument("--device", default="cuda:0",
+                   help="torch device for SOMA-X; 'cpu' works (Warp runs its CPU kernels)")
     args = p.parse_args()
 
     import torch
@@ -49,16 +52,17 @@ def main():
 
     from soma_jax.assets import data_root
     torch.backends.cuda.matmul.allow_tf32 = False
-    layer = SOMALayer(data_root=args.asset_dir or str(data_root()), device="cuda:0",
+    dev = args.device
+    layer = SOMALayer(data_root=args.asset_dir or str(data_root()), device=dev,
                       identity_model_type="soma", mode="warp", correctives_model_path=None,
-                      enable_procedural_transforms=False).to("cuda:0")
+                      enable_procedural_transforms=False).to(dev)
     layer.eval()
     inputs = reference_inputs(layer.num_shape_components)
     with torch.no_grad():
-        layer.prepare_identity(torch.from_numpy(inputs["coeffs"]).cuda(),
+        layer.prepare_identity(torch.from_numpy(inputs["coeffs"]).to(dev),
                                repose_to_bind_pose=False)
-        out = layer.pose(torch.from_numpy(inputs["poses"]).cuda(),
-                         transl=torch.from_numpy(inputs["transl"]).cuda(),
+        out = layer.pose(torch.from_numpy(inputs["poses"]).to(dev),
+                         transl=torch.from_numpy(inputs["transl"]).to(dev),
                          apply_correctives=False)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.out, vertices=out["vertices"].cpu().numpy(), **inputs)

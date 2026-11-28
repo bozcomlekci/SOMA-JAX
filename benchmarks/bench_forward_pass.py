@@ -16,6 +16,12 @@ Usage::
     python benchmarks/bench_forward_pass.py --device cuda:0 \
         --soma-asset assets/third_party \
         --output benchmarks/results/runtime.json
+
+    # CPU: no GPU needed. The Warp svd3 hybrid is CUDA-only and is skipped;
+    # --soma-x-mode dense times upstream's dense PyTorch LBS instead of Warp's
+    # CPU kernels, and --min-samples keeps the slow large batches short.
+    python benchmarks/bench_forward_pass.py --device cpu --soma-x-mode dense \
+        --min-samples 10 --output benchmarks/results/_cpu.json
 """
 from __future__ import annotations
 import argparse
@@ -68,7 +74,75 @@ def _summary(times_s: list[float], batch: int) -> dict:
     }
 
 
-def _timed_samples(step, sync, warmup_s: float = 0.7, budget_s: float = 1.2) -> list[float]:
+def _git_version(pkg_dir: Path) -> str | None:
+    """``git describe`` of the checkout holding the package directory
+    ``pkg_dir``, plus ``-dirty`` when tracked files *under it* are modified (so
+    an edited benchmark script does not mark the library as changed). None
+    outside a git checkout, e.g. an extracted archive."""
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(pkg_dir), *args],
+                              capture_output=True, text=True, timeout=10)
+    try:
+        head = git("describe", "--always", "--abbrev=12")
+        if head.returncode != 0:
+            return None
+        dirty = git("status", "--porcelain", "--untracked-files=no", "--", ".")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return head.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+
+
+def _cpu_model() -> str | None:
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    import platform
+    return platform.processor() or None
+
+
+def _env(device: str) -> dict:
+    """What produced the numbers: hardware, library versions, code versions.
+
+    Versions and commits only, no paths. Read after the benchmarks ran, so the
+    modules they imported (torch, upstream ``soma``) are visible.
+    """
+    import importlib.metadata as md
+    import platform
+    env = {"device": device, "python": platform.python_version(),
+           "cpu": _cpu_model(), "cpu_count": os.cpu_count()}
+    for dist in ("jax", "jaxlib", "torch", "warp-lang", "numpy"):
+        try:
+            env[dist] = md.version(dist)
+        except md.PackageNotFoundError:
+            pass
+    if "jax" in sys.modules:
+        env["jax_backend"] = sys.modules["jax"].default_backend()
+    if "torch" in sys.modules:
+        env["torch_threads"] = sys.modules["torch"].get_num_threads()
+    if "soma" in sys.modules:                                    # upstream SOMA-X
+        soma = sys.modules["soma"]
+        env["soma_x_version"] = getattr(soma, "__version__", None)
+        env["soma_x_git"] = _git_version(Path(soma.__file__).resolve().parent)
+    if "soma_jax" in sys.modules:
+        env["soma_jax_git"] = _git_version(Path(sys.modules["soma_jax"].__file__).resolve().parent)
+    return env
+
+
+def _jax_platform() -> str:
+    """'gpu' on a CUDA/ROCm backend, else JAX's backend name (e.g. 'cpu')."""
+    import jax
+    backend = jax.default_backend()
+    return "gpu" if backend in ("gpu", "cuda", "rocm") else backend
+
+
+def _timed_samples(step, sync, warmup_s: float = 0.7, budget_s: float = 1.2,
+                   min_samples: int = 30) -> list[float]:
     """Low-variance GPU timing -> list of per-iteration times (seconds).
 
     The RTX 5080 idles at ~810 MHz and boosts to ~3090 MHz; that clock ramp is
@@ -82,7 +156,9 @@ def _timed_samples(step, sync, warmup_s: float = 0.7, budget_s: float = 1.2) -> 
     reproducible, essentially spread-free number.
 
     ``step()`` issues one forward and returns its result; ``sync(result)``
-    blocks until the device has finished it.
+    blocks until the device has finished it. ``min_samples`` floors ``outer``:
+    30 for the GPU tables; a CPU run lowers it so batches that take seconds per
+    forward finish in minutes (the standard error is reported either way).
     """
     t_end = time.perf_counter() + warmup_s
     while time.perf_counter() < t_end:
@@ -95,7 +171,7 @@ def _timed_samples(step, sync, warmup_s: float = 0.7, budget_s: float = 1.2) -> 
     per = (time.perf_counter() - t0) / 5
     inner = max(1, min(256, int(round(2e-3 / max(per, 1e-9)))))   # >= ~2 ms of work per sample
     outer = int(round(budget_s / max(inner * per, 1e-9)))
-    outer = max(30, min(outer, 300))
+    outer = max(min_samples, min(outer, 300))
     samples = []
     for _ in range(outer):
         t0 = time.perf_counter()
@@ -111,11 +187,17 @@ def _timed_samples(step, sync, warmup_s: float = 0.7, budget_s: float = 1.2) -> 
 # SOMA-X (torch + Warp)
 # ---------------------------------------------------------------------------
 def bench_soma_x(asset_dir: str, batches: list[int],
-                  warmup: int, n_iter: int, device: str) -> dict:
+                  warmup: int, n_iter: int, device: str,
+                  mode: str = "warp", min_samples: int = 30) -> dict:
     """Time SOMA-X's full forward pass (prepare_identity + pose) at each
-    batch size, plus skeleton-fitting alone."""
+    batch size, plus skeleton-fitting alone.
+
+    ``mode`` is upstream's skinning backend: ``"warp"`` (its Warp kernels, the
+    paper's and this page's setting; on a CPU device Warp runs its CPU kernels)
+    or ``"dense"`` (upstream's dense PyTorch LBS fallback)."""
     import torch
     from soma import SOMALayer
+    on_cuda = str(device).startswith("cuda")
 
     # Pin true float32 matmuls (no TF32) so this matches the JAX side's
     # `jax_default_matmul_precision="highest"`. allow_tf32 already defaults to
@@ -125,14 +207,15 @@ def bench_soma_x(asset_dir: str, batches: list[int],
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
-    print(f"\n[soma_x] loading SOMALayer (mode='warp', backend='soma', device={device})")
+    tag = "soma_x" if mode == "warp" else f"soma_x_{mode}"
+    print(f"\n[{tag}] loading SOMALayer (mode={mode!r}, backend='soma', device={device})")
     # mode='warp' triggers SOMA-X's Warp LBS kernels (= paper's "Warp (GPU)" row).
     # We disable correctives to mirror the paper's setup (LBS-only forward).
     layer = SOMALayer(
         data_root=str(asset_dir),
         device=device,
         identity_model_type="soma",
-        mode="warp",
+        mode=mode,
         correctives_model_path=None,   # paper Table 4 measures LBS-only.
         enable_procedural_transforms=False,
     ).to(device)
@@ -141,9 +224,16 @@ def bench_soma_x(asset_dir: str, batches: list[int],
     n_joints = len(layer.parents) + 1  # parents excludes virtual root prepended later
     print(f"  K_id={K_id} n_joints_public={n_joints - 1}")
 
+    # Torch CPU ops return finished, and so do Warp's CPU launches; only a CUDA
+    # device runs asynchronously and needs the explicit sync.
+    if on_cuda:
+        sync = lambda r=None: torch.cuda.synchronize()
+    else:
+        sync = lambda r=None: None
+
     rows = []
     for B in batches:
-        print(f"\n[soma_x] batch={B}")
+        print(f"\n[{tag}] batch={B}")
         try:
             torch.manual_seed(0)
             identity = torch.zeros(B, K_id, device=device, dtype=torch.float32)
@@ -151,34 +241,35 @@ def bench_soma_x(asset_dir: str, batches: list[int],
             poses = torch.zeros(B, n_joints - 1, 3, device=device, dtype=torch.float32)
             transl = torch.zeros(B, 3, device=device, dtype=torch.float32)
 
-            sync = lambda r=None: torch.cuda.synchronize()
             # 1) skeleton-only: prepare_identity (identity blend + SkeletonTransfer
             #    .fit + rebind precompute).
             skel = _summary(_timed_samples(
                 lambda: layer.prepare_identity(identity, repose_to_bind_pose=False),
-                sync), B)
+                sync, min_samples=min_samples), B)
 
             # 2) total forward: prepare_identity + pose (full pipeline each call).
             def _fwd_step():
                 layer.prepare_identity(identity, repose_to_bind_pose=False)
                 return layer.pose(poses, transl=transl, apply_correctives=False)
-            fwd = _summary(_timed_samples(_fwd_step, sync), B)
+            fwd = _summary(_timed_samples(_fwd_step, sync, min_samples=min_samples), B)
         except Exception as e:
             print(f"  SKIPPED (B={B}): {type(e).__name__}: {str(e)[:120]}")
-            torch.cuda.empty_cache()
+            if on_cuda:
+                torch.cuda.empty_cache()
             continue
         print(f"  skel={skel['median_ms']:6.3f} ms  total={fwd['median_ms']:6.3f} ms  "
               f"(p10-p90 {fwd['p10_ms']:.3f}-{fwd['p90_ms']:.3f})  "
               f"m/s={fwd['meshes_per_sec_median']:,.0f}")
         rows.append({"batch": B, "skel": skel, "total": fwd})
-    return {"backend": "soma_x", "mode": "warp_gpu", "rows": rows}
+    return {"backend": tag, "mode": f"{mode}_{'gpu' if on_cuda else 'cpu'}", "rows": rows}
 
 
 # ---------------------------------------------------------------------------
 # SOMA-JAX
 # ---------------------------------------------------------------------------
 def bench_soma_jax(asset_path: str, batches: list[int],
-                    warmup: int, n_iter: int, matmul_precision: str = "highest") -> dict:
+                    warmup: int, n_iter: int, matmul_precision: str = "highest",
+                    min_samples: int = 30) -> dict:
     """Time soma_jax's full forward pass at each batch size, plus the
     skeleton-fitting cost (J_regressor @ rest_verts -> joint positions)."""
     import jax
@@ -223,10 +314,11 @@ def bench_soma_jax(asset_path: str, batches: list[int],
             transl = jnp.zeros((B, 3), dtype=jnp.float32)
 
             skel = _summary(_timed_samples(
-                lambda: prepare_only(identity), lambda r: r[0].block_until_ready()), B)
+                lambda: prepare_only(identity), lambda r: r[0].block_until_ready(),
+                min_samples=min_samples), B)
             fwd = _summary(_timed_samples(
                 lambda: full_forward(identity, rotmats, transl),
-                lambda r: r.block_until_ready()), B)
+                lambda r: r.block_until_ready(), min_samples=min_samples), B)
         except Exception as e:
             print(f"  SKIPPED (B={B}): {type(e).__name__}: {str(e)[:120]}")
             continue
@@ -234,7 +326,8 @@ def bench_soma_jax(asset_path: str, batches: list[int],
               f"(p10-p90 {fwd['p10_ms']:.3f}-{fwd['p90_ms']:.3f})  "
               f"m/s={fwd['meshes_per_sec_median']:,.0f}")
         rows.append({"batch": B, "skel": skel, "total": fwd})
-    return {"backend": "soma_jax_linear", "mode": "jax_gpu_linear_regressor", "rows": rows}
+    return {"backend": "soma_jax_linear", "mode": f"jax_{_jax_platform()}_linear_regressor",
+            "rows": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +336,8 @@ def bench_soma_jax(asset_path: str, batches: list[int],
 def bench_soma_jax_st(hf_asset_dir: str, batches: list[int],
                        warmup: int, n_iter: int,
                        rotation_backend: str = "jax",
-                       matmul_precision: str = "highest") -> dict:
+                       matmul_precision: str = "highest",
+                       min_samples: int = 30) -> dict:
     """Time soma_jax doing the *same algorithm* SOMA-X runs per identity.
 
     ``rotation_backend``: ``"jax"`` runs the covariance→rotation SVD with
@@ -372,10 +466,11 @@ def bench_soma_jax_st(hf_asset_dir: str, batches: list[int],
             hips = jnp.zeros((B, 3), dtype=jnp.float32)
 
             skel = _summary(_timed_samples(
-                lambda: prepare_identity(coeffs), lambda r: r[1].block_until_ready()), B)
+                lambda: prepare_identity(coeffs), lambda r: r[1].block_until_ready(),
+                min_samples=min_samples), B)
             fwd = _summary(_timed_samples(
                 lambda: full_forward(coeffs, rotmats, hips),
-                lambda r: r.block_until_ready()), B)
+                lambda r: r.block_until_ready(), min_samples=min_samples), B)
         except Exception as e:
             print(f"  SKIPPED (B={B}): {type(e).__name__}: {str(e)[:120]}")
             continue
@@ -385,7 +480,7 @@ def bench_soma_jax_st(hf_asset_dir: str, batches: list[int],
         rows.append({"batch": B, "skel": skel, "total": fwd})
     tag = "soma_jax_hybrid" if rotation_backend == "warp" else "soma_jax_st"
     mode = ("jax_warp_hybrid_skeleton_transfer" if rotation_backend == "warp"
-            else "jax_gpu_skeleton_transfer")
+            else f"jax_{_jax_platform()}_skeleton_transfer")
     return {"backend": tag, "mode": mode, "rows": rows}
 
 
@@ -418,6 +513,13 @@ def main():
     p.add_argument("--matmul-precision", default="highest",
                     help="JAX matmul precision: 'highest' = float32 (fair vs SOMA-X); "
                          "'default' = TF32 (JAX-only, NOT comparable to SOMA-X's float32).")
+    p.add_argument("--soma-x-mode", default="warp", choices=["warp", "dense"],
+                    help="SOMA-X skinning backend: 'warp' = its Warp kernels (the paper's and "
+                         "the GPU tables' setting; CPU kernels on --device cpu); 'dense' = "
+                         "upstream's dense PyTorch LBS fallback.")
+    p.add_argument("--min-samples", type=int, default=30,
+                    help="Floor on timed samples per measurement. 30 is the GPU methodology; "
+                         "lower it for CPU batches that take seconds per forward.")
     args = p.parse_args()
 
     # Tell JAX which device to use.
@@ -425,6 +527,10 @@ def main():
     if args.device.startswith("cuda"):
         idx = args.device.split(":")[-1] if ":" in args.device else "0"
         os.environ["CUDA_VISIBLE_DEVICES"] = idx
+    elif args.device == "cpu":
+        # Keep JAX on the host as well: on a machine with a GPU it would
+        # otherwise pick the GPU while SOMA-X runs on the CPU.
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
     # Repo-relative provenance: absolute paths would publish the local layout.
     payload = {"args": {k: (str(Path(v).resolve().relative_to(REPO))
@@ -434,28 +540,34 @@ def main():
                "results": []}
     if not args.skip_soma_x:
         payload["results"].append(
-            bench_soma_x(args.soma_asset, args.batches, args.warmup, args.iters, args.device)
+            bench_soma_x(args.soma_asset, args.batches, args.warmup, args.iters, args.device,
+                         mode=args.soma_x_mode, min_samples=args.min_samples)
         )
     if not args.skip_soma_jax_st:
         payload["results"].append(
             bench_soma_jax_st(args.soma_asset, args.batches, args.warmup, args.iters,
-                              rotation_backend="jax", matmul_precision=args.matmul_precision)
+                              rotation_backend="jax", matmul_precision=args.matmul_precision,
+                              min_samples=args.min_samples)
         )
     if not args.skip_soma_jax_hybrid:
         from soma_jax.geometry.warp_kabsch import is_available, unavailable_reason
         if not is_available():
             print(f"\n[soma_jax_hybrid] skipped: {unavailable_reason()}")
+            payload.setdefault("skipped", {})["soma_jax_hybrid"] = unavailable_reason()
             args.skip_soma_jax_hybrid = True
     if not args.skip_soma_jax_hybrid:
         payload["results"].append(
             bench_soma_jax_st(args.soma_asset, args.batches, args.warmup, args.iters,
-                              rotation_backend="warp", matmul_precision=args.matmul_precision)
+                              rotation_backend="warp", matmul_precision=args.matmul_precision,
+                              min_samples=args.min_samples)
         )
     if not args.skip_soma_jax:
         payload["results"].append(
             bench_soma_jax(args.soma_jax_asset, args.batches, args.warmup, args.iters,
-                           matmul_precision=args.matmul_precision)
+                           matmul_precision=args.matmul_precision,
+                           min_samples=args.min_samples)
         )
+    payload["env"] = _env(args.device)
 
     # Stamp the precision convention onto every block so a result can never be
     # read without knowing which one produced it. SOMA-X is always true float32

@@ -107,6 +107,17 @@ its extra speed with an optional dependency and a plain-Kabsch rotation step
 that departs from upstream's `auto` on ill-conditioned joints: 0.69 mm max /
 1.6 µm mean against SOMA-X's meshes.
 
+These GPU figures come from the v0.3.3 port. A CPU re-run on v0.3.6 times the
+v0.3.3 code alongside, on the same machine, and finds no measurable change on
+either side. It also shows the margin is a GPU result:
+- on a 4-core CPU, pure JAX is 1.8× faster than SOMA-X's Warp CPU kernels at
+  B=1, but 2.3–3.6× slower from B=4 on;
+- the cause is its top-8 skinning gather, which XLA:CPU materializes, so the
+  step is memory-bound;
+- the skeleton fit stays 1.7–2.4× faster.
+
+Details are in [`benchmarks/README.md`](../benchmarks/README.md#cpu-section).
+
 On **peak GPU memory** — CUDA context plus requested-bytes high-water, with
 NVIDIA Warp's allocations counted on both sides — SOMA-X carries the slightly
 smaller fixed baseline (1.01 vs 1.08 GiB), but SOMA-JAX grows **3.5× more

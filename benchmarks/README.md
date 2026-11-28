@@ -5,8 +5,10 @@ Reproducing (and extending) the SOMA paper's **Table 4 (Runtime performance)**
 distributed with this repo) against SOMA-X v0.3.3 on a single NVIDIA
 **RTX 5080 (16 GB)** in the `body` conda env. The port now tracks v0.3.6;
 v0.3.4–v0.3.6 changed the corrective weights and added the USD animation API,
-none of which these LBS-only timings run, so they were not re-measured. Two
-experiments:
+none of which these LBS-only timings run. They were not re-measured on a GPU;
+a [CPU re-run](#cpu-section) on v0.3.6 times the v0.3.3 code alongside and finds
+no measurable change on either side, and it shows how differently the two
+compare without a GPU. Two experiments:
 
 * **Runtime** — forward-pass time & throughput vs batch size.
 * **Memory** — peak GPU memory vs batch size.
@@ -26,6 +28,7 @@ benchmarks/
   somax_reference.py      verify_fairness.py                           # fairness
                                              plot_procedural_gap.py    # rig study
   results/     runtime.json  runtime_tf32.json  memory.jsonl  tf32_precision.json
+               runtime_cpu.json  runtime_cpu_dense.json  runtime_cpu_ab.json
   figures/     runtimes.{png,pdf}  memory.{png,pdf}  tf32.{png,pdf}
                procedural_rig_gap.{png,pdf}
 ```
@@ -55,6 +58,10 @@ bash benchmarks/run_memory.sh
 python benchmarks/plot_memory.py
 
 # TF32 (JAX-only): see "Precision" below
+
+# runtime on the CPU, no GPU needed: see "Runtime on CPU" below
+DEVICE=cpu MIN_SAMPLES=10 BATCHES="1 2 4 8 16 32 64 128 256 512" \
+    OUTPUT=benchmarks/results/runtime_cpu.json bash benchmarks/run_runtime.sh
 
 # what upstream's 110-joint procedural rig changes (upstream vs upstream, CPU)
 python benchmarks/plot_procedural_gap.py
@@ -306,6 +313,142 @@ python benchmarks/tf32_precision.py                         # -> results/tf32_pr
 python benchmarks/plot_tf32.py                              # -> figures/tf32.{png,pdf}
 ```
 
+<a name="cpu-section"></a>
+## Runtime on CPU (v0.3.6, no GPU)
+
+The tables above need the RTX 5080. As a rough check on v0.3.6, both sides
+were timed on the CPU of a 4-core cloud VM: an Intel Xeon at 2.10 GHz with
+AVX-512, 15 GB of RAM and no GPU. The software was SOMA-X v0.3.6 on torch
+2.10.0+cpu and warp-lang 1.11.1, and SOMA-JAX on JAX 0.12.0.1. Treat the
+numbers as rough: on this shared VM, repeated runs of the same code differ by
+up to ~15% at mid batches. Absolute CPU numbers also say nothing about the GPU
+tables.
+
+The setup is the GPU one: matched float32, upstream's public rig, top-8 LBS,
+the SOMA identity backend, no correctives and zero inputs. Three things differ
+on CPU:
+
+- **SOMA-X runs its Warp kernels on the CPU** (`mode="warp"`, as on the GPU).
+  Its dense PyTorch fallback, `mode="dense"`, is slower at every batch above 1:
+  82.6 ms at B=2 and 3.78 s at B=128 (`results/runtime_cpu_dense.json`). So
+  Warp is the baseline.
+- **The JAX + Warp `svd3` hybrid can't run**, because Warp registers its XLA
+  FFI handler for CUDA only.
+- **Fewer samples, smaller batches.** Each point takes at least 10 samples
+  (`--min-samples 10`) instead of 30. The sweep stops at B=512 because
+  SOMA-JAX's CPU memory grows by 13.7 MB per mesh (7.7 GB at B=512), so B=1024
+  would not fit in 15 GB.
+
+Milliseconds per forward (median), with the speedup over SOMA-X in brackets:
+
+| Batch | SOMA-X (Warp, CPU) | full fit, pure JAX | linear fit (approx.) |
+|---:|---:|---:|---:|
+| 1 | 5.48 | 3.11 (1.76×) | 2.12 (2.58×) |
+| 2 | 6.78 | 4.47 (1.52×) | 3.53 (1.92×) |
+| 4 | 10.38 | 23.76 (0.44×) | 25.67 (0.40×) |
+| 8 | 16.90 | 45.93 (0.37×) | 48.47 (0.35×) |
+| 16 | 28.09 | 99.25 (0.28×) | 102.71 (0.27×) |
+| 32 | 55.54 | 197.80 (0.28×) | 185.05 (0.30×) |
+| 64 | 117.96 | 410.38 (0.29×) | 362.59 (0.33×) |
+| 128 | 233.15 | 743.10 (0.31×) | 687.41 (0.34×) |
+| 256 | 523.95 | 1502.07 (0.35×) | 1432.86 (0.37×) |
+| 512 | 1068.48 | 2769.84 (0.39×) | 2858.05 (0.37×) |
+
+The same forward split in two (ms). The first part is the skeleton fit,
+`prepare_identity` on both sides; the second is the rest of the forward,
+FK + LBS:
+
+| Batch | skeleton fit, SOMA-X | skeleton fit, pure JAX | FK + LBS, SOMA-X | FK + LBS, pure JAX |
+|---:|---:|---:|---:|---:|
+| 1 | 3.21 | 1.59 | 2.27 | 1.51 |
+| 4 | 5.14 | 2.45 | 5.24 | 21.31 |
+| 64 | 62.19 | 26.36 | 55.76 | 384.02 |
+| 512 | 616.23 | 265.29 | 452.25 | 2504.55 |
+
+Every batch, with standard errors and the throughput, is in
+[`results/runtime_cpu.json`](results/runtime_cpu.json).
+
+### CPU conclusions
+
+* **On a CPU, SOMA-JAX is faster only at the smallest batches:** 1.8× at B=1
+  and 1.5× at B=2. From B=4 on, SOMA-X is 2.3–3.6× faster. At B=512 it takes
+  1.07 s to SOMA-JAX's 2.77 s (479 vs 185 meshes/sec).
+* **The skeleton fit is not the cause.** JAX's is 1.7–2.4× faster at every
+  batch. The loss is all in the skinning: FK + LBS take 2.50 s of JAX's 2.77 s
+  at B=512, against 0.45 s for SOMA-X's Warp CPU kernel.
+* **Why:** SOMA-JAX's top-8 LBS (`lbs_sparse`) gathers each vertex's eight bone
+  transforms into a (B, V, 8, 3, 4) array and slices it for two einsums.
+  - On the GPU, XLA fuses that work.
+  - On the CPU it materializes the array. That array plus its two slices come
+    to 13.9 MB per mesh, which matches the measured 13.7 MB per mesh, so the
+    step is memory-bound.
+  - Warp's CPU kernel blends each vertex in one pass instead.
+  - A GEMM over the same top-8 weights (`lbs_blend` on the scattered (V, J)
+    matrix) avoids the gather. SOMA-JAX does not switch to it on CPU yet.
+* **For scale:** the paper's "PyTorch (CPU)" row reads 3.2 ms for the skeleton
+  fit and 12.1 ms in total at B=1, on the paper's CPU. Here SOMA-X takes 3.2 ms
+  and 5.5 ms.
+
+**Fairness on CPU.** Run `somax_reference.py --device cpu`, then
+`verify_fairness.py`; every check passes:
+- Zero and random inputs time the same (ratio 0.98), so nothing is
+  constant-folded.
+- The pure-JAX pipeline reproduces SOMA-X's own CPU meshes to 0.0036 mm max and
+  0.46 µm mean. Against the GPU reference it was 0.0027 mm.
+- The hybrid checks are skipped, since the hybrid is CUDA-only.
+
+### v0.3.3 vs v0.3.6 on CPU: do the RTX 5080 tables still apply?
+
+The GPU tables were measured on the v0.3.3 port, commit 4f3cf6b.
+- **Upstream:** in v0.3.4–v0.3.6 its timed path changed only in the
+  rotation-vector formula (`soma/geometry/transforms.py`), and the timed
+  assets did not change.
+- **SOMA-JAX:** its skeleton-fit code did change, e.g. the zero-covariance
+  gradient guard.
+
+So the old and new code of each side were timed on this machine with the same
+assets and harness settings (30 samples), alternating new and old runs over
+three pairs:
+
+| Side | Batch | new / old, three pairs | mean |
+|---|---:|---|---:|
+| SOMA-X v0.3.6 / v0.3.3 (Warp, CPU) | 1 | 1.01, 0.85, 0.96 | 0.94 |
+| | 32 | 0.87, 0.98, 1.01 | 0.95 |
+| | 256 | 0.98, 0.97, 1.02 | 0.99 |
+| SOMA-JAX full fit, main / 4f3cf6b | 1 | 0.97, 1.03, 0.97 | 0.99 |
+| | 32 | 0.94, 1.12, 0.99 | 1.01 |
+| | 256 | 1.05, 0.94, 0.98 | 0.99 |
+
+Every ratio lies inside the spread between repeats of the same code, which
+reaches 23% here because of VM noise. Neither side's timed path changed
+measurably. The low SOMA-X mean at B=1 comes from one noisy old run. This
+supports the claim that the RTX 5080 tables describe v0.3.6, but a CPU cannot
+prove it: a change that shows up only on the GPU's code path would not appear
+here. The data is in [`results/runtime_cpu_ab.json`](results/runtime_cpu_ab.json).
+
+**Memory is not re-measured on CPU.** The GPU method (the CUDA context, the
+device allocator counters, Warp's allocator) has no CPU equivalent here. For
+orientation only, the peak resident memory of each sweep process up to B=512
+was 2.6 GB for SOMA-X and 8.4 GB for SOMA-JAX (both JAX rows).
+
+Reproduce:
+
+```bash
+DEVICE=cpu MIN_SAMPLES=10 BATCHES="1 2 4 8 16 32 64 128 256 512" \
+    OUTPUT=benchmarks/results/runtime_cpu.json bash benchmarks/run_runtime.sh
+python benchmarks/bench_forward_pass.py --device cpu --soma-x-mode dense \
+    --skip-soma-jax --skip-soma-jax-st --skip-soma-jax-hybrid --min-samples 10 \
+    --batches 1 2 4 8 16 32 64 128 --output benchmarks/results/runtime_cpu_dense.json
+python benchmarks/somax_reference.py --device cpu && python benchmarks/verify_fairness.py
+```
+
+The v0.3.3/v0.3.6 comparison ran each old version from an extracted tree:
+- SOMA-JAX via `git archive 4f3cf6b`, run with that tree's own harness;
+- upstream's `soma/` package from `v0.3.3`, put first on `PYTHONPATH`.
+
+Each ran the pure-JAX full fit or SOMA-X `mode="warp"` at B=1, 32 and 256 with
+`--device cpu`.
+
 ## Memory on RTX 5080 (peak GPU memory)
 
 **One metric: `peak_mib`** — the CUDA context plus the high-water mark of the
@@ -544,13 +687,13 @@ rig and makes it the default, as upstream does
 | File | Purpose |
 |---|---|
 | `_rig.py` | upstream's public rig plus the core asset's shape data, for the JAX pipelines |
-| `bench_forward_pass.py` | runtime benchmark (all 4 setups; median + SE; writes `results/runtime.json`) |
-| `run_runtime.sh` | runs torch / JAX subprocesses and merges into `results/runtime.json` |
+| `bench_forward_pass.py` | runtime benchmark (all 4 setups; median + SE; writes `results/runtime.json`; `--device cpu`, `--soma-x-mode dense`, `--min-samples` for the CPU runs) |
+| `run_runtime.sh` | runs torch / JAX subprocesses and merges into `results/runtime.json` (`DEVICE=cpu`, `SOMA_X_MODES`, `MIN_SAMPLES`, `OUTPUT` for other runs) |
 | `plot_runtimes.py` | two-panel runtime figure → `figures/runtimes.{png,pdf}` |
 | `tf32_precision.py` | TF32 vertex-error emulation → `results/tf32_precision.json` |
 | `plot_tf32.py` | TF32-vs-float32 trade figure (speed + measured precision cost) → `figures/tf32.{png,pdf}` |
-| `somax_reference.py` | SOMA-X's posed meshes on seeded inputs → `results/_somax_reference.npz` (not committed) |
-| `verify_fairness.py` | fairness checks (shared `_build_fair_pipeline`) |
+| `somax_reference.py` | SOMA-X's posed meshes on seeded inputs → `results/_somax_reference.npz` (not committed; `--device cpu` without a GPU) |
+| `verify_fairness.py` | fairness checks (shared `_build_fair_pipeline`; the Warp-hybrid checks need a CUDA GPU, the rest run on CPU) |
 | `bench_memory.py` | memory benchmark (context + requested-bytes high-water incl. Warp; one fresh subprocess per point) |
 | `run_memory.sh` | memory sweep → `results/memory.jsonl` |
 | `plot_memory.py` | single-panel memory figure (GiB) → `figures/memory.{png,pdf}` |
